@@ -30,6 +30,7 @@ import struct
 import sys
 
 SOURCE = "tls_x64.c"
+EC_SOURCE = "tls_ec.c"
 EXPORTS = (
     "TlsGetValue",
     "TlsSetValue",
@@ -37,6 +38,24 @@ EXPORTS = (
     "GetCurrentThreadId",
     "GetCurrentProcessId",
 )
+
+TLS_EC_C = r'''/*
+ * madeira-m5: ARM64EC counterpart symbols for kernelbase's GetLastError,
+ * GetCurrentThreadId, and GetCurrentProcessId so lld-link emits CHPE
+ * RedirectionMetadata pairing EXP+#<Name> -> #<Name>.
+ */
+#ifdef __arm64ec__
+extern unsigned int __cdecl kernelbase_GetLastError(void);
+extern unsigned int __cdecl kernelbase_GetCurrentThreadId(void);
+extern unsigned int __cdecl kernelbase_GetCurrentProcessId(void);
+unsigned int __cdecl GetLastError(void);
+unsigned int __cdecl GetCurrentThreadId(void);
+unsigned int __cdecl GetCurrentProcessId(void);
+unsigned int __cdecl GetLastError(void) { return kernelbase_GetLastError(); }
+unsigned int __cdecl GetCurrentThreadId(void) { return kernelbase_GetCurrentThreadId(); }
+unsigned int __cdecl GetCurrentProcessId(void) { return kernelbase_GetCurrentProcessId(); }
+#endif
+'''
 
 TLS_X64_C = r'''/*
  * madeira-m5: x64 bodies for kernelbase's TlsGetValue, TlsSetValue,
@@ -84,15 +103,15 @@ __ASM_GLOBAL_FUNC( "EXP+#TlsSetValue",
                    "ret\n"
                    "9:\tjmp \"#TlsSetValue\"" )
 
-__ASM_GLOBAL_FUNC( "EXP+#kernelbase_GetLastError",
+__ASM_GLOBAL_FUNC( "EXP+#GetLastError",
                    "movl %gs:0x68,%eax\n\t"
                    "ret" )
 
-__ASM_GLOBAL_FUNC( "EXP+#kernelbase_GetCurrentThreadId",
+__ASM_GLOBAL_FUNC( "EXP+#GetCurrentThreadId",
                    "movl %gs:0x48,%eax\n\t"
                    "ret" )
 
-__ASM_GLOBAL_FUNC( "EXP+#kernelbase_GetCurrentProcessId",
+__ASM_GLOBAL_FUNC( "EXP+#GetCurrentProcessId",
                    "movl %gs:0x40,%eax\n\t"
                    "ret" )
 
@@ -104,28 +123,37 @@ def patch(wine):
     kb = os.path.join(wine, "dlls", "kernelbase")
     mk = os.path.join(kb, "Makefile.in")
     src = os.path.join(kb, SOURCE)
+    ec_src = os.path.join(kb, EC_SOURCE)
     if not os.path.isfile(mk):
         sys.exit("patch-wine-kernelbase-x64-tls: missing " + mk)
     with open(src, "w", encoding="utf-8") as f:
         f.write(TLS_X64_C)
+    with open(ec_src, "w", encoding="utf-8") as f:
+        f.write(TLS_EC_C)
     text = open(mk, "r", encoding="utf-8").read()
-    if f"\t{SOURCE} \\\n" in text or f"\t{SOURCE}\n" in text:
+    added = []
+    for sname in (SOURCE, EC_SOURCE):
+        if f"\t{sname} \\\n" in text or f"\t{sname}\n" in text:
+            continue
+        lines = text.split("\n")
+        try:
+            start = lines.index("SOURCES = \\")
+        except ValueError:
+            sys.exit("patch-wine-kernelbase-x64-tls: SOURCES anchor not found in " + mk)
+        end = start + 1
+        while end < len(lines) and lines[end].endswith("\\"):
+            end += 1
+        if end >= len(lines) or not lines[end].startswith("\t"):
+            sys.exit("patch-wine-kernelbase-x64-tls: SOURCES list not understood in " + mk)
+        lines[end] = lines[end] + " \\"
+        lines.insert(end + 1, "\t" + sname)
+        text = "\n".join(lines)
+        added.append(sname)
+    if not added:
         print("patch-wine-kernelbase-x64-tls: already patched")
         return 0
-    lines = text.split("\n")
-    try:
-        start = lines.index("SOURCES = \\")
-    except ValueError:
-        sys.exit("patch-wine-kernelbase-x64-tls: SOURCES anchor not found in " + mk)
-    end = start + 1
-    while end < len(lines) and lines[end].endswith("\\"):
-        end += 1
-    if end >= len(lines) or not lines[end].startswith("\t"):
-        sys.exit("patch-wine-kernelbase-x64-tls: SOURCES list not understood in " + mk)
-    lines[end] = lines[end] + " \\"
-    lines.insert(end + 1, "\t" + SOURCE)
-    open(mk, "w", encoding="utf-8").write("\n".join(lines))
-    print("patch-wine-kernelbase-x64-tls: patched " + mk + " (+" + SOURCE + ")")
+    open(mk, "w", encoding="utf-8").write(text)
+    print("patch-wine-kernelbase-x64-tls: patched " + mk + " (+" + ",+".join(added) + ")")
     return 0
 
 

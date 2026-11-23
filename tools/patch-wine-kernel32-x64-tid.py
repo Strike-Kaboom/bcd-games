@@ -18,7 +18,23 @@ import struct
 import sys
 
 SOURCE = "tid_x64.c"
+EC_SOURCE = "tid_ec.c"
 EXPORTS = ("GetCurrentThreadId", "GetCurrentProcessId")
+
+TID_EC_C = r'''/*
+ * madeira-m5: ARM64EC counterpart symbols for kernel32's GetCurrentThreadId and
+ * GetCurrentProcessId so lld-link emits CHPE RedirectionMetadata pairing
+ * EXP+#<Name> -> #<Name>.
+ */
+#ifdef __arm64ec__
+extern unsigned int __cdecl KERNEL32_GetCurrentThreadId(void);
+extern unsigned int __cdecl KERNEL32_GetCurrentProcessId(void);
+unsigned int __cdecl GetCurrentThreadId(void);
+unsigned int __cdecl GetCurrentProcessId(void);
+unsigned int __cdecl GetCurrentThreadId(void) { return KERNEL32_GetCurrentThreadId(); }
+unsigned int __cdecl GetCurrentProcessId(void) { return KERNEL32_GetCurrentProcessId(); }
+#endif
+'''
 
 TID_X64_C = r'''/*
  * madeira-m5: x64 bodies for kernel32's GetCurrentThreadId and GetCurrentProcessId
@@ -33,11 +49,11 @@ TID_X64_C = r'''/*
 
 #include "wine/asm.h"
 
-__ASM_GLOBAL_FUNC( "EXP+#KERNEL32_GetCurrentThreadId",
+__ASM_GLOBAL_FUNC( "EXP+#GetCurrentThreadId",
                    "movl %gs:0x48,%eax\n\t"
                    "ret" )
 
-__ASM_GLOBAL_FUNC( "EXP+#KERNEL32_GetCurrentProcessId",
+__ASM_GLOBAL_FUNC( "EXP+#GetCurrentProcessId",
                    "movl %gs:0x40,%eax\n\t"
                    "ret" )
 
@@ -49,28 +65,37 @@ def patch(wine):
     k32 = os.path.join(wine, "dlls", "kernel32")
     mk = os.path.join(k32, "Makefile.in")
     src = os.path.join(k32, SOURCE)
+    ec_src = os.path.join(k32, EC_SOURCE)
     if not os.path.isfile(mk):
         sys.exit("patch-wine-kernel32-x64-tid: missing " + mk)
     with open(src, "w", encoding="utf-8") as f:
         f.write(TID_X64_C)
+    with open(ec_src, "w", encoding="utf-8") as f:
+        f.write(TID_EC_C)
     text = open(mk, "r", encoding="utf-8").read()
-    if f"\t{SOURCE} \\\n" in text or f"\t{SOURCE}\n" in text:
+    added = []
+    for sname in (SOURCE, EC_SOURCE):
+        if f"\t{sname} \\\n" in text or f"\t{sname}\n" in text:
+            continue
+        lines = text.split("\n")
+        try:
+            start = lines.index("SOURCES = \\")
+        except ValueError:
+            sys.exit("patch-wine-kernel32-x64-tid: SOURCES anchor not found in " + mk)
+        end = start + 1
+        while end < len(lines) and lines[end].endswith("\\"):
+            end += 1
+        if end >= len(lines) or not lines[end].startswith("\t"):
+            sys.exit("patch-wine-kernel32-x64-tid: SOURCES list not understood in " + mk)
+        lines[end] = lines[end] + " \\"
+        lines.insert(end + 1, "\t" + sname)
+        text = "\n".join(lines)
+        added.append(sname)
+    if not added:
         print("patch-wine-kernel32-x64-tid: already patched")
         return 0
-    lines = text.split("\n")
-    try:
-        start = lines.index("SOURCES = \\")
-    except ValueError:
-        sys.exit("patch-wine-kernel32-x64-tid: SOURCES anchor not found in " + mk)
-    end = start + 1
-    while end < len(lines) and lines[end].endswith("\\"):
-        end += 1
-    if end >= len(lines) or not lines[end].startswith("\t"):
-        sys.exit("patch-wine-kernel32-x64-tid: SOURCES list not understood in " + mk)
-    lines[end] = lines[end] + " \\"
-    lines.insert(end + 1, "\t" + SOURCE)
-    open(mk, "w", encoding="utf-8").write("\n".join(lines))
-    print("patch-wine-kernel32-x64-tid: patched " + mk + " (+" + SOURCE + ")")
+    open(mk, "w", encoding="utf-8").write(text)
+    print("patch-wine-kernel32-x64-tid: patched " + mk + " (+" + ",+".join(added) + ")")
     return 0
 
 

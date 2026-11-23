@@ -2072,7 +2072,7 @@ jobs:
           fi
           xcodebuild -project app/Madeira.xcodeproj \
             -scheme Madeira -sdk iphoneos -configuration Release \
-            CODE_SIGNING_ALLOWED=NO DEAD_CODE_STRIPPING=NO "${pool_bss[@]}" \
+            CODE_SIGNING_ALLOWED=NO DEAD_CODE_STRIPPING=NO DEBUG_INFORMATION_FORMAT=dwarf "${pool_bss[@]}" \
             archive -archivePath build-out/Madeira.xcarchive \
             > "$GITHUB_WORKSPACE/archive.log" 2>&1
           rc=$?

@@ -51,7 +51,7 @@ if [ -f "$R/wine/dlls/kernelbase/Makefile.in" ] && [ -f "$SHIP/kernelbase.dll" ]
     fi
     git -C "$R/wine" checkout -- dlls/kernelbase/Makefile.in
     touch "$R/wine/dlls/kernelbase/Makefile.in"
-    rm -f "$R/wine/dlls/kernelbase/tls_x64.c" "$kb" "$B"/dlls/kernelbase/arm64ec-windows/*.o
+    rm -f "$R/wine/dlls/kernelbase/tls_x64.c" "$R/wine/dlls/kernelbase/tls_ec.c" "$kb" "$B"/dlls/kernelbase/arm64ec-windows/*.o
 fi
 
 # 2. kernel32-x64tid.dll (usd-direct + GetCurrentThreadId/ProcessId in x64)
@@ -75,5 +75,5 @@ if [ -f "$R/wine/dlls/kernel32/Makefile.in" ] && [ -f "$SHIP/kernel32.dll" ]; th
     fi
     git -C "$R/wine" checkout -- dlls/kernel32/sync.c dlls/kernel32/Makefile.in
     touch "$R/wine/dlls/kernel32/Makefile.in"
-    rm -f "$R/wine/dlls/kernel32/tid_x64.c" "$k32" "$B"/dlls/kernel32/arm64ec-windows/*.o
+    rm -f "$R/wine/dlls/kernel32/tid_x64.c" "$R/wine/dlls/kernel32/tid_ec.c" "$k32" "$B"/dlls/kernel32/arm64ec-windows/*.o
 fi

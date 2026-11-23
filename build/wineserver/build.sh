@@ -239,6 +239,10 @@ COLLISIONS=(
     # every process hung in server_init_process() the moment a client
     # connected -- guest ntdll init is exactly when the pointer was stolen.
     user_shared_data
+    # madeira-m5 (2026-11-23): Xcode 26.6 Release link (ld_prime) rejects duplicate
+    # strong definitions of these three globals shared by libwineserver.a (registry.o /
+    # request_ios.o) and libntdll_unix.a (server.o). Rename wineserver's copies to _ws_*.
+    supported_machines_count server_start_time native_machine
 )
 RENAME_ARGS=()
 for s in "${COLLISIONS[@]}"; do
