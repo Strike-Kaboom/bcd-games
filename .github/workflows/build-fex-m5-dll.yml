@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Fast Linux cross-compile workflow for ARM64EC FEX xtajit64.dll (Windows PE DLL via llvm-mingw).
+# Builds the exact same tools/build-xtajit64.sh recipe (TUNE_CPU=apple-m5 + madeira-m5-opt-v1/v2)
+# without waiting on GitHub Actions macOS arm64 runner capacity.
+name: Build FEX M5 xtajit64.dll (Linux cross-compile)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: build-fex-m5-dll
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository == 'Strike-Kaboom/bcd-games'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build number
+        id: bn
+        run: |
+          n=$(grep -v '^#' docs/local-build/BUILD-NUMBER | tr -d '[:space:]')
+          echo "n=$n" >> "$GITHUB_OUTPUT"
+          echo "::notice::building FEX M5 xtajit64.dll for 0.1.$n"
+
+      - name: Install build tools (ninja, cmake, nasm, binutils)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build cmake nasm xz-utils python3
+
+      - name: Cache llvm-mingw 20260421 (Linux x86_64)
+        id: mingw-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchains/llvm-mingw-20260421-ucrt-ubuntu-22.04-x86_64
+          key: llvm-mingw-20260421-ucrt-ubuntu-22.04-x86_64
+
+      - name: Download llvm-mingw 20260421
+        if: steps.mingw-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p toolchains
+          curl -fSL -o /tmp/llvm-mingw.tar.xz \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xJf /tmp/llvm-mingw.tar.xz -C toolchains
+          rm -f /tmp/llvm-mingw.tar.xz
+
+      - name: Build xtajit64.dll (TUNE_CPU=apple-m5 + madeira-m5-opt-v1/v2)
+        run: |
+          export MINGW="$PWD/toolchains/llvm-mingw-20260421-ucrt-ubuntu-22.04-x86_64/bin"
+          bash tools/build-xtajit64.sh
+
+      - name: Verify xtajit64.dll markers, exports, and cleanliness
+        run: |
+          python3 - <<'PYEOF'
+          import os, struct, sys
+
+          dll = "app/Madeira/arm64ec-windows/xtajit64.dll"
+          avx = "app/Madeira/arm64ec-windows/xtajit64-avx.dll"
+          data = open(dll, "rb").read()
+          assert data[:2] == b"MZ", "Not a PE binary"
+          assert open(avx, "rb").read() == data, "xtajit64-avx.dll mismatch"
+          for marker in (
+              b"madeira-m5-opt-v1",
+              b"madeira-m5-opt-v2",
+              b"[callret] madeira-m5-opt-v2 invalidation resets skipped=",
+              b"[smc-hot] hot SMC pages on",
+              b"rpmalloc",
+          ):
+              assert marker in data, f"Missing marker {marker!r} in {dll}"
+          print(f"OK: {dll} ({len(data):,} bytes) verified with all madeira-m5-opt-v1/v2 markers")
+          PYEOF
+          "$PWD/toolchains/llvm-mingw-20260421-ucrt-ubuntu-22.04-x86_64/bin/llvm-readobj" --coff-exports app/Madeira/arm64ec-windows/xtajit64.dll | grep -E "Name:" | head -30
+
+      - name: Upload xtajit64.dll artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xtajit64-M5-0.1.${{ steps.bn.outputs.n }}
+          path: |
+            app/Madeira/arm64ec-windows/xtajit64.dll
+            app/Madeira/arm64ec-windows/xtajit64-avx.dll
+          retention-days: 14
