@@ -3128,6 +3128,7 @@ jobs:
             exit 1
           fi
           bash build/stage-licenses.sh
+          echo "MADEIRA_MSC_HEADERS_ONLY=1" >> "$GITHUB_ENV"
           echo "MADEIRA_MSC_INCLUDE=$INC" >> "$GITHUB_ENV"
           V=$(grep -E "define IR_VERSION_(MAJOR|MINOR|PATCH)" "$INC/metal_irconverter/ir_version.h" | awk '{print $3}' | paste -sd. -)
           echo "::notice::Metal Shader Converter $V Apache-2.0 headers verified (libmetalirconverter.dylib intentionally omitted from public CI; inject locally via tools/inject-local-converter.py)"

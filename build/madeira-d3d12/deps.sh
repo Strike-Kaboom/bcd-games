@@ -48,7 +48,9 @@ _msc_resolve() {
         # madeira-m5 (2026-11-23): public CI compiles madeira-d3d12 purely against the
         # Apache-2.0 vendored headers (madeira_ir_unix.mm dlopen()s libmetalirconverter.dylib
         # at runtime on device). Never require Apple's proprietary dylib in public CI.
-        MSC_LIB_IOS=""
+        # Keep MSC_LIB_IOS pointing at the conventional path so converter_id_inputs() and
+        # build-madeira-d3d12-dll.sh scid_inputs() hash the exact same absent-file token.
+        MSC_LIB_IOS="$ios_lib"
         MSC_HAVE_PKG=0 MSC_ROOT="" MSC_PAYLOAD="" MSC_LIB_MACOS=""
         return 0
     fi
