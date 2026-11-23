@@ -81,6 +81,7 @@ git -C "$SRC" submodule update -q --init --depth 1 external/DirectX-Headers exte
 
 # 2. The two tablegen tools for the Mac itself (the cross build runs them).
 COMMON=(-G Ninja -C "$SRC/cmake/caches/PredefinedParams.cmake" -DCMAKE_BUILD_TYPE=Release
+        -DCLANG_FORMAT_EXE=CLANG_FORMAT_EXE-NOTFOUND
         -DHLSL_INCLUDE_TESTS=OFF -DENABLE_SPIRV_CODEGEN=OFF -DSPIRV_BUILD_TESTS=OFF -DLLVM_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_TESTS=OFF
         -DLLVM_BUILD_TESTS=OFF -DLLVM_APPEND_VC_REV=OFF -DLLVM_ENABLE_ASSERTIONS=OFF -DHLSL_BUILD_DXILCONV=OFF)
 cmake -S "$SRC" -B "$WORK/host" "${COMMON[@]}" -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \

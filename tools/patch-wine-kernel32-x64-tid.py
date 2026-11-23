@@ -33,11 +33,11 @@ TID_X64_C = r'''/*
 
 #include "wine/asm.h"
 
-__ASM_GLOBAL_FUNC( "EXP+#GetCurrentThreadId",
+__ASM_GLOBAL_FUNC( "EXP+#KERNEL32_GetCurrentThreadId",
                    "movl %gs:0x48,%eax\n\t"
                    "ret" )
 
-__ASM_GLOBAL_FUNC( "EXP+#GetCurrentProcessId",
+__ASM_GLOBAL_FUNC( "EXP+#KERNEL32_GetCurrentProcessId",
                    "movl %gs:0x40,%eax\n\t"
                    "ret" )
 

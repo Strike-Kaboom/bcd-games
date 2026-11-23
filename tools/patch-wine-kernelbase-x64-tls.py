@@ -84,15 +84,15 @@ __ASM_GLOBAL_FUNC( "EXP+#TlsSetValue",
                    "ret\n"
                    "9:\tjmp \"#TlsSetValue\"" )
 
-__ASM_GLOBAL_FUNC( "EXP+#GetLastError",
+__ASM_GLOBAL_FUNC( "EXP+#kernelbase_GetLastError",
                    "movl %gs:0x68,%eax\n\t"
                    "ret" )
 
-__ASM_GLOBAL_FUNC( "EXP+#GetCurrentThreadId",
+__ASM_GLOBAL_FUNC( "EXP+#kernelbase_GetCurrentThreadId",
                    "movl %gs:0x48,%eax\n\t"
                    "ret" )
 
-__ASM_GLOBAL_FUNC( "EXP+#GetCurrentProcessId",
+__ASM_GLOBAL_FUNC( "EXP+#kernelbase_GetCurrentProcessId",
                    "movl %gs:0x40,%eax\n\t"
                    "ret" )
 

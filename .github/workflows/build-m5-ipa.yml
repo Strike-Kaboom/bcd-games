@@ -1684,7 +1684,11 @@ jobs:
 
       - name: Build extra Wine DLLs for arm64ec
         continue-on-error: true
-        run: bash tools/build-wine-extra-dlls.sh "$GITHUB_WORKSPACE/wine/build-native"
+        run: |
+          # ntdll-unix already compiled unix_private.h into libntdll_unix.a; restore dlls/opengl32
+          # so build-wine-extra-dlls.sh's clean-pin guard builds and ships opengl32-optin.dll.
+          git -C wine checkout -- dlls/opengl32/unix_private.h
+          bash tools/build-wine-extra-dlls.sh "$GITHUB_WORKSPACE/wine/build-native"
 
       - name: Check kernel32-usd.dll (tick count without a fault per call)
         run: |
@@ -2165,6 +2169,8 @@ jobs:
           for req in ("Payload/Madeira.app/PlugIns/MadeiraJITHelper.appex/",
                       "Payload/Madeira.app/PlugIns/MadeiraMemoryHost.appex/",
                       "Payload/Madeira.app/arm64ec-windows/ntdll-sync.dll",
+                      "Payload/Madeira.app/arm64ec-windows/kernelbase-x64tls.dll",
+                      "Payload/Madeira.app/arm64ec-windows/kernel32-x64tid.dll",
                       "Payload/Madeira.app/arm64ec-windows/d3d11-src.dll",
                       "Payload/Madeira.app/arm64ec-windows/xtajit64.dll"):
               if not any(n.startswith(req) for n in names):
@@ -2173,10 +2179,7 @@ jobs:
               sys.exit("ERROR: xtajit64.dll missing madeira-m5-opt-v1 marker")
           if b"[m5-latency] madeira-m5" not in z.read("Payload/Madeira.app/arm64ec-windows/d3d11-src.dll"):
               sys.exit("ERROR: d3d11-src.dll missing [m5-latency] madeira-m5 marker")
-          for opt in ("Payload/Madeira.app/arm64ec-windows/kernelbase-x64tls.dll",
-                      "Payload/Madeira.app/arm64ec-windows/kernel32-x64tid.dll"):
-              print("present:" if opt in names else "WARN missing:", opt)
-          print(f"OK: {sys.argv[1]} verified clean (no proprietary binaries; both PlugIns and M5 markers present)")
+          print(f"OK: {sys.argv[1]} verified clean (no proprietary binaries; both PlugIns and all M5 DLLs/markers present)")
           PY
 
       - name: Upload unsigned M5 IPA artifact (no Apple converter dylib)
