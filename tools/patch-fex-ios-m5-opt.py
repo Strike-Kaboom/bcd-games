@@ -26,8 +26,23 @@ compiling arm64ecfex (xtajit64.dll):
      iOS Mach exec-fault redirect) with hardware CNTVCT_EL0/CNTFRQ_EL0, and raise
      MIN_L1_ENTRIES (8K -> 32K) and MAX_L1_ENTRIES (128K -> 512K) for 12 GB+ iPads
      to curb L1 cache thrashing (61.3M misses in Dark Souls III).
-  5. Module.cpp: default MADEIRA_SMC_HOT_PAGE to 64 (upstream FEX default;
-     MADEIRA_SMC_HOT_PAGE=0 still disables it) to avoid SMC recompile storms.
+  5. Module.cpp & InvalidationTracker.{h,cpp}: scale hot SMC page tracking to
+     512 slots, align hot-page tracking and re-protection skips to Apple
+     Silicon's 16 KB hardware page size on iOS (so neighbor 4 KB re-protects
+     never silently re-write-protect a hot 16 KB page), and default
+     MADEIRA_SMC_HOT_PAGE to 8 (MADEIRA_SMC_HOT_PAGE=0 disables) so hot SMC
+     pages promote immediately instead of triggering 100k+ Mach exceptions and
+     128 MB JIT code-cache rollovers.
+  6. Core.cpp (IosSkipInvalidationCallRetReset): fix the broken direct-mapped
+     Table[256] (Thread >> 12) & 255 hash that threw away 15/16 slots on 64 KB-
+     aligned Thread pointers (causing 142k / 1.13 TB of redundant 8 MB callret
+     resets), upgrade to a 1024-entry open-addressed table keyed on >> 16, and
+     default MADEIRA_CALLRET_RESET_RATE to 500 ms on iOS (0 disables).
+  7. InvalidationTracker.cpp (non-exec VirtualAlloc/VirtualFree fast path):
+     add a shared_lock interval-intersection check in HandleMemoryProtection-
+     Notification and InvalidateAlignedInterval (Free=true) so freeing ordinary
+     non-executable data buffers never acquires CodeInvalidationMutex (stop-
+     the-world) or loops all threads or acquires IntervalsLock exclusively.
 
 Usage:
   patch-fex-ios-m5-opt.py FEX_DIR
@@ -36,6 +51,7 @@ import os
 import sys
 
 MARK = "madeira-m5-opt-v1"
+MARK_V2 = "madeira-m5-opt-v2"
 
 
 def patch_file(path, edits):
@@ -162,6 +178,101 @@ def main():
     else:
         patch_file(core, [("Core.cpp volatile TSO", tso_old, tso_new)])
 
+    # 6. FEXCore/Source/Interface/Core/Core.cpp (callret reset hash-collision fix + 500ms default)
+    callret_old = """static bool IosSkipInvalidationCallRetReset(FEXCore::Core::InternalThreadState* Thread) {
+  static uint64_t IntervalTicks = ~0ULL;
+  if (IntervalTicks == ~0ULL) {
+    uint64_t Ms = 0;
+    if (const char* Rate = getenv("MADEIRA_CALLRET_RESET_RATE"); Rate && *Rate) {
+      Ms = strtoull(Rate, nullptr, 0);
+    }
+    uint64_t Frequency = 0;
+    if (Ms) {
+      __asm volatile("mrs %0, cntfrq_el0" : "=r"(Frequency));
+    }
+    IntervalTicks = Frequency / 1000 * Ms;
+  }
+  if (!IntervalTicks) {
+    return false;
+  }
+
+  uint64_t Now;
+  __asm volatile("mrs %0, cntvct_el0" : "=r"(Now));
+  // Direct-mapped by thread: a collision only means an extra reset.
+  struct LastReset {
+    FEXCore::Core::InternalThreadState* Thread;
+    uint64_t Ticks;
+  };
+  static LastReset Table[256];
+  auto& Entry = Table[(reinterpret_cast<uintptr_t>(Thread) >> 12) & 255];
+  if (Entry.Thread == Thread && Now - Entry.Ticks < IntervalTicks) {
+    static uint64_t Skipped = 0;
+    if ((++Skipped & 0xfff) == 1) {
+      LogMan::Msg::EFmt("[callret] invalidation resets skipped={} (at most one per thread every {} ticks; "
+                        "MADEIRA_CALLRET_RESET_RATE=0 disables)", Skipped, IntervalTicks);
+    }
+    return true;
+  }
+  Entry = {Thread, Now};
+  return false;
+}"""
+    callret_new = """static bool IosSkipInvalidationCallRetReset(FEXCore::Core::InternalThreadState* Thread) {
+  /* """ + MARK_V2 + """: default 500 ms rate limit (MADEIRA_CALLRET_RESET_RATE=0 disables) and
+   * collision-free 1024-slot open-addressed table keyed on >> 16 (64 KB-aligned Thread pointers
+   * previously collided in 16/256 buckets with >> 12, causing 140k+ redundant 8 MB resets). */
+  static uint64_t IntervalTicks = ~0ULL;
+  if (IntervalTicks == ~0ULL) {
+    uint64_t Ms = 500;
+    if (const char* Rate = getenv("MADEIRA_CALLRET_RESET_RATE"); Rate && *Rate) {
+      Ms = strtoull(Rate, nullptr, 0);
+    }
+    uint64_t Frequency = 0;
+    if (Ms) {
+      __asm volatile("mrs %0, cntfrq_el0" : "=r"(Frequency));
+    }
+    IntervalTicks = Frequency / 1000 * Ms;
+  }
+  if (!IntervalTicks) {
+    return false;
+  }
+
+  uint64_t Now;
+  __asm volatile("mrs %0, cntvct_el0" : "=r"(Now));
+  struct LastReset {
+    FEXCore::Core::InternalThreadState* Thread;
+    uint64_t Ticks;
+  };
+  static constexpr size_t TableSize = 1024;
+  static LastReset Table[TableSize];
+  const uintptr_t Key = reinterpret_cast<uintptr_t>(Thread);
+  const size_t BaseIdx = ((Key >> 16) ^ (Key >> 26)) & (TableSize - 1);
+  LastReset* Slot = nullptr;
+  for (size_t Probe = 0; Probe < 16; ++Probe) {
+    auto& Cand = Table[(BaseIdx + Probe) & (TableSize - 1)];
+    if (Cand.Thread == Thread) {
+      Slot = &Cand;
+      break;
+    }
+    if (!Cand.Thread && !Slot) {
+      Slot = &Cand;
+    }
+  }
+  if (!Slot) {
+    Slot = &Table[BaseIdx];
+  }
+  if (Slot->Thread == Thread && Now - Slot->Ticks < IntervalTicks) {
+    static uint64_t Skipped = 0;
+    if ((++Skipped & 0xfff) == 1) {
+      LogMan::Msg::EFmt("[callret] """ + MARK_V2 + """ invalidation resets skipped={} (at most one per thread every {} ticks; "
+                        "MADEIRA_CALLRET_RESET_RATE=0 disables)", Skipped, IntervalTicks);
+    }
+    return true;
+  }
+  *Slot = {Thread, Now};
+  return false;
+}"""
+    patch_file(core, [("Core.cpp callret reset table", callret_old, callret_new)])
+
     # 4. FEXCore/Source/Interface/Core/LookupCache.h
     lc = os.path.join(fex, "FEXCore", "Source", "Interface", "Core", "LookupCache.h")
     lc_clock_old = """    const auto CurrentTime = std::chrono::system_clock::now();
@@ -225,20 +336,313 @@ def main():
         ("LookupCache LastPeriodTicks", lc_field_old, lc_field_new),
     ])
 
-    # 5. Source/Windows/ARM64EC/Module.cpp (default MADEIRA_SMC_HOT_PAGE = 64)
+    # 5. Source/Windows/ARM64EC/Module.cpp (default MADEIRA_SMC_HOT_PAGE = 8)
     mod = os.path.join(fex, "Source", "Windows", "ARM64EC", "Module.cpp")
     smc_old = """    uint32_t HotThreshold = 0;
     if (const char* Hot = getenv("MADEIRA_SMC_HOT_PAGE"); Hot && *Hot) {
       HotThreshold = static_cast<uint32_t>(strtoul(Hot, nullptr, 0));
     }"""
-    smc_new = """    /* """ + MARK + """: default hot SMC page threshold to upstream 64 (MADEIRA_SMC_HOT_PAGE=0 disables) */
-    uint32_t HotThreshold = 64;
+    smc_new = """    /* """ + MARK_V2 + """: default hot SMC page threshold to 8 faults/sec per 16 KB page (MADEIRA_SMC_HOT_PAGE=0 disables) */
+    uint32_t HotThreshold = 8;
     if (const char* Hot = getenv("MADEIRA_SMC_HOT_PAGE"); Hot && *Hot) {
       HotThreshold = static_cast<uint32_t>(strtoul(Hot, nullptr, 0));
     }"""
     patch_file(mod, [("Module.cpp SMC hot page default", smc_old, smc_new)])
 
-    print("patch-fex-ios-m5-opt: all 5 M5 optimizations applied cleanly")
+    # 7. Source/Windows/Common/InvalidationTracker.h (512 hot-SMC slots)
+    inv_h = os.path.join(fex, "Source", "Windows", "Common", "InvalidationTracker.h")
+    invh_old = """  static constexpr size_t HotFaultSlots = 64;
+  static constexpr size_t MaxHotPages = 64;"""
+    invh_new = """  /* """ + MARK_V2 + """: scale hot SMC tables for multi-page protectors (e.g. Dark Souls III's ~49 hot 16 KB pages) */
+  static constexpr size_t HotFaultSlots = 512;
+  static constexpr size_t MaxHotPages = 512;"""
+    patch_file(inv_h, [("InvalidationTracker.h hot SMC capacity", invh_old, invh_new)])
+
+    # 8. Source/Windows/Common/InvalidationTracker.cpp (non-exec fast paths + 16 KB iOS hot-SMC pages)
+    inv_c = os.path.join(fex, "Source", "Windows", "Common", "InvalidationTracker.cpp")
+    inv_prot_old = """  const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto AlignedSize = (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+
+  const bool NeedsInvalidate = [&]() {
+    std::unique_lock Lock(IntervalsLock);"""
+    inv_prot_new = """  const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto AlignedSize = (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+  /* """ + MARK_V2 + """: avoid exclusive IntervalsLock on ordinary non-exec VirtualAlloc/Protect calls */
+  if (!ProtHasExec(Prot)) {
+    std::shared_lock Lock(IntervalsLock);
+    if (!DEPDisabled && !XIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize})) {
+      return;
+    }
+  }
+#endif
+
+  const bool NeedsInvalidate = [&]() {
+    std::unique_lock Lock(IntervalsLock);"""
+
+    inv_free_old = """  const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto AlignedSize = std::max(Size, (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
+
+  InvalidateIntervalInternal(AlignedBase, AlignedSize);"""
+    inv_free_new = """  const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto AlignedSize = std::max(Size, (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
+
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+  /* """ + MARK_V2 + """: skip stop-the-world CodeInvalidationMutex + all-thread loop + exclusive IntervalsLock
+   * when freeing an ordinary non-executable buffer above 4 GB (eliminates 60+/frame lock storms in DS3). */
+  if (Free && Address && AlignedBase >= 0x100000000ULL && AlignedSize < (1ULL << 30)) {
+    std::shared_lock Lock(IntervalsLock);
+    const FEXCore::IntervalList<uint64_t>::Interval Range {AlignedBase, AlignedBase + AlignedSize};
+    if (!XIntervals.Intersect(Range) && !RWXIntervals.Intersect(Range)) {
+      return;
+    }
+  }
+#endif
+
+  InvalidateIntervalInternal(AlignedBase, AlignedSize);"""
+
+    inv_hot_fault_old = """  if (NeedsInvalidate) {
+    // MADEIRA: a page that turns hot here is invalidated below as usual, once: from then on nothing
+    // compiled from it relies on the write trap.
+    if (CountSMCWriteFault(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK)) {
+      static std::atomic<uint32_t> HotLogCount {0};
+      if (HotLogCount.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LogMan::Msg::EFmt("[smc-hot] page {:#x} took {} write faults within a second: no longer write-protected, its blocks "
+                          "validate their code per instruction (MADEIRA_SMC_HOT_PAGE=0 disables)",
+                          FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, HotPageThreshold);
+      }
+    }
+    // IntervalsLock cannot be held during invalidation
+    {
+      std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
+
+      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);"""
+    inv_hot_fault_new = """  if (NeedsInvalidate) {
+    /* """ + MARK_V2 + """: on Apple Silicon (16 KB hardware mprotect pages), key hot SMC pages at 16 KB
+     * and invalidate the entire 16 KB hardware page once on promotion so neighbor 4 KB reprotects never re-trap it. */
+#ifdef FEX_IOS_HOST
+    constexpr uint64_t HotPageSize = 0x4000ULL;
+    constexpr uint64_t HotPageMask = ~(HotPageSize - 1);
+#else
+    constexpr uint64_t HotPageSize = FEXCore::Utils::FEX_PAGE_SIZE;
+    constexpr uint64_t HotPageMask = FEXCore::Utils::FEX_PAGE_MASK;
+#endif
+    const bool BecameHot = CountSMCWriteFault(FaultAddress & HotPageMask);
+    if (BecameHot) {
+      static std::atomic<uint32_t> HotLogCount {0};
+      if (HotLogCount.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LogMan::Msg::EFmt("[smc-hot] page {:#x} took {} write faults within a second: no longer write-protected, its blocks "
+                          "validate their code per instruction (MADEIRA_SMC_HOT_PAGE=0 disables)",
+                          FaultAddress & HotPageMask, HotPageThreshold);
+      }
+    }
+    // IntervalsLock cannot be held during invalidation
+    {
+      std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
+
+      if (BecameHot) {
+        InvalidateIntervalInternalLocked(FaultAddress & HotPageMask, HotPageSize);
+      } else {
+        InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+      }"""
+
+    inv_hot_helpers_old = """bool InvalidationTracker::IsHotSMCPage(uint64_t Address) const {
+  const auto Used = HotPagesUsed.load(std::memory_order_acquire);
+  if (!Used) {
+    return false;
+  }
+  const auto Page = Address & FEXCore::Utils::FEX_PAGE_MASK;
+  for (uint32_t i = 0; i < Used; ++i) {
+    if (HotPages[i].load(std::memory_order_acquire) == Page) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool InvalidationTracker::CountSMCWriteFault(uint64_t Page) {
+  // madeira-bcd (round 632): hot pages are off unless MADEIRA_SMC_HOT_PAGE names a threshold; then a write fault reads no clock and
+  // takes no lock (the threshold is written once, in EnableHotSMCPages, before any guest code runs).
+  if (!HotPageThreshold) {
+    return false;
+  }
+  uint64_t Now, Frequency;
+  __asm volatile("mrs %0, cntvct_el0" : "=r"(Now));
+  __asm volatile("mrs %0, cntfrq_el0" : "=r"(Frequency));
+
+  std::scoped_lock Lock(HotPagesLock);
+  if (!HotPageThreshold || !Page) {
+    return false;
+  }
+
+  // Direct-mapped: a page evicted by another one simply starts counting again.
+  auto& Slot = HotFaults[(Page >> FEXCore::Utils::FEX_PAGE_SHIFT) % HotFaultSlots];
+  if (Slot.Page != Page || Now - Slot.WindowStart > Frequency) {
+    Slot = {Page, Now, 0};
+  }
+  if (++Slot.Count < HotPageThreshold) {
+    return false;
+  }
+  Slot = {};
+
+  const auto Used = HotPagesUsed.load(std::memory_order_relaxed);
+  for (uint32_t i = 0; i < Used; ++i) {
+    if (!HotPages[i].load(std::memory_order_relaxed)) {
+      HotPages[i].store(Page, std::memory_order_release);
+      return true;
+    }
+  }
+  if (Used == MaxHotPages) {
+    // Table full: this page keeps the write trap.
+    return false;
+  }
+  HotPages[Used].store(Page, std::memory_order_release);
+  HotPagesUsed.store(Used + 1, std::memory_order_release);
+  return true;
+}
+
+void InvalidationTracker::ForgetHotSMCPages(uint64_t Begin, uint64_t End) {
+  if (!HotPagesUsed.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::scoped_lock Lock(HotPagesLock);
+  const auto Used = HotPagesUsed.load(std::memory_order_relaxed);
+  for (uint32_t i = 0; i < Used; ++i) {
+    const auto Page = HotPages[i].load(std::memory_order_relaxed);
+    if (Page && Page >= Begin && Page < End) {
+      HotPages[i].store(0, std::memory_order_release);
+    }
+  }
+}"""
+    inv_hot_helpers_new = """bool InvalidationTracker::IsHotSMCPage(uint64_t Address) const {
+  const auto Used = HotPagesUsed.load(std::memory_order_acquire);
+  if (!Used) {
+    return false;
+  }
+#ifdef FEX_IOS_HOST
+  const auto Page = Address & ~0x3FFFULL;
+#else
+  const auto Page = Address & FEXCore::Utils::FEX_PAGE_MASK;
+#endif
+  for (uint32_t i = 0; i < Used; ++i) {
+    if (HotPages[i].load(std::memory_order_acquire) == Page) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool InvalidationTracker::CountSMCWriteFault(uint64_t Page) {
+  if (!HotPageThreshold) {
+    return false;
+  }
+  uint64_t Now, Frequency;
+  __asm volatile("mrs %0, cntvct_el0" : "=r"(Now));
+  __asm volatile("mrs %0, cntfrq_el0" : "=r"(Frequency));
+
+  std::scoped_lock Lock(HotPagesLock);
+  if (!HotPageThreshold || !Page) {
+    return false;
+  }
+
+#ifdef FEX_IOS_HOST
+  constexpr uint32_t HotPageShift = 14;
+#else
+  constexpr uint32_t HotPageShift = FEXCore::Utils::FEX_PAGE_SHIFT;
+#endif
+  auto& Slot = HotFaults[(Page >> HotPageShift) % HotFaultSlots];
+  if (Slot.Page != Page || Now - Slot.WindowStart > Frequency) {
+    Slot = {Page, Now, 0};
+  }
+  if (++Slot.Count < HotPageThreshold) {
+    return false;
+  }
+  Slot = {};
+
+  const auto Used = HotPagesUsed.load(std::memory_order_relaxed);
+  for (uint32_t i = 0; i < Used; ++i) {
+    if (HotPages[i].load(std::memory_order_relaxed) == Page) {
+      return false;
+    }
+  }
+  for (uint32_t i = 0; i < Used; ++i) {
+    if (!HotPages[i].load(std::memory_order_relaxed)) {
+      HotPages[i].store(Page, std::memory_order_release);
+      return true;
+    }
+  }
+  if (Used == MaxHotPages) {
+    return false;
+  }
+  HotPages[Used].store(Page, std::memory_order_release);
+  HotPagesUsed.store(Used + 1, std::memory_order_release);
+  return true;
+}
+
+void InvalidationTracker::ForgetHotSMCPages(uint64_t Begin, uint64_t End) {
+  if (!HotPagesUsed.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::scoped_lock Lock(HotPagesLock);
+#ifdef FEX_IOS_HOST
+  constexpr uint64_t HotPageSize = 0x4000ULL;
+#else
+  constexpr uint64_t HotPageSize = FEXCore::Utils::FEX_PAGE_SIZE;
+#endif
+  const auto Used = HotPagesUsed.load(std::memory_order_relaxed);
+  for (uint32_t i = 0; i < Used; ++i) {
+    const auto Page = HotPages[i].load(std::memory_order_relaxed);
+    if (Page && Page + HotPageSize > Begin && Page < End) {
+      HotPages[i].store(0, std::memory_order_release);
+    }
+  }
+}"""
+
+    inv_reprot_old = """        // MADEIRA: never write-protect a hot page again; protect the runs of pages around it.
+        uint64_t RunBegin = Address;
+        for (uint64_t Page = Address & FEXCore::Utils::FEX_PAGE_MASK; Page < ProtectEnd; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+          if (IsHotSMCPage(Page)) {
+            if (RunBegin < std::max(Page, Address)) {
+              Protect(RunBegin, std::max(Page, Address));
+            }
+            RunBegin = std::min(Page + FEXCore::Utils::FEX_PAGE_SIZE, ProtectEnd);
+          }
+        }
+        if (RunBegin < ProtectEnd) {
+          Protect(RunBegin, ProtectEnd);
+        }"""
+    inv_reprot_new = """        // """ + MARK_V2 + """: never write-protect a hot 16 KB Apple Silicon page again; protect runs around it.
+#ifdef FEX_IOS_HOST
+        constexpr uint64_t StepSize = 0x4000ULL;
+        constexpr uint64_t StepMask = ~(StepSize - 1);
+#else
+        constexpr uint64_t StepSize = FEXCore::Utils::FEX_PAGE_SIZE;
+        constexpr uint64_t StepMask = FEXCore::Utils::FEX_PAGE_MASK;
+#endif
+        uint64_t RunBegin = Address;
+        for (uint64_t Page = Address & StepMask; Page < ProtectEnd; Page += StepSize) {
+          if (IsHotSMCPage(Page)) {
+            const uint64_t SkipStart = std::max(Page, Address);
+            if (RunBegin < SkipStart) {
+              Protect(RunBegin, SkipStart);
+            }
+            RunBegin = std::min(Page + StepSize, ProtectEnd);
+          }
+        }
+        if (RunBegin < ProtectEnd) {
+          Protect(RunBegin, ProtectEnd);
+        }"""
+
+    patch_file(inv_c, [
+        ("InvalidationTracker.cpp HandleMemoryProtection fast path", inv_prot_old, inv_prot_new),
+        ("InvalidationTracker.cpp InvalidateAlignedInterval fast path", inv_free_old, inv_free_new),
+        ("InvalidationTracker.cpp 16KB hot SMC promotion", inv_hot_fault_old, inv_hot_fault_new),
+        ("InvalidationTracker.cpp 16KB hot SMC helpers", inv_hot_helpers_old, inv_hot_helpers_new),
+        ("InvalidationTracker.cpp 16KB hot SMC reprotect skip", inv_reprot_old, inv_reprot_new),
+    ])
+
+    print("patch-fex-ios-m5-opt: all 8 M5 v2 optimizations applied cleanly")
     return 0
 
 

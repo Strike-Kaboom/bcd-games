@@ -2844,8 +2844,10 @@ static void *wine_process_thread(void *arg) {
              *     [xp] overhead during play (set MADEIRA_PROBES=light to measure [xp-api]).
              *   - MADEIRA_NTDLL_SYNC=1: enable ntdll-sync.dll (now carrying our ARM64EC forwarded-export
              *     CHPE redirect fix) unless MADEIRA_NTDLL_XSEC=1 or MADEIRA_NTDLL_SYNC=0.
-             *   - MADEIRA_D3D11_SRC=1: use patched d3d11-src.dll (maxFrameLatency=1, game-thread
-             *     Present1 pacer, quiet [bc-stream]) unless MADEIRA_DXMT_FRESH or MADEIRA_D3D11_SRC is set. */
+             *   - MADEIRA_DXMT_FRESH=1: use the fresh 64-bit DXMT set (our patched d3d11-src.dll with
+             *     maxFrameLatency=1, game-thread Present1 pacer, quiet [bc-stream], PLUS fresh compiled
+             *     internal Metal shaders fixing the Dark Souls III enemy-kill tessellation GPU hang)
+             *     unless MADEIRA_DXMT_FRESH or MADEIRA_D3D11_SRC is explicitly set. */
             {
                 const char *m5Opt = getenv("MADEIRA_M5_OPT");
                 if (!(m5Opt && m5Opt[0] == '0' && !m5Opt[1])) {
@@ -2856,7 +2858,10 @@ static void *wine_process_thread(void *arg) {
                         setenv("MADEIRA_NTDLL_SYNC", "1", 0);
                     }
                     if (!getenv("MADEIRA_DXMT_FRESH")) {
-                        setenv("MADEIRA_D3D11_SRC", "1", 0);
+                        const char *d11 = getenv("MADEIRA_D3D11_SRC");
+                        if (!d11 || strcmp(d11, "0") != 0) {
+                            setenv("MADEIRA_DXMT_FRESH", "1", 0);
+                        }
                     }
                 }
             }

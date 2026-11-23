@@ -1852,9 +1852,9 @@ jobs:
               raise SystemExit('Required ARM64EC direct return module was not built; refusing the fallback IPA')
           if b'callret-small-v1 madeira-bcd' not in module:
               raise SystemExit('Required ARM64EC small call-ret region module was not built; refusing the fallback IPA')
-          if b'madeira-m5-opt-v1' not in module:
-              raise SystemExit('Required ARM64EC M5 optimization patch (madeira-m5-opt-v1) was not built into xtajit64.dll')
-          print('ARM64EC rpmalloc + madeira-m5-opt-v1 build markers verified')
+          if b'madeira-m5-opt-v1' not in module or b'madeira-m5-opt-v2' not in module:
+              raise SystemExit('Required ARM64EC M5 optimization patches (madeira-m5-opt-v1/v2) were not built into xtajit64.dll')
+          print('ARM64EC rpmalloc + madeira-m5-opt-v1/v2 build markers verified')
           PYEOF
           # Verify the linked x64 entries; never silently ship a fallback DLL
           # that accepts the option but lacks the required interop ABI.
@@ -2175,8 +2175,8 @@ jobs:
                       "Payload/Madeira.app/arm64ec-windows/xtajit64.dll"):
               if not any(n.startswith(req) for n in names):
                   sys.exit(f"ERROR: missing required file/extension {req} in unsigned IPA")
-          if b"madeira-m5-opt-v1" not in z.read("Payload/Madeira.app/arm64ec-windows/xtajit64.dll"):
-              sys.exit("ERROR: xtajit64.dll missing madeira-m5-opt-v1 marker")
+          if b"madeira-m5-opt-v1" not in z.read("Payload/Madeira.app/arm64ec-windows/xtajit64.dll") or b"madeira-m5-opt-v2" not in z.read("Payload/Madeira.app/arm64ec-windows/xtajit64.dll"):
+              sys.exit("ERROR: xtajit64.dll missing madeira-m5-opt-v1/v2 marker")
           if b"[m5-latency] madeira-m5" not in z.read("Payload/Madeira.app/arm64ec-windows/d3d11-src.dll"):
               sys.exit("ERROR: d3d11-src.dll missing [m5-latency] madeira-m5 marker")
           print(f"OK: {sys.argv[1]} verified clean (no proprietary binaries; both PlugIns and all M5 DLLs/markers present)")
