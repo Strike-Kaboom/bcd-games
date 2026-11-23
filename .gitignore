@@ -186,6 +186,8 @@ app/Madeira/arm64ec-windows/kernelbase-fibertrace.dll
 app/Madeira/arm64ec-windows/setupapi-optin.dll
 # build 663: the 64-bit kernel32 whose tick count needs no fault per call (tools/build-wine-extra-dlls.sh, KUD)
 app/Madeira/arm64ec-windows/kernel32-usd.dll
+app/Madeira/arm64ec-windows/kernel32-x64tid.dll
+app/Madeira/arm64ec-windows/kernelbase-x64tls.dll
 # tools/build-wine-extra-dlls.sh output (Wine's ntdll with the executable section views and two code-probe recoveries,
 # env.MADEIRA_NTDLL_XSEC = 1; thebcd69/bcd-games#4 by mckenna654), built in CI next to the shipped ntdll.dll
 app/Madeira/arm64ec-windows/ntdll-xsec.dll

@@ -55,10 +55,19 @@ fi
 # what reproduces the committed module, and on the macOS runner it aborts the
 # configure. Name it outright.
 # Always (re)configure: a cached tree from before the ASM flag would keep it.
+# madeira-m5 (2026-11-23): pick the newest Apple Silicon -mcpu target supported by this clang
+TUNE_CPU="cortex-a78"
+for cand in apple-m5 apple-m4 apple-m3 apple-m2 apple-m1; do
+    if printf 'int x;\n' | "$MINGW/arm64ec-w64-mingw32-clang" -x c -mcpu="$cand" -c - -o /dev/null 2>/dev/null; then
+        TUNE_CPU="$cand"
+        break
+    fi
+done
+echo "::notice::xtajit64.dll tuning for TUNE_CPU=$TUNE_CPU"
 {
     cmake -S "$R/FEX" -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE="$R/FEX/Data/CMake/toolchain_mingw.cmake" \
-        -DMINGW_TRIPLE=arm64ec-w64-mingw32 -DTUNE_CPU=cortex-a78 \
+        -DMINGW_TRIPLE=arm64ec-w64-mingw32 -DTUNE_CPU="$TUNE_CPU" \
         -DFEX_IOS_HOST_BUILD=ON \
         -DCMAKE_C_FLAGS=-DFEX_IOS_HOST=1 -DCMAKE_CXX_FLAGS=-DFEX_IOS_HOST=1 \
         -DCMAKE_ASM_FLAGS=-DFEX_IOS_HOST=1 \
@@ -256,12 +265,15 @@ python3 "$R/tools/patch-fex-ios-repne-bit-ops.py" "$R/FEX" || echo "::warning::t
 # suspend doorbell test (the callee's own entry point, or ExitFunctionEC, tested it on the way): two instructions fewer per call return. Default off:
 # every entry point is emitted as before. Last, so its anchors are the other overlays' output.
 python3 "$R/tools/patch-fex-ios-callret-lean.py" "$R/FEX" || echo "::warning::the lean call return was not applied (FEX anchor changed); xtajit64.dll is built without it"
+# madeira-m5 (2026-11-23): Apple M5 ISA (FRINTTS/RPRES/CSSC/ECV/WFXT + 128B line), volatile-metadata TSO fix,
+# CompileBlock hot-path cleanup, CNTVCT_EL0 L1 stats + 32K->512K L1 cache, default MADEIRA_SMC_HOT_PAGE=64.
+python3 "$R/tools/patch-fex-ios-m5-opt.py" "$R/FEX"
 # Opt-in, whichever pin (round 670; the owner's yes of 2026-11-18 to the engine review's I10): MADEIRA_FEX_EC_EXIT_POOL=1 installs
 # ExitFunctionECJitPool, the lean JIT exit with a per-thread hint for targets that are already pool addresses (method tables of an
 # image's pool copy), which ExitFunctionECJit walks the whole alias table for. Last, after every overlay that touches Module.cpp.
 python3 "$R/tools/patch-fex-ios-ec-exit-pool.py" "$R/FEX"
 build
-git -C FEX checkout -- "$CPUF" Source/Windows/ARM64EC/Module.cpp Source/Windows/ARM64EC/Module.S Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/include/FEXCore/Debug/InternalThreadState.h FEXCore/Source/Interface/Core/Core.cpp Source/Windows/Common/CallRetStack.h FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp FEXCore/Source/Interface/Core/JIT/JIT.cpp FEXCore/Source/Interface/Core/JIT/MiscOps.cpp FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h FEXCore/Source/Interface/IR/IntrusiveIRList.h FEXCore/Source/Interface/IR/IREmitter.h FEXCore/Source/Interface/Core/OpcodeDispatcher.h FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp FEXCore/Source/Interface/Core/Frontend.h FEXCore/Source/Interface/Core/Frontend.cpp FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp FEXCore/Source/Utils/AllocWatch.cpp FEXCore/Source/Interface/Core/JIT/JITClass.h
+git -C FEX checkout -- "$CPUF" Source/Windows/ARM64EC/Module.cpp Source/Windows/ARM64EC/Module.S Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/include/FEXCore/Debug/InternalThreadState.h FEXCore/Source/Interface/Core/Core.cpp FEXCore/Source/Interface/Core/LookupCache.h Source/Windows/Common/CallRetStack.h FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp FEXCore/Source/Interface/Core/JIT/JIT.cpp FEXCore/Source/Interface/Core/JIT/MiscOps.cpp FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h FEXCore/Source/Interface/IR/IntrusiveIRList.h FEXCore/Source/Interface/IR/IREmitter.h FEXCore/Source/Interface/Core/OpcodeDispatcher.h FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp FEXCore/Source/Interface/Core/Frontend.h FEXCore/Source/Interface/Core/Frontend.cpp FEXCore/Source/Interface/Core/X86Tables/SecondaryTables.cpp FEXCore/Source/Utils/AllocWatch.cpp FEXCore/Source/Interface/Core/JIT/JITClass.h
 git -C FEX/External/rpmalloc checkout -- rpmalloc/rpmalloc.c
 cp "$B/Bin/libarm64ecfex.dll" "$SHIP"
 cp "$B/Bin/libarm64ecfex.dll" "$AVX"

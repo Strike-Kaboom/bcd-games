@@ -5082,7 +5082,8 @@ static int exec_begin_render(struct mad_exec *e) {
      * attachment-less pass unconditionally: these are the passes the
      * attachment-less change newly enabled, so they are the suspects, and the
      * host's enc# resolves straight to one of these lines. */
-    if (attachless && e->renc && g_said_attachless++ < 20000)
+    /* madeira-m5 (2026-11-23): cap [attachless] log spam at 16 lines instead of 20,000 */
+    if (attachless && e->renc && g_said_attachless++ < 16)
         d3d12_log("[attachless] enc#%u %ux%u UAV-only\n", e->renc_seq, w, h);
     if (!e->renc) { d3d12_log("[madeira-d3d12] no render encoder\n"); return 0; }
     e->enc_nrt = e->nrt; memcpy(e->enc_rt, e->rt, sizeof e->rt); e->enc_depth = e->depth;

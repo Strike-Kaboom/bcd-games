@@ -1,3 +1,15 @@
+> **Unofficial Personal M5 Optimization Fork (`Strike-Kaboom/bcd-games`)**  
+> **Includes work from BCD by thebcd69 (https://github.com/thebcd69/bcd-games).**  
+> Licensed under GPL-3.0 with `LICENSE-BCD.md` additional terms and `LICENSE-EXCEPTION.md`. Not affiliated with or endorsed by official BCD.  
+> **Key M5 iPad Pro patches (based on BCD v0.1.712, modified 2026-11-23):**
+> - Fixed ARM64EC forwarded-export CHPE redirection in `ntdll-sync.dll` (`tools/patch-wine-ntdll-ec-fwd-redirect.py`) and added x64 fast paths for `kernelbase` (`TlsGetValue`/`TlsSetValue`/`GetLastError`/`GetCurrentThreadId`/`GetCurrentProcessId`) and `kernel32` (`GetCurrentThreadId`/`GetCurrentProcessId`).
+> - Reduced D3D11/DXMT input latency (`tools/patch-dxmt-m5-latency.py`: `MADEIRA_MAX_FRAME_LATENCY=1` default, game-thread `Present1()` pacer for `MADEIRA_FPS_CAP`, and silenced native-BC `[bc-stream]` log spam).
+> - Enabled probed Apple M5 ARMv9.2 ISA features in FEX (`tools/patch-fex-ios-m5-opt.py`: `FRINTTS`, `RPRES`, `CSSC`, `ECV`, `WFXT`, 128 B cache line, Apple Silicon `-DTUNE_CPU`), fixed FEX's volatile-metadata TSO bug, removed `CompileBlock` global atomic contention / FMOD debug hook, switched L1 stats to `CNTVCT_EL0`, scaled L1 cache (`32K->512K`), and defaulted `MADEIRA_SMC_HOT_PAGE=64`.
+> - Switched app Xcode archive to `-configuration Release`, fixed main-thread `0x8BADF00D` watchdog freeze with large Steam libraries (`BCDLiveStore.swift`, `GameRecommendationsList.swift`, `GameRecommendations.swift`), gated `ios_verify_commit_zero()` behind `MADEIRA_VERIFY_COMMIT_ZERO=1`, fixed 12 GB+ `ml993` memory headroom, and capped `[attachless]` D3D12 log spam.
+> - Public CI builds cleanly without Apple's `libmetalirconverter.dylib`; inject your local copy before sideloading using `tools/inject-local-converter.py`.
+
+---
+
 <p align="center">
   <img src="assets/readme/icon.png" width="128" alt="BCD">
 </p>

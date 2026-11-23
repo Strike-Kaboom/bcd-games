@@ -2838,6 +2838,29 @@ static void *wine_process_thread(void *arg) {
                 }
             }
 
+            /* madeira-m5 (2026-11-23): Apple M5 / 12 GB+ iPad performance defaults (never overwrite
+             * explicit bcd.cfg or per-game settings; MADEIRA_M5_OPT=0 disables all of them):
+             *   - MADEIRA_PROBES=0 & MADEIRA_LEAN_DIAG=1: stop thread-suspending profilers and 4x/s
+             *     [xp] overhead during play (set MADEIRA_PROBES=light to measure [xp-api]).
+             *   - MADEIRA_NTDLL_SYNC=1: enable ntdll-sync.dll (now carrying our ARM64EC forwarded-export
+             *     CHPE redirect fix) unless MADEIRA_NTDLL_XSEC=1 or MADEIRA_NTDLL_SYNC=0.
+             *   - MADEIRA_D3D11_SRC=1: use patched d3d11-src.dll (maxFrameLatency=1, game-thread
+             *     Present1 pacer, quiet [bc-stream]) unless MADEIRA_DXMT_FRESH or MADEIRA_D3D11_SRC is set. */
+            {
+                const char *m5Opt = getenv("MADEIRA_M5_OPT");
+                if (!(m5Opt && m5Opt[0] == '0' && !m5Opt[1])) {
+                    setenv("MADEIRA_PROBES", "0", 0);
+                    setenv("MADEIRA_LEAN_DIAG", "1", 0);
+                    const char *xsec = getenv("MADEIRA_NTDLL_XSEC");
+                    if (!(xsec && xsec[0] == '1' && !xsec[1])) {
+                        setenv("MADEIRA_NTDLL_SYNC", "1", 0);
+                    }
+                    if (!getenv("MADEIRA_DXMT_FRESH")) {
+                        setenv("MADEIRA_D3D11_SRC", "1", 0);
+                    }
+                }
+            }
+
             /* madeira-bcd (2026-11-15, owner's decision: the frozen 64-bit DLLs audited and rebuilt, chosen by a key): env.MADEIRA_DXMT_FRESH = 1
              * (the game's own file, or bcd.cfg for every game) runs the 64-bit DXMT set built from BCD's dxmt pin instead of the four binaries
              * upstream committed (d3d11.dll and dxgi.dll built 2026-10-14 from dxmt 2dc8d16, d3d10core.dll and winemetal.dll built 2026-09-28
@@ -3519,6 +3542,57 @@ static void *wine_process_thread(void *arg) {
                 }
                 dprintf(STDERR_FILENO, "[shell-dir] ml719 %d repaired, %d already good\n",
                         repaired, already);
+            }
+
+            /* madeira-m5 (2026-11-23): link M5 x64 fast-path ARM64EC DLLs when present in the bundle
+             * and not opted out (placed after ml719 so existing host-check blocks remain untouched):
+             *   - kernelbase.dll -> kernelbase-x64tls.dll (TlsGetValue, TlsSetValue, GetLastError,
+             *     GetCurrentThreadId/ProcessId in x64; MADEIRA_KB_X64_TLS=0 keeps stock).
+             *   - kernel32.dll -> kernel32-x64tid.dll (KUSER_SHARED_DATA direct GetTickCount +
+             *     GetCurrentThreadId/ProcessId in x64; MADEIRA_K32_X64_TID=0 or MADEIRA_USD_DIRECT=0 skips). */
+            {
+                const char *m5Opt = getenv("MADEIRA_M5_OPT");
+                if (!(m5Opt && m5Opt[0] == '0' && !m5Opt[1])) {
+                    NSString *ecDir = [bundlePath stringByAppendingPathComponent:@"arm64ec-windows"];
+                    NSMutableArray *m5Dirs = [NSMutableArray arrayWithObject:
+                        [prefix stringByAppendingPathComponent:@"drive_c/windows/sysx64"]];
+                    if (use_arm64ec) [m5Dirs addObject:sys32Dir];
+
+                    const char *kbTlsEnv = getenv("MADEIRA_KB_X64_TLS");
+                    const char *ftEnv = getenv("MADEIRA_FIBER_TRACE");
+                    const char *optEnv = getenv("MADEIRA_OPTIN_DLLS");
+                    const char *wfEnv = getenv("MADEIRA_WIN64_FRESH");
+                    BOOL kbWanted = !(kbTlsEnv && kbTlsEnv[0] == '0' && !kbTlsEnv[1])
+                                 && !(ftEnv && ftEnv[0] == '1')
+                                 && !(wfEnv && wfEnv[0] == '1' && !wfEnv[1])
+                                 && !(optEnv && strstr(optEnv, "kernelbase"));
+                    NSString *kbTlsDll = [ecDir stringByAppendingPathComponent:@"kernelbase-x64tls.dll"];
+                    if (kbWanted && [fm fileExistsAtPath:kbTlsDll]) {
+                        for (NSString *dir in m5Dirs) {
+                            NSString *dst = [dir stringByAppendingPathComponent:@"kernelbase.dll"];
+                            [fm removeItemAtPath:dst error:nil];
+                            [fm createSymbolicLinkAtPath:dst withDestinationPath:kbTlsDll error:nil];
+                        }
+                        dprintf(STDERR_FILENO, "[WineProc] madeira-m5: kernelbase.dll -> kernelbase-x64tls.dll (TlsGetValue/TlsSetValue/GetLastError/GetCurrentThreadId in x64; %s)\n",
+                                use_arm64ec ? "system32 + sysx64" : "sysx64 only");
+                    }
+
+                    const char *k32TidEnv = getenv("MADEIRA_K32_X64_TID");
+                    const char *usdEnv = getenv("MADEIRA_USD_DIRECT");
+                    BOOL k32Wanted = !(k32TidEnv && k32TidEnv[0] == '0' && !k32TidEnv[1])
+                                  && !(usdEnv && usdEnv[0] == '0' && !usdEnv[1])
+                                  && !(wfEnv && wfEnv[0] == '1' && !wfEnv[1]);
+                    NSString *k32TidDll = [ecDir stringByAppendingPathComponent:@"kernel32-x64tid.dll"];
+                    if (k32Wanted && [fm fileExistsAtPath:k32TidDll]) {
+                        for (NSString *dir in m5Dirs) {
+                            NSString *dst = [dir stringByAppendingPathComponent:@"kernel32.dll"];
+                            [fm removeItemAtPath:dst error:nil];
+                            [fm createSymbolicLinkAtPath:dst withDestinationPath:k32TidDll error:nil];
+                        }
+                        dprintf(STDERR_FILENO, "[WineProc] madeira-m5: kernel32.dll -> kernel32-x64tid.dll (USD-direct + GetCurrentThreadId/ProcessId in x64; %s)\n",
+                                use_arm64ec ? "system32 + sysx64" : "sysx64 only");
+                    }
+                }
             }
 
             /* madeira-bcd: the same folders for the user Wine actually runs as.

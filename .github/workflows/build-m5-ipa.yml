@@ -1,0 +1,2220 @@
+# Portions copyright 2026 Connor Gow: code taken from https://github.com/willfaust/Madeira (pull request #462)
+# under GPL-3.0-or-later and modified for BCD in November 2026. See THIRD-PARTY-NOTICES.md.
+# Portions copyright 2026 Russell Barton: code taken from https://github.com/thebcd69/bcd-games (pull request #46 by rbarton124)
+# under GPL-3.0-or-later with the Madeira Converter Exception and modified for BCD in November 2026. See THIRD-PARTY-NOTICES.md.
+name: Build BCD-M5 IPA (unsigned)
+
+on:
+  workflow_dispatch:
+  # Paused while builds run on the owner's Mac (2026-10-13). To build on push
+  # to main again, uncomment the three lines below.
+  # push:
+  #   branches: [main]
+  #   paths: [".github/workflows/build-ipa.yml"]
+
+# A push and a manual dispatch seconds apart used to start two parallel
+# multi-hour macOS jobs on the same commit.
+concurrency:
+  group: build-m5-ipa
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # madeira-m5 (2026-11-23): build on Strike-Kaboom/bcd-games using macos-26 (Xcode 26 / iOS 26 SDK).
+    if: github.repository == 'Strike-Kaboom/bcd-games'
+    runs-on: macos-26
+    permissions:
+      contents: read
+      actions: read
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select newest Xcode
+        shell: bash
+        run: |
+          echo "-- installed Xcodes --"
+          ls -d /Applications/Xcode*.app 2>/dev/null || echo "(none beyond the default)"
+          NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$NEWEST" ]; then
+            sudo xcode-select -s "$NEWEST/Contents/Developer"
+            echo "::notice::selected $NEWEST"
+          fi
+
+      - name: Build number
+        id: bn
+        shell: bash
+        run: |
+          n=$(grep -v '^#' docs/local-build/BUILD-NUMBER | tr -d '[:space:]')
+          case "$n" in
+            ''|*[!0-9]*) echo "::error::docs/local-build/BUILD-NUMBER holds no build number"; exit 1 ;;
+          esac
+          echo "n=$n" >> "$GITHUB_OUTPUT"
+          echo "::notice::build $n (GitHub run #${{ github.run_number }})"
+
+      - name: Toolchain versions
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+          clang --version
+
+      # madeira-m5 (2026-11-23): fast (~2 min) core engine & M5 regression host checks
+      - name: Run M5 and core engine host checks
+        run: |
+          python3 tests/host/check-game-recommendations.py --require-swift
+          python3 tests/host/check-d3d11-src.py
+          python3 tests/host/check-d3d11-src-fixes.py
+          python3 tests/host/check-dxmt-patch-chain.py
+          python3 tests/host/check-dxmt-fresh.py
+          python3 tests/host/check-fex-ec-exit-pool.py
+          python3 tests/host/check-fex-l1-invalidate.py
+          python3 tests/host/check-fex-callret-lean.py
+          python3 tests/host/check-kernel32-usd-direct.py
+          python3 tests/host/check-ntdll-sync.py
+          python3 tests/host/check-sched-hints.py
+          python3 tests/host/check-ota-variants.py
+          python3 tests/host/check-notices.py
+
+      - name: Install newer bison (macOS ships an ancient 2.3)
+        run: |
+          brew install bison
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+
+      - name: Install llvm (need lld/llvm-dlltool for aarch64-windows PE cross target)
+        run: |
+          brew install llvm lld
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+
+      - name: Wine submodule revision
+        id: winerev
+        shell: bash
+        run: echo "sha=$(git -C wine rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Work around wine's uncommitted arm64ec_x64_export_iat.c
+        shell: bash
+        run: |
+          F=wine/dlls/ntdll/arm64ec_x64_export_iat.c
+          if [ -f "$F" ]; then
+            echo "::notice::$F is present upstream now -- this step can go"
+          else
+            printf '/* placeholder: see build-ipa.yml; PE-side only, never compiled here */\n' > "$F"
+            echo "::warning::$F missing from the wine fork -- empty placeholder written for makedep"
+          fi
+          # dlls/ntdll/unix/sync.c includes build/madeira_cfg.h BEFORE config.h,
+          # on purpose (ml1122: Wine's headers ban strncpy by macro). makedep
+          # treats that ordering as fatal, so configure never writes a
+          # Makefile. Upstream builds from a long-configured tree and never
+          # meets it. Make that one sanity check a warning.
+          MD=wine/tools/makedep.c
+          python3 - "$MD" <<'PYEOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          old = 'fatal_error( "%s must be included before other headers\\n", file->name );'
+          new = ('fprintf( stderr, "%s:%d: warning: %s must be included before other headers '
+                 '(madeira-bcd CI: not fatal)\\n", input_file_name, input_line, file->name );')
+          if new in s:
+              print("makedep: already patched")
+          elif s.count(old) == 1:
+              open(p, "w").write(s.replace(old, new))
+              print("makedep: config.h ordering check is now a warning")
+          else:
+              print("::error::makedep.c anchor not found -- wine moved, review this step")
+              sys.exit(1)
+          # The WoW64 series' wine (125hz pr/wow64-core) includes Madeira's
+          # iOS shim headers (ios_fastsync.h, ios_srv_stats.h, ...) by bare
+          # name; the iOS builds find them with -I build/ntdll-unix/shims,
+          # makedep does not and stops configure. They are outside the tree
+          # like a system header, so skip them the way makedep skips those.
+          s = open(p).read()
+          old = '    if (make->external) return NULL; /* ignore missing files in external libs */\n'
+          new = old + ('    if (!strncmp( source->name, "ios_", 4 )) return NULL;  '
+                       '/* madeira-bcd CI: build/ntdll-unix/shims */\n')
+          if new in s:
+              print("makedep: ios_* shims already skipped")
+          elif s.count(old) == 1:
+              open(p, "w").write(s.replace(old, new))
+              print("makedep: missing ios_* shim headers are skipped")
+          else:
+              print("::error::makedep.c external-lib anchor not found -- wine moved, review this step")
+              sys.exit(1)
+          PYEOF
+
+      - name: Restore native wine tools
+        id: winenative
+        uses: actions/cache/restore@v4
+        with:
+          path: wine/build-native
+          key: wine-native-v1-${{ steps.winerev.outputs.sha }}
+
+      - name: "Build native wine (for host-side tools: widl/wrc/wmc)"
+        if: steps.winenative.outputs.cache-hit != 'true'
+        run: |
+          cd wine
+          mkdir -p build-native
+          cd build-native
+          # LOCAL (x86_64 Mac): an x86_64 host's configure defaults to a 32-bit Wine,
+          # which macOS cannot build ("gcc -m32 works... no"); arm64 hosts are 64-bit.
+          W64=""; [ "$(uname -m)" = x86_64 ] && W64=--enable-win64
+          ../configure $W64 > "$GITHUB_WORKSPACE/wine-native-configure.log" 2>&1 || true
+          # Only the host tools and the generated headers are used from this
+          # tree. A full host build also compiles the iOS-only unix sources
+          # for macOS, and one failure there used to stop make before widl.
+          N=$(sysctl -n hw.ncpu)
+          { make -j"$N" __tools__ && make -j"$N" include; } > "$GITHUB_WORKSPACE/wine-native-make.log" 2>&1 \
+            || make -k -j"$N" >> "$GITHUB_WORKSPACE/wine-native-make.log" 2>&1 || true
+
+      - name: Save native wine tools
+        if: steps.winenative.outputs.cache-hit != 'true' && hashFiles('wine/build-native/tools/widl/widl') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: wine/build-native
+          key: wine-native-v1-${{ steps.winerev.outputs.sha }}
+
+      - name: Diagnose native wine tools build
+        run: |
+          echo "-- looking for widl (proof the native tools built) --"
+          find wine/build-native/tools -maxdepth 2 -name "widl*" 2>&1 || echo "not found"
+          if [ ! -x wine/build-native/tools/widl/widl ]; then
+            echo "::error::native widl NOT built -- dumping tails"
+            NCTAIL=$(tail -n 30 wine-native-configure.log 2>/dev/null | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::native configure TAIL :: $NCTAIL"
+            NMTAIL=$(tail -n 40 wine-native-make.log 2>/dev/null | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::native make TAIL :: $NMTAIL"
+          else
+            echo "::notice::native widl built OK"
+          fi
+
+      - name: Configure wine (build-macos, cross)
+        run: |
+          cd wine
+          mkdir -p build-macos
+          cd build-macos
+          ../configure --enable-win64 --disable-tests \
+            CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0" \
+            CROSSCC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0" \
+            --host=aarch64-apple-darwin --build=x86_64-apple-darwin \
+            --with-wine-tools="$GITHUB_WORKSPACE/wine/build-native" \
+            --without-freetype --without-fontconfig \
+            --without-x --without-opengl --without-vulkan \
+            --without-gnutls --without-pcsclite --without-usb \
+            --without-v4l2 --without-gphoto --without-inotify \
+            --without-sane --without-pulse --without-alsa --without-oss \
+            --without-capi --without-cups --without-krb5 --without-ldap \
+            --without-netapi --without-sdl --without-udev --without-unwind \
+            > "$GITHUB_WORKSPACE/wine-configure.log" 2>&1 || true
+
+      - name: Generate cross-tree headers and patch config.h for iOS SDK
+        shell: bash
+        run: |
+          make -C wine/build-macos include -j"$(sysctl -n hw.ncpu)" > "$GITHUB_WORKSPACE/make-include.log" 2>&1 || true
+          cp -n wine/build-native/include/*.h wine/build-macos/include/ 2>/dev/null || true
+          CFG=wine/build-macos/include/config.h
+          {
+            echo ""
+            echo "/* iOS SDK fixups appended by CI */"
+            echo "#undef HAVE_GETATTRLIST"
+            echo "/* pipe2() is new in iOS 27's libc: with the iOS 27 SDK configure finds it, the app"
+            echo " * imports it weakly, and on iOS 26 and older the call goes to address 0 and every game"
+            echo " * launch crashes in server_pipe (0.1.682, iPadOS 26.6.2 crash reports). The app runs"
+            echo " * on iOS 18 and later: use pipe() + FD_CLOEXEC, as Wine does without pipe2. */"
+            echo "#undef HAVE_PIPE2"
+            echo "#ifndef D_TAPE"
+            echo "#define D_TAPE 1"
+            echo "#endif"
+            echo "#ifndef D_DISK"
+            echo "#define D_DISK 2"
+            echo "#endif"
+            echo "#ifndef D_TTY"
+            echo "#define D_TTY 3"
+            echo "#endif"
+            echo ""
+            echo "/* Wine configure runs --without-gnutls here (the host has no"
+            echo " * gnutls for the iOS sysroot), so config.h defines neither of"
+            echo " * these. But dlls/bcrypt/gnutls.c is wrapped head-to-toe in"
+            echo " * #ifdef HAVE_GNUTLS_CIPHER_INIT and dlls/secur32/schannel_gnutls.c"
+            echo " * in #ifdef SONAME_LIBGNUTLS -- undefined, both compile to an"
+            echo " * EMPTY object, __wine_unix_call_funcs is never emitted, and the"
+            echo " * app link dies on _bcrypt_unix_call_funcs / _secur32_unix_call_funcs."
+            echo " * We link toolchains/gnutls-ios statically and ios_gnutls_shim.h"
+            echo " * rewrites dlopen/dlsym onto a static symtab, so the soname string"
+            echo " * is only ever pattern-matched, never actually dlopen()ed. */"
+            echo "#ifndef SONAME_LIBGNUTLS"
+            echo "#define SONAME_LIBGNUTLS \"libgnutls.so.30\""
+            echo "#endif"
+            echo "#ifndef HAVE_GNUTLS_CIPHER_INIT"
+            echo "#define HAVE_GNUTLS_CIPHER_INIT 1"
+            echo "#endif"
+          } >> "$CFG"
+          if [ -f wine/build-macos/include/dwrite.h ]; then
+            echo "::notice::dwrite.h present in cross tree"
+          else
+            echo "::error::dwrite.h STILL MISSING"
+            LS=$(ls wine/build-native/include/ 2>&1 | head -40 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::native include dir :: $LS"
+            T=$(tail -n 20 "$GITHUB_WORKSPACE/make-include.log" 2>/dev/null | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::make include tail :: $T"
+          fi
+
+      - name: Diagnose wine build-macos state
+        run: |
+          echo "-- listing wine/build-macos (depth 2) --"
+          find wine/build-macos -maxdepth 2 2>&1 | head -60 || echo "wine/build-macos missing entirely"
+          if [ -f wine/build-macos/include/config.h ]; then
+            echo "::notice::config.h EXISTS, $(wc -l < wine/build-macos/include/config.h) lines"
+          else
+            echo "::error::config.h MISSING at wine/build-macos/include/config.h -- configure did not actually produce it"
+            LINES=$(wc -l < wine-configure.log 2>/dev/null || echo 0)
+            echo "::error::wine-configure.log has $LINES lines total"
+            HEAD=$(head -n 25 wine-configure.log 2>/dev/null | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::configure HEAD :: $HEAD"
+            TAIL=$(tail -n 40 wine-configure.log 2>/dev/null | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::configure TAIL :: $TAIL"
+          fi
+
+      - name: Clone freetype 2.13.3
+        run: git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
+
+      - name: Build freetype-ios
+        run: bash build/freetype-ios/build.sh
+
+      - name: Restore GnuTLS iOS stack
+        id: gnutlscache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/gnutls-ios
+            build/gnutls-ios/obj
+            build/gnutls-ios/src
+          key: gnutls-ios-gmp6.3.0-nettle3.10.1-gnutls3.8.9-v1
+
+      - name: Build GnuTLS stack for iOS
+        if: steps.gnutlscache.outputs.cache-hit != 'true'
+        run: bash build/gnutls-ios/build.sh
+
+      - name: Verify GnuTLS iOS headers and libs
+        shell: bash
+        run: |
+          set +e
+          shopt -s nullglob
+          LIBS=(toolchains/gnutls-ios/lib/*.a)
+          echo "gnutls-ios libs: ${#LIBS[@]}"
+          ls toolchains/gnutls-ios/include/gnutls/gnutls.h 2>&1
+          if [ ! -f toolchains/gnutls-ios/include/gnutls/gnutls.h ]; then
+            echo "::error::gnutls headers missing -- bcrypt/secur32 unixlibs will not link"
+            exit 1
+          fi
+
+      - name: Save GnuTLS iOS stack
+        if: steps.gnutlscache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/gnutls-ios
+            build/gnutls-ios/obj
+            build/gnutls-ios/src
+          key: gnutls-ios-gmp6.3.0-nettle3.10.1-gnutls3.8.9-v1
+
+      - name: Restore FFmpeg iOS
+        id: ffmpegcache
+        uses: actions/cache/restore@v4
+        with:
+          path: toolchains/ffmpeg-ios
+          key: ffmpeg-ios-${{ hashFiles('build/ffmpeg/build.sh', 'build/ffmpeg/src/SHA256SUMS') }}
+
+      - name: Build FFmpeg for iOS
+        shell: bash
+        run: |
+          if [ "${{ steps.ffmpegcache.outputs.cache-hit }}" = "true" ]; then
+            for lib in libavformat libavcodec libswresample libavutil; do
+              cp toolchains/ffmpeg-ios/lib/$lib.a app/Madeira/$lib.a
+            done
+            echo "FFmpeg restored from cache"
+          else
+            bash build/ffmpeg/build.sh
+          fi
+          ls -la app/Madeira/libav*.a app/Madeira/libswresample.a
+
+      - name: Save FFmpeg iOS
+        if: steps.ffmpegcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: toolchains/ffmpeg-ios
+          key: ffmpeg-ios-${{ hashFiles('build/ffmpeg/build.sh', 'build/ffmpeg/src/SHA256SUMS') }}
+
+      - name: Restore OpenGL libraries (MoltenVK, Mesa OSMesa + Zink)
+        id: glcache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            app/Madeira/gl/*.dylib
+            app/Madeira/gl/*.version
+            app/Madeira/licenses/Mesa-license.rst
+            app/Madeira/licenses/MoltenVK-Apache-2.0.txt
+            app/Madeira/licenses/SPIRV-Cross-Apache-2.0.txt
+            app/Madeira/licenses/SPIRV-Tools-Apache-2.0.txt
+            app/Madeira/licenses/cereal-BSD-3-Clause.txt
+          key: opengl-libs-v1-${{ hashFiles('build/mesa-ios/build.sh', 'build/mesa-ios/ios-arm64.cross', 'build/mesa-ios/patches/*.patch', 'build/moltenvk-ios/build.sh') }}
+
+      - name: Build MoltenVK for iOS
+        if: steps.glcache.outputs.cache-hit != 'true'
+        run: bash build/moltenvk-ios/build.sh
+
+      - name: Build Mesa OSMesa + Zink for iOS
+        if: steps.glcache.outputs.cache-hit != 'true'
+        run: bash build/mesa-ios/build.sh
+
+      - name: Save OpenGL libraries
+        if: steps.glcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            app/Madeira/gl/*.dylib
+            app/Madeira/gl/*.version
+            app/Madeira/licenses/Mesa-license.rst
+            app/Madeira/licenses/MoltenVK-Apache-2.0.txt
+            app/Madeira/licenses/SPIRV-Cross-Apache-2.0.txt
+            app/Madeira/licenses/SPIRV-Tools-Apache-2.0.txt
+            app/Madeira/licenses/cereal-BSD-3-Clause.txt
+          key: opengl-libs-v1-${{ hashFiles('build/mesa-ios/build.sh', 'build/mesa-ios/ios-arm64.cross', 'build/mesa-ios/patches/*.patch', 'build/moltenvk-ios/build.sh') }}
+
+      - name: Restore KosmicKrisp (Mesa's Vulkan on Metal 4)
+        id: kkcache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            app/Madeira/gl/libvulkan_kosmickrisp.dylib
+            app/Madeira/gl/libvulkan_kosmickrisp.version
+            app/Madeira/licenses/KosmicKrisp-Mesa-license.rst
+          key: kosmickrisp-v1-${{ hashFiles('build/mesa-ios/build-kosmickrisp-bcd.sh', 'build/mesa-ios/build-kosmickrisp.sh', 'build/mesa-ios/build-playport-kosmickrisp.sh', 'build/mesa-ios/fetch-playport.py', 'build/mesa-ios/kk-stale-source.sh', 'build/mesa-ios/kosmickrisp-ios-arm64.cross', 'build/mesa-ios/kosmickrisp-patches/*.patch', 'build/mesa-ios/playport-patches/*.patch') }}
+
+      - name: Build KosmicKrisp for iOS
+        id: kkbuild
+        if: steps.kkcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: bash build/mesa-ios/build-kosmickrisp-bcd.sh
+
+      - name: Save KosmicKrisp
+        if: steps.kkcache.outputs.cache-hit != 'true' && steps.kkbuild.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            app/Madeira/gl/libvulkan_kosmickrisp.dylib
+            app/Madeira/gl/libvulkan_kosmickrisp.version
+            app/Madeira/licenses/KosmicKrisp-Mesa-license.rst
+          key: kosmickrisp-v1-${{ hashFiles('build/mesa-ios/build-kosmickrisp-bcd.sh', 'build/mesa-ios/build-kosmickrisp.sh', 'build/mesa-ios/build-playport-kosmickrisp.sh', 'build/mesa-ios/fetch-playport.py', 'build/mesa-ios/kk-stale-source.sh', 'build/mesa-ios/kosmickrisp-ios-arm64.cross', 'build/mesa-ios/kosmickrisp-patches/*.patch', 'build/mesa-ios/playport-patches/*.patch') }}
+
+      - name: Drop a stale KosmicKrisp after a failed build
+        if: steps.kkcache.outputs.cache-hit != 'true' && steps.kkbuild.outcome != 'success'
+        run: |
+          rm -f app/Madeira/gl/libvulkan_kosmickrisp.dylib app/Madeira/gl/libvulkan_kosmickrisp.version app/Madeira/licenses/KosmicKrisp-Mesa-license.rst
+          rm -f app/Madeira/gl/libvulkan_kosmickrisp_real.dylib
+          echo "::warning::KosmicKrisp was not built: vulkan = kosmickrisp stays off in this build"
+
+      - name: Put the kk-retry shim in front of KosmicKrisp
+        continue-on-error: true
+        run: bash build/mesa-ios/kk-retry/build.sh
+
+      - name: Build the shader translator for iOS
+        continue-on-error: true
+        run: |
+          bash build/vkd3d-msl/build.sh wine app/Madeira/gl ios
+          mv -f app/Madeira/gl/libbcd-dxbc-msl.LICENSE.txt app/Madeira/licenses/libbcd-dxbc-msl.LICENSE.txt
+          mv -f app/Madeira/gl/libbcd-dxbc-msl.SOURCE.txt app/Madeira/licenses/libbcd-dxbc-msl.SOURCE.txt
+
+      - name: Restore patched MoltenVK (second Vulkan library)
+        id: mvkpcache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            app/Madeira/gl/libMoltenVK_patched.dylib
+            app/Madeira/gl/libMoltenVK_patched.version
+          key: moltenvk-patched-v1-${{ hashFiles('build/moltenvk-ios/build-patched.sh', 'build/moltenvk-ios/patches/*.patch') }}
+
+      - name: Build patched MoltenVK for iOS
+        id: mvkpbuild
+        if: steps.mvkpcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: bash build/moltenvk-ios/build-patched.sh
+
+      - name: Save patched MoltenVK
+        if: steps.mvkpcache.outputs.cache-hit != 'true' && steps.mvkpbuild.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            app/Madeira/gl/libMoltenVK_patched.dylib
+            app/Madeira/gl/libMoltenVK_patched.version
+          key: moltenvk-patched-v1-${{ hashFiles('build/moltenvk-ios/build-patched.sh', 'build/moltenvk-ios/patches/*.patch') }}
+
+      - name: Drop a stale patched MoltenVK after a failed build
+        if: steps.mvkpcache.outputs.cache-hit != 'true' && steps.mvkpbuild.outcome != 'success'
+        run: |
+          rm -f app/Madeira/gl/libMoltenVK_patched.dylib app/Madeira/gl/libMoltenVK_patched.dylib.tmp app/Madeira/gl/libMoltenVK_patched.version
+          echo "::warning::The patched MoltenVK was not built: vulkan = moltenvk-patched stays off in this build"
+
+      - name: Patch wine with the game text-log mirror
+        run: |
+          python3 tests/host/check-guest-log.py
+          python3 tools/patch-wine-guest-log.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine text-log mirror to ignore the [DISPLAY] log level
+        run: |
+          python3 tests/host/check-guest-log-tag.py
+          python3 tools/patch-wine-guest-log-tag.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine text-log mirror to mirror the Rockstar service's own files
+        run: |
+          python3 tests/host/check-guest-log-service.py
+          python3 tools/patch-wine-guest-log-service.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine text-log mirror to mirror a Ren'Py game's error files
+        run: |
+          python3 tests/host/check-guest-log-renpy.py
+          python3 tools/patch-wine-guest-log-renpy.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine text-log mirror to keep the stack trace under an exception line
+        run: |
+          python3 tests/host/check-guest-log-trace.py
+          python3 tools/patch-wine-guest-log-trace.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine text-log mirror to drop account names
+        run: |
+          python3 tests/host/check-guest-log-redact.py
+          python3 tools/patch-wine-guest-log-redact.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine text-log mirror to hide sign-in values
+        run: |
+          python3 tests/host/check-guest-log-secrets.py
+          python3 tools/patch-wine-guest-log-secrets.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine text-log mirror with a ring of 16 lines
+        run: |
+          python3 tests/host/check-guest-log-ring.py
+          python3 tools/patch-wine-guest-log-ring.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine with the guest file trace
+        run: python3 tools/patch-wine-file-trace.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine with the file-lookup census
+        run: |
+          python3 tests/host/check-wine-file-census.py
+          python3 tools/patch-wine-file-census.py wine/dlls/ntdll/unix/file.c
+
+      - name: Check and patch GLOBALROOT DOS paths
+        run: |
+          python3 tests/host/check-globalroot.py
+          python3 tools/patch-wine-globalroot.py wine/dlls/ntdll/unix/file.c
+
+      - name: Check and patch opengl32's NULL sync
+        run: |
+          python3 tests/host/check-gl-null-sync.py
+          python3 tools/patch-wine-gl-null-sync.py wine
+
+      - name: Check and patch opt-in app-local DLL reads
+        run: |
+          python3 tests/host/check-app-local-dll.py
+          python3 tools/patch-wine-app-local-dll.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine with size queries from one fstat
+        run: python3 tools/patch-wine-file-info-fstat.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine to hide the host's version file from Windows programs
+        run: |
+          python3 tests/host/check-hide-host-version-plist.py
+          python3 tools/patch-wine-hide-host-version-plist.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine with the directory-listing census
+        run: |
+          python3 tests/host/check-wine-dir-storm.py
+          python3 tools/patch-wine-dir-storm.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine to list a file's extended attributes once
+        run: |
+          python3 tests/host/check-file-xattr-one-list.py
+          python3 tools/patch-wine-file-xattr-one-list.py wine/dlls/ntdll/unix/file.c
+
+      - name: Patch wine with the DNS trace
+        run: python3 tools/patch-wine-dns-trace.py wine/dlls/ws2_32/unixlib.c
+
+      - name: Patch wine so the DNS wrapper refuses Valve's crash upload host (on by default)
+        run: |
+          python3 tests/host/check-wine-dns-refuse-crash.py
+          python3 tools/patch-wine-dns-refuse-crash.py wine/dlls/ws2_32/unixlib.c
+
+      - name: Patch wine d3dx9 volume textures from resources
+        run: python3 tools/patch-wine-d3dx9-volume-resource.py wine
+
+      - name: Patch wine xaudio2 engine callbacks (opt-in)
+        run: |
+          python3 tests/host/check-xaudio2-callbacks.py
+          python3 tools/patch-wine-xaudio2-callbacks.py wine
+
+      - name: Patch wine vkd3d-shader to read point as a name
+        run: |
+          python3 tests/host/check-vkd3d-point-ident.py
+          python3 tools/patch-wine-vkd3d-point-ident.py wine
+
+      - name: Patch wine vkd3d-shader to honour register(ps, c0)
+        run: |
+          python3 tests/host/check-vkd3d-register-target.py
+          python3 tools/patch-wine-vkd3d-register-target.py wine
+
+      - name: Patch wine vkd3d-shader to read more HLSL keywords as names
+        run: |
+          python3 tests/host/check-vkd3d-keyword-names.py
+          python3 tools/patch-wine-vkd3d-keyword-names.py wine
+
+      - name: Patch wine d3dx10/d3dx11 compile functions to write pHResult
+        run: |
+          python3 tests/host/check-wine-d3dx-hresult.py
+          python3 tools/patch-wine-d3dx-hresult.py wine
+
+      - name: Patch wine d3dcompile with a failed-compile diagnostic
+        run: |
+          python3 tests/host/check-wine-d3dcompile-diag.py
+          python3 tools/patch-wine-d3dcompile-diag.py wine
+
+      - name: Patch wine vkd3d-utils to dump a refused shader (opt-in)
+        run: |
+          python3 tests/host/check-vkd3d-hlsl-fail-dump.py
+          python3 tools/patch-wine-vkd3d-hlsl-fail-dump.py wine
+
+      - name: Patch wine vkd3d-shader to write a loop it cannot unroll as guarded copies (opt-in)
+        run: |
+          python3 tests/host/check-vkd3d-loop-fallback.py
+          python3 tools/patch-wine-vkd3d-loop-fallback.py wine
+
+      - name: Patch wine rpcrt4 named-pipe diagnostics
+        run: python3 tools/patch-wine-rpc-np-diag.py wine
+
+      - name: Patch wine CPU-error diagnostics
+        run: python3 tools/patch-wine-cpu-error-diag.py wine
+
+      - name: Patch wine so MessageBoxTimeout honours its timeout
+        run: python3 tools/patch-wine-msgbox-timeout.py wine
+
+      - name: Patch wine wintrust diagnostics
+        run: python3 tools/patch-wine-wintrust-diag.py wine
+
+      - name: Patch wine wintrust code-signing root pin
+        run: python3 tools/patch-wine-wintrust-root-pin.py wine
+
+      - name: Patch wine with the 64-bit [steam-api] hook
+        run: |
+          python3 tests/host/check-steam-api-diag.py
+          python3 tools/patch-ntdll-unix-dbg-write-hook.py wine/dlls/ntdll/unix/debug.c
+
+      - name: Patch wine with fault-safe waiter diagnostics
+        run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
+
+      - name: Patch wine with the opt-in safe orphan-lock reaper
+        run: |
+          python3 tests/host/check-lock-orphan.py
+          python3 tools/patch-wine-lock-orphan.py wine/dlls/ntdll/unix/sync.c
+
+      - name: Patch wine with the stamped orphan-lock mode as the default
+        run: |
+          python3 tests/host/check-lock-orphan-default.py
+          python3 tools/patch-wine-lock-orphan-default.py wine/dlls/ntdll/unix/sync.c
+
+      - name: Patch wine with the fault-safe orphan-lock reads
+        run: |
+          python3 tests/host/check-orphan-safe-read.py
+          python3 tools/patch-wine-orphan-safe-read.py wine/dlls/ntdll/unix/sync.c
+
+      - name: Patch wine with the opt-in yield mode
+        run: python3 tools/patch-wine-yield-mode.py wine/dlls/ntdll/unix/sync.c
+
+      - name: Patch wine so non-alertable sleeps can run I/O completions
+        run: python3 tools/patch-wine-sleep-kernel-apc.py wine/dlls/ntdll/unix/sync.c
+
+      - name: Enable opt-in overlapped I/O completion checkpoints
+        run: python3 tools/patch-wine-overlapped-system-apc.py wine
+
+      - name: Patch wine so an infinite wait on an address can re-check every second
+        run: python3 tools/patch-wine-woa-recheck.py wine/dlls/ntdll/sync.c wine/dlls/ntdll/unix/sync.c
+
+      - name: Patch wine so a waker unlinks a waiter before it marks it woken (32-bit ntdll)
+        run: |
+          python3 tests/host/check-woa-wake-order.py
+          python3 tools/patch-wine-woa-wake-order.py wine/dlls/ntdll/sync.c
+
+      - name: Patch wine with the opt-in available memory
+        run: |
+          python3 tests/host/check-avail-phys.py
+          python3 tools/patch-wine-avail-phys.py wine/dlls/ntdll/unix/system.c
+
+      - name: Check and patch Vulkan for 32-bit programs
+        run: |
+          python3 tools/patch-wine-vulkan-wow64.py
+          grep -q wine_vk_client_ptr wine/dlls/winevulkan/vulkan_thunks.c
+          grep -q host_alloc wine/dlls/win32u/vulkan.c
+
+      - name: Build ntdll-unix
+        # Keep going so one run reports every broken stage (and caches FEX and
+        # LLVM). "Verify all linked archives exist" still fails the job before
+        # anything is archived if this produced no library.
+        continue-on-error: true
+        run: bash build/ntdll-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/ntdll.log"; exit ${PIPESTATUS[0]}
+
+      - name: Verify ntdll-unix exports the crypto call tables
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          OBJ=build/ntdll-unix/obj
+          # nm's own flags do the filtering -- -g external, -U defined-only --
+          # so match on the symbol name alone. Anchoring the whole line
+          # against "addr TYPE _name" is what made this check report every
+          # table missing even when the objects plainly defined them: the
+          # archive-member output format does not match that shape.
+          nm -gU app/Madeira/libntdll_unix.a 2>/dev/null \
+            | awk '{print $NF}' | sort -u > defined-syms.txt
+          echo "defined external symbols in libntdll_unix.a: $(wc -l < defined-syms.txt | tr -d ' ')"
+          MISSING=""
+          for s in bcrypt_unix_call_funcs secur32_unix_call_funcs crypt32_unix_call_funcs \
+                   ws2_32_unix_call_funcs dwrite_unix_call_funcs winedmo_unix_call_funcs \
+                   opengl32_unix_call_funcs opengl32_unix_call_wow64_funcs winevulkan_unix_call_funcs winevulkan_unix_call_wow64_funcs; do
+            if grep -qx "_$s" defined-syms.txt; then
+              echo "  OK   $s (defined)"
+            else
+              echo "  MISS $s"; MISSING="$MISSING $s"
+            fi
+          done
+          echo "-- object sizes (an empty object means its #ifdef guard was off) --"
+          for o in ws2_32_unixlib bcrypt_unixlib secur32_unixlib crypt32_unixlib dwrite_unixlib winedmo_unixlib opengl32_wgl opengl32_thunks winevulkan_vulkan winevulkan_thunks; do
+            if [ -f "$OBJ/$o.o" ]; then
+              printf '  %-18s %8s bytes, %s external defs\n' "$o" \
+                "$(wc -c < "$OBJ/$o.o" | tr -d ' ')" \
+                "$(nm -gU "$OBJ/$o.o" 2>/dev/null | wc -l | tr -d ' ')"
+            else
+              echo "  $o.o ABSENT"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "-- raw nm shape for bcrypt_unixlib.o --"
+            nm -gU "$OBJ/bcrypt_unixlib.o" 2>&1 | head -5 | cat -A | head -5
+            echo "::error::libntdll_unix.a defines none of ::$MISSING"
+            for o in bcrypt_unixlib secur32_unixlib crypt32_unixlib; do
+              if [ -s "$OBJ/$o.err" ]; then
+                E=$(grep -m4 -B1 -A4 "error:" "$OBJ/$o.err" | head -c 1500 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+                echo "::error::$o compile errors :: $E"
+              fi
+            done
+            exit 1
+          fi
+
+      - name: Patch wineserver thread priorities (keep pthread QoS)
+        run: python3 tools/patch-wine-thread-qos.py
+
+      - name: Patch the wineserver's cancel_process_async (keep the async alive while it is cancelled)
+        run: |
+          python3 tests/host/check-wineserver-async-cancel.py
+          python3 tools/patch-wineserver-async-cancel.py wine
+
+      - name: Patch the wineserver's process log
+        run: |
+          python3 tests/host/check-wineserver-proc-log.py
+          python3 tools/patch-wineserver-proc-log.py wine
+
+      - name: Patch the wineserver's failed named-object opens (log)
+        run: |
+          python3 tests/host/check-wineserver-object-open-trace.py
+          python3 tools/patch-wineserver-object-open-trace.py wine
+
+      - name: Fetch the General MIDI sound bank
+        run: bash tools/fetch-soundfont.sh
+
+      - name: Fetch the Japanese locale's font
+        run: bash tools/fetch-japanese-font.sh
+
+      - name: Build base libwineserver.a from wine/server sources
+        shell: bash
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          BD="$GITHUB_WORKSPACE/build/wineserver"
+          OBJ="$BD/obj"
+          mkdir -p "$OBJ/base"
+          FLAGS=(-arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 -O2
+            -I"$GITHUB_WORKSPACE/wine/include" -I"$GITHUB_WORKSPACE/wine/include/wine"
+            -I"$GITHUB_WORKSPACE/wine/build-macos/include"
+            -I"$BD" -I"$GITHUB_WORKSPACE/wine/server"
+            -I"$GITHUB_WORKSPACE/build/ntdll-unix/shims"
+            -include "$BD/config_ios.h" -include stdarg.h
+            -include "$BD/unicode_fix.h" -include "$BD/wineserver_ios_kill.h"
+            -DBINDIR=\"/usr/local/bin\" -DDATADIR=\"/usr/local/share\"
+            -D__WINESRC__ -DWINE_IOS=1 -Dmain=wineserver_main
+            -Wno-implicit-function-declaration)
+          OK=0; BAD=0; BADLIST=""
+          for src in "$GITHUB_WORKSPACE"/wine/server/*.c; do
+            n=$(basename "$src" .c)
+            if xcrun -sdk iphoneos clang "${FLAGS[@]}" -c "$src" -o "$OBJ/base/$n.o" 2>"$OBJ/base/$n.err"; then
+              OK=$((OK+1))
+            else
+              BAD=$((BAD+1)); BADLIST="$BADLIST $n"
+            fi
+          done
+          echo "base compile: $OK ok, $BAD failed:$BADLIST"
+          echo "::notice::base wineserver compile :: $OK ok, $BAD failed:$BADLIST"
+          ar rcs "$OBJ/libwineserver.a" "$OBJ"/base/*.o
+          echo "::notice::base libwineserver.a $(wc -c < "$OBJ/libwineserver.a" | tr -d ' ') bytes"
+          # surface the first few real failures so we can judge if any matter
+          M=0
+          for f in $(grep -rl "error:" "$OBJ/base" --include="*.err" 2>/dev/null | head -3); do
+            M=$((M+1))
+            MSG=$(grep -m3 -A3 "error:" "$f" | head -c 1200 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::base compile error in $f :: $MSG"
+          done
+
+      - name: Build wineserver
+        # Keep going so one run reports every broken stage (and caches FEX and
+        # LLVM). "Verify all linked archives exist" still fails the job before
+        # anything is archived if this produced no library.
+        continue-on-error: true
+        run: bash build/wineserver/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/wineserver.log"; exit ${PIPESTATUS[0]}
+
+      - name: Patch Wine's win32u Vulkan present (Windows Vulkan)
+        run: |
+          python3 tools/patch-wine-vulkan-suboptimal.py
+          grep -q MADEIRA_VK_HOST_SUBOPTIMAL wine/dlls/win32u/vulkan.c
+
+      - name: Check and patch Wine's win32u Vulkan present (frame ring)
+        run: |
+          python3 tests/host/check-vk-present-ring.py --require-wine
+          python3 tools/patch-wine-vulkan-frame-ring.py
+          grep -q "madeira-bcd frame ring (Vulkan)" wine/dlls/win32u/vulkan.c
+
+      - name: Check and patch Wine's win32u Vulkan present (frame-rate limit)
+        run: |
+          python3 tests/host/check-vk-fps-cap.py --require-wine
+          python3 tools/patch-wine-vulkan-fps-cap.py
+          grep -q "madeira-bcd fps cap (Vulkan)" wine/dlls/win32u/vulkan.c
+
+      - name: Patch Wine's win32u NtGdiEnumFonts (a face name that does not fit)
+        run: |
+          python3 tests/host/check-wine-enumfonts-facename.py
+          python3 tools/patch-wine-enumfonts-facename.py wine
+          grep -q "madeira-bcd: NtGdiEnumFonts face name" wine/dlls/win32u/font.c
+
+      - name: Build win32u-unix
+        # Keep going so one run reports every broken stage (and caches FEX and
+        # LLVM). "Verify all linked archives exist" still fails the job before
+        # anything is archived if this produced no library.
+        continue-on-error: true
+        run: bash build/win32u-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/win32u.log"; exit ${PIPESTATUS[0]}
+
+      - name: Restore llvm-mingw
+        id: mingwcache
+        uses: actions/cache/restore@v4
+        with:
+          path: toolchains/llvm-mingw-20260421-ucrt-macos-universal
+          key: llvm-mingw-20260421-ucrt-macos-universal
+
+      - name: Install ninja/meson and fetch llvm-mingw
+        shell: bash
+        run: |
+          brew install ninja meson
+          mkdir -p toolchains
+          MINGW=toolchains/llvm-mingw-20260421-ucrt-macos-universal
+          if [ -x "$MINGW/bin/arm64ec-w64-mingw32-clang++" ]; then
+            echo "::notice::llvm-mingw restored from cache"
+            echo "MINGW_OK=1" >> "$GITHUB_ENV"
+          else
+            # Piping curl into tar hid a failed download. Run 71 received 92
+            # bytes of error page, tar said "Unrecognized archive format", the
+            # step exited 0, and the IPA shipped the committed xtajit64.dll
+            # instead of ours -- with the job green throughout. Download to a
+            # file, retry, and check what arrived before unpacking.
+            URL=https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz
+            for try in 1 2 3; do
+              curl -fL --retry 3 --retry-delay 5 -o /tmp/mingw.tar.xz "$URL" && break
+              echo "download attempt $try failed"
+              sleep $((try * 5))
+            done
+            SZ=$(wc -c < /tmp/mingw.tar.xz 2>/dev/null || echo 0)
+            echo "downloaded $SZ bytes"
+            if [ "$SZ" -lt 10000000 ]; then
+              echo "::error::llvm-mingw download failed -- $SZ bytes is not an archive; \
+          the IPA will carry the COMMITTED xtajit64.dll, not the one we build"
+            else
+              tar -xJf /tmp/mingw.tar.xz -C toolchains/
+              echo "::notice::llvm-mingw unpacked ($SZ bytes)"
+              echo "MINGW_OK=1" >> "$GITHUB_ENV"
+            fi
+          fi
+          ls toolchains/
+
+      - name: Save llvm-mingw
+        if: env.MINGW_OK == '1' && steps.mingwcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: toolchains/llvm-mingw-20260421-ucrt-macos-universal
+          key: llvm-mingw-20260421-ucrt-macos-universal
+
+      - name: Restore GC64 LuaJIT (LOVE games)
+        id: lovecache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            app/Madeira/compat/love/lua51.dll
+            app/Madeira/compat/love/lua51.dll.version
+            app/Madeira/compat/lua-c-comments/lua51.dll
+            app/Madeira/licenses/LuaJIT-MIT.txt
+          key: luajit-gc64-v1-${{ hashFiles('build/luajit-x64/build.sh', 'build/luajit-x64/*.patch') }}
+
+      - name: Build the GC64 LuaJIT (LOVE games)
+        if: steps.lovecache.outputs.cache-hit != 'true' && env.MINGW_OK == '1'
+        continue-on-error: true
+        run: bash build/luajit-x64/build.sh
+
+      - name: Save GC64 LuaJIT (LOVE games)
+        if: steps.lovecache.outputs.cache-hit != 'true' && hashFiles('app/Madeira/compat/love/lua51.dll') != '' && hashFiles('app/Madeira/compat/lua-c-comments/lua51.dll') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            app/Madeira/compat/love/lua51.dll
+            app/Madeira/compat/love/lua51.dll.version
+            app/Madeira/compat/lua-c-comments/lua51.dll
+            app/Madeira/licenses/LuaJIT-MIT.txt
+          key: luajit-gc64-v1-${{ hashFiles('build/luajit-x64/build.sh', 'build/luajit-x64/*.patch') }}
+
+      - name: Build dxgi-src.dll (DXMT dxgi from source, IDXGIFactory7)
+        continue-on-error: true
+        run: bash tools/build-dxgi-dll.sh
+
+      - name: Build d3d11-src.dll (DXMT d3d11 from source, SwapDeviceContextState)
+        continue-on-error: true
+        run: bash tools/build-d3d11-dll.sh
+
+      - name: FEX submodule revision
+        id: fexrev
+        shell: bash
+        run: echo "sha=$(git -C FEX rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore FEX iOS build
+        id: fexcache
+        uses: actions/cache/restore@v4
+        with:
+          path: FEX/build-ios
+          key: fex-ios-${{ steps.fexrev.outputs.sha }}-v3
+
+      - name: Patch FEX IOS_RPM_GUARD for the system-allocator branch
+        if: steps.fexcache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          python3 - FEX/FEXCore/Source/Utils/AllocatorHooks.cpp <<'PYEOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          guard = "#ifndef IOS_RPM_GUARD\n#define IOS_RPM_GUARD() ((void)0)\n#endif\n"
+          anchor = "size_t malloc_usable_size(void* ptr) {\n  IOS_RPM_GUARD();"
+          if guard in s:
+              print("AllocatorHooks.cpp: already patched")
+          elif s.count(anchor) >= 1:
+              # Twice: the allocator and system-allocator branches. In the first
+              # the macro already exists, so the #ifndef is inert there.
+              open(p, "w").write(s.replace(anchor, guard + anchor))
+              print("AllocatorHooks.cpp: IOS_RPM_GUARD fallback added")
+          elif "IOS_RPM_GUARD" not in s:
+              print("AllocatorHooks.cpp: no IOS_RPM_GUARD any more -- step can go")
+          else:
+              print("::error::AllocatorHooks.cpp anchor moved -- review this step")
+              sys.exit(1)
+          PYEOF
+
+      - name: Guard FEX diagnostic probes for the iOS static-lib target
+        if: steps.fexcache.outputs.cache-hit != 'true'
+        run: python3 tools/patch-fex-ios-probes.py
+
+      - name: Build FEX for iOS
+        if: steps.fexcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          # Apple builds skip Source/ (Linux-only tools) via `if (NOT APPLE)`,
+          # so only the libraries Xcode links get built.
+          # CMAKE_SYSTEM_NAME=iOS puts CMake in cross mode, where it does not
+          # infer CMAKE_SYSTEM_PROCESSOR -- FEX's CMakeLists.txt:89 then does
+          # string(TOLOWER) on an empty value and aborts with "Unsupported
+          # processor type ." Its regex accepts ^aarch64.
+          cmake -S FEX -B FEX/build-ios -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DBUILD_TESTING=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_THUNKS=OFF \
+            -DENABLE_LTO=OFF -DENABLE_CCACHE=OFF \
+            -DTUNE_CPU=generic -DTUNE_ARCH=generic \
+            -DCMAKE_DISABLE_FIND_PACKAGE_fmt=ON \
+            > "$GITHUB_WORKSPACE/fex-cfg.log" 2>&1
+          # Explicit targets: `all` would also build FEXCore_shared, which we
+          # don't link and which needs dylib settings iOS won't give us.
+          cmake --build FEX/build-ios -j"$(sysctl -n hw.ncpu)" \
+            --target FEXCore FEXCore_Base JemallocLibs \
+                     cephes_128bit softfloat_3e fmt xxhash \
+            -- -k 0 > "$GITHUB_WORKSPACE/fex-build.log" 2>&1
+
+      - name: Verify FEX iOS archives
+        if: always()
+        # LLVM still builds (and caches) in a run where FEX failed; the
+        # linked-archives check fails the job before archiving.
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          OK=1
+          for a in FEXCore/Source/libFEXCore.a FEXCore/Source/libFEXCore_Base.a \
+                   FEXCore/Source/libJemallocLibs.a External/cephes/libcephes_128bit.a \
+                   External/fmt/libfmt.a External/SoftFloat-3e/libsoftfloat_3e.a \
+                   External/xxhash/cmake_unofficial/libxxhash.a; do
+            if [ -f "FEX/build-ios/$a" ]; then
+              echo "  OK   $a ($(wc -c < "FEX/build-ios/$a" | tr -d ' ') bytes)"
+            else
+              echo "  MISS $a"; OK=0
+            fi
+          done
+          if [ "$OK" -eq 0 ]; then
+            for L in fex-cfg fex-build; do
+              if [ -f "$L.log" ]; then
+                # Compiler errors beat a blind tail: the real cause is usually
+                # hundreds of lines above the end of a ninja log.
+                E=$(grep -E "error:|CMake Error" "$L.log" | head -40)
+                [ -n "$E" ] || E=$(tail -n 40 "$L.log")
+                echo "::error::$L.log :: $(printf '%s' "$E" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")"
+              else
+                echo "::error::$L.log MISSING"
+              fi
+            done
+            exit 1
+          fi
+          echo "::notice::all 7 FEX archives present"
+
+      - name: Save FEX iOS build
+        if: steps.fexcache.outputs.cache-hit != 'true' && hashFiles('FEX/build-ios/FEXCore/Source/libFEXCore.a') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: FEX/build-ios
+          key: fex-ios-${{ steps.fexrev.outputs.sha }}-v3
+
+      - name: Restore FEX ARM64EC build
+        id: fexeccache
+        uses: actions/cache/restore@v4
+        with:
+          path: FEX/build-arm64ec
+          key: fex-arm64ec-${{ steps.fexrev.outputs.sha }}-v2
+
+      - name: Build xtajit64.dll (FEX fixes, AVX opt-in)
+        if: env.MINGW_OK == '1'
+        continue-on-error: true
+        run: bash tools/build-xtajit64.sh
+
+      - name: Save FEX ARM64EC build
+        if: steps.fexeccache.outputs.cache-hit != 'true' && hashFiles('FEX/build-arm64ec/Bin/libarm64ecfex.dll') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: FEX/build-arm64ec
+          key: fex-arm64ec-${{ steps.fexrev.outputs.sha }}-v2
+
+      - name: Restore FEX WOW64 build
+        id: fexwowcache
+        uses: actions/cache/restore@v4
+        with:
+          path: FEX/build-wow64
+          key: fex-wow64-${{ steps.fexrev.outputs.sha }}-v1
+
+      - name: Build xtajit.dll (WOW64, CPUID index fix)
+        if: env.MINGW_OK == '1'
+        continue-on-error: true
+        run: bash tools/build-xtajit-wow64.sh
+
+      - name: Save FEX WOW64 build
+        if: steps.fexwowcache.outputs.cache-hit != 'true' && hashFiles('FEX/build-wow64/Bin/libwow64fex.dll') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: FEX/build-wow64
+          key: fex-wow64-${{ steps.fexrev.outputs.sha }}-v1
+
+      - name: Restore LLVM 15.0.7 iOS build
+        id: llvmcache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/llvm-ios-build
+            toolchains/llvm-project
+          key: llvm-15.0.7-ios-v2
+
+      - name: Build LLVM 15.0.7 for iOS (two-stage, per build/dxmt-ios/README.md)
+        if: steps.llvmcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          git clone --depth 1 --branch llvmorg-15.0.7 \
+            https://github.com/llvm/llvm-project.git toolchains/llvm-project
+          # README: Apple ld rejects --gc-sections; make the Darwin branch cover iOS
+          sed -i '' 's/MATCHES "Darwin"/MATCHES "Darwin|iOS"/' \
+            toolchains/llvm-project/llvm/cmake/modules/AddLLVM.cmake
+          grep -n 'Darwin|iOS' toolchains/llvm-project/llvm/cmake/modules/AddLLVM.cmake | head
+          # The same for -Wl,-z,defs on shared libraries (libLTO.dylib): Xcode 27's ld refuses "-z" (build 672, the M5 Max);
+          # older Xcode ignored it. Static libraries, the ones DXMT links, are not affected.
+          sed -i '' 's/CMAKE_SYSTEM_NAME MATCHES "Darwin|FreeBSD|OpenBSD|DragonFly|AIX|SunOS|OS390"/CMAKE_SYSTEM_NAME MATCHES "Darwin|iOS|FreeBSD|OpenBSD|DragonFly|AIX|SunOS|OS390"/' \
+            toolchains/llvm-project/llvm/cmake/modules/HandleLLVMOptions.cmake
+          grep -n 'Darwin|iOS|FreeBSD' toolchains/llvm-project/llvm/cmake/modules/HandleLLVMOptions.cmake | head
+
+          # stage 1: host llvm-tblgen only (use Xcode clang, not brew's newer one)
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DLLVM_TARGETS_TO_BUILD="" -DLLVM_INCLUDE_TESTS=Off \
+            -DLLVM_INCLUDE_EXAMPLES=Off -DLLVM_INCLUDE_BENCHMARKS=Off \
+            > "$GITHUB_WORKSPACE/llvm-host-cfg.log" 2>&1
+          cmake --build toolchains/llvm-host-build --target llvm-tblgen \
+            -j"$(sysctl -n hw.ncpu)" > "$GITHUB_WORKSPACE/llvm-host-build.log" 2>&1
+
+          # stage 2: iOS target libs, reusing host tblgen
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DLLVM_TABLEGEN="$GITHUB_WORKSPACE/toolchains/llvm-host-build/bin/llvm-tblgen" \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DLLVM_BUILD_UTILS=Off -DLLVM_BUILD_TOOLS=Off \
+            -DLLVM_TARGETS_TO_BUILD="" \
+            -DLLVM_INCLUDE_TESTS=Off -DLLVM_INCLUDE_EXAMPLES=Off \
+            -DLLVM_INCLUDE_BENCHMARKS=Off -DLLVM_INCLUDE_UTILS=Off \
+            -DLLVM_ENABLE_TERMINFO=Off -DLLVM_ENABLE_LIBXML2=Off \
+            -DLLVM_ENABLE_ZSTD=Off -DLLVM_ENABLE_ZLIB=Off \
+            > "$GITHUB_WORKSPACE/llvm-ios-cfg.log" 2>&1
+          cmake --build toolchains/llvm-ios-build -j"$(sysctl -n hw.ncpu)" \
+            > "$GITHUB_WORKSPACE/llvm-ios-build.log" 2>&1
+
+      - name: Verify LLVM iOS build
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          shopt -s nullglob
+          LIBS=(toolchains/llvm-ios-build/lib/*.a)
+          N=${#LIBS[@]}
+          echo "llvm-ios-build static libs: $N"
+          echo "::notice::llvm-ios-build has $N static libs"
+          echo "-- toolchains tree --"
+          ls -la toolchains 2>&1 | head -20
+          ls -la toolchains/llvm-ios-build 2>&1 | head -20
+          if [ "$N" -lt 5 ]; then
+            for L in llvm-host-cfg llvm-host-build llvm-ios-cfg llvm-ios-build; do
+              if [ -f "$L.log" ]; then
+                T=$(tail -n 30 "$L.log" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+                echo "::error::$L.log tail :: $T"
+              else
+                echo "::error::$L.log MISSING"
+              fi
+            done
+            exit 1
+          fi
+
+      - name: Save LLVM 15.0.7 iOS build
+        if: steps.llvmcache.outputs.cache-hit != 'true' && hashFiles('toolchains/llvm-ios-build/lib/libLLVMCore.a') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/llvm-ios-build
+            toolchains/llvm-project
+          key: llvm-15.0.7-ios-v2
+
+      - name: Ensure Metal compiler
+        shell: bash
+        run: |
+          xcodebuild -version
+          if xcrun -sdk macosx metal --version 2>&1 | head -3; then
+            echo "::notice::metal compiler already present"
+          else
+            echo "metal missing -- attempting download"
+            xcodebuild -downloadComponent MetalToolchain \
+              || echo "::warning::-downloadComponent unsupported on this Xcode"
+          fi
+
+      - name: Use public Metal atomics when the compiler needs them (Xcode 27)
+        run: |
+          python3 tools/patch-dxmt-metal-atomics.py --if-needed
+          python3 tests/host/check-dxmt-metal-atomics.py --require-metal
+
+      - name: Generate DXMT shader headers
+        shell: bash
+        run: |
+          SHADERS="$GITHUB_WORKSPACE/dxmt/src/airconv/shaders"
+          OUT="$GITHUB_WORKSPACE/build/dxmt-ios/shader-headers"
+          mkdir -p "$OUT"
+          cd "$OUT"
+          for s in air_msad air_samplepos air_tessellation; do
+            xcrun -sdk macosx metal -o "$s.air" -c "$SHADERS/$s.metal" \
+              -std=metal3.1 --target=air64-apple-macos14.0
+            # meson passes `xxd -n <basename>`; that flag is not in every xxd,
+            # so rename the symbols instead (air_msad_air -> air_msad).
+            xxd -i "$s.air" | sed "s/${s}_air/${s}/g" > "$s.h"
+          done
+          ls -la
+
+      - name: Locate Metal Shader Converter headers
+        shell: bash
+        run: |
+          INC="$GITHUB_WORKSPACE/madeira-d3d12/third_party/metal-shader-converter/include"
+          if ! bash -c 'MADEIRA_MSC_HEADERS_ONLY=1 source build/madeira-d3d12/deps.sh'; then
+            echo "::error::the vendored Metal Shader Converter headers do not match their pinned hashes (build/madeira-d3d12/deps.sh)"
+            exit 1
+          fi
+          bash build/stage-licenses.sh
+          echo "MADEIRA_MSC_INCLUDE=$INC" >> "$GITHUB_ENV"
+          V=$(grep -E "define IR_VERSION_(MAJOR|MINOR|PATCH)" "$INC/metal_irconverter/ir_version.h" | awk '{print $3}' | paste -sd. -)
+          echo "::notice::Metal Shader Converter $V Apache-2.0 headers verified (libmetalirconverter.dylib intentionally omitted from public CI; inject locally via tools/inject-local-converter.py)"
+
+      - name: Build Madeira Dock host
+        continue-on-error: true
+        run: |
+          # env.MADEIRA_DOCK_GAME_SCM = 1: a service manager in the game session
+          python3 tools/patch-dock-game-scm.py madeira-dock/src/launch.c || echo "::warning::Dock game-session service manager patch not applied"
+          # env.MADEIRA_DOCK_KEEP_ALIVE = <exe>;<exe>: hold the session while a self-updating launcher restarts
+          python3 tools/patch-dock-keep-alive.py madeira-dock/src/launch.c || echo "::warning::Dock keep-alive patch not applied"
+          # night round 2026-11-11 (X2 S2; Control G2CRAR): env.MADEIRA_DOCK_KEEP_ALIVE = * holds the session while a program of the game's install folder runs
+          python3 tests/host/check-dock-keep-alive-tree.py
+          python3 tools/patch-dock-keep-alive-tree.py madeira-dock/src/launch.c || echo "::warning::Dock keep-alive tree patch not applied"
+          # round 624 (Steam 113): the published values read back while the game starts; env.MADEIRA_DOCK_PUMP_MS / _REASSERT experiments
+          python3 tools/patch-dock-steam-readback.py madeira-dock/src/launch.c || echo "::warning::Dock Steam readback patch not applied"
+          # night round 2026-11-11 (X2 S1 + S4b; K7QKB6, 25C9NT, 9HEY99, NR2WGS, KQMTVT): the discovery entries are mirrored into the 32-bit registry view (HKCU
+          # Software\Wow6432Node when the prefix has it) and steam_api's five calls are replayed and reported; env.MADEIRA_DOCK_STEAM_VIEWS = 0 skips the mirror
+          python3 tests/host/check-dock-steam-views.py
+          python3 tools/patch-dock-steam-views.py madeira-dock/src/launch.c || echo "::warning::Dock steam views patch not applied"
+          # round 630 (444TS8): a late sign-in gets 45 s for the licence list (at most 180 s); env.MADEIRA_DOCK_LICENCE_WAIT = 0: 90 s as before
+          python3 tests/host/check-dock-licence-wait.py
+          python3 tools/patch-dock-licence-wait.py madeira-dock/src/session.c || echo "::warning::Dock licence-wait patch not applied"
+          # round 632 (madeira-dock cf11b7c; 1,939 BCD Dock sessions waited a fixed 5.0 s): ownership is asked 500 ms after the sign-in; before the old 5 s only a yes
+          # counts, so nothing fails earlier than it did; env.MADEIRA_DOCK_LICENCE_WAIT_MS = 5000 gives the old timing
+          python3 tests/host/check-dock-licence-ask.py
+          python3 tools/patch-dock-licence-ask.py madeira-dock/src/session.c || echo "::warning::Dock licence-ask patch not applied"
+          # round 630 (N14Q6D): the two silent install-folder failures (host result 41) report which check failed; log only
+          python3 tests/host/check-dock-install-dir-events.py
+          python3 tools/patch-dock-install-dir-events.py madeira-dock/src/launch.c || echo "::warning::Dock install-folder events patch not applied"
+          # round 630 (BN3SXW): the Steam client entries step (42) says which part failed; a failed open is tried once more after 1 s
+          python3 tests/host/check-dock-registry-events.py
+          python3 tools/patch-dock-registry-events.py madeira-dock/src/launch.c || echo "::warning::Dock registry events patch not applied"
+          # night round 2026-11-11 (ZB8E97, RAC3KD, GNWWRT, GWX5H2, DP9TVR: launch-registry-step=2, error 2 after the retry): a missing Steam client key is
+          # created instead of ending the start in 42, and a start that still fails says which keys the host sees; env.MADEIRA_DOCK_REGISTRY_CREATE = 0 keeps the failure
+          python3 tests/host/check-dock-registry-create.py
+          python3 tools/patch-dock-registry-create.py madeira-dock/src/launch.c || echo "::warning::Dock registry create patch not applied"
+          # round 632 (Madeira #519; BCD logs: 24 sessions of 12 Steam games, ceg-result=55, and FRKBN1, ceg-request=0): Valve's CEG step in a
+          # Dock session. The registered Steam Client Service is started before the request (env.MADEIRA_DOCK_CEG_SERVICE_START = 0 skips it), a request that
+          # failed with 55 is asked again (3 times), and an OK with no job on a first request is "already prepared" (replaces round 630's keyed zero-jobs experiment)
+          python3 tests/host/check-dock-ceg-prepare.py
+          python3 tools/patch-dock-ceg-service-start.py madeira-dock/src/scm.c || echo "::warning::Dock CEG service start patch not applied"
+          # night round 2026-11-11 (G2 S3; R0GHX7, HJZJ1P, 7XG9VK, WFRZ8A): the service is looked at once more after its settle and started again when it died
+          python3 tests/host/check-dock-ceg-service-restart.py
+          python3 tools/patch-dock-ceg-service-restart.py madeira-dock/src/scm.c || echo "::warning::Dock CEG service restart patch not applied"
+          python3 tools/patch-dock-ceg-retry.py madeira-dock/src/launch.c || echo "::warning::Dock CEG retry patch not applied"
+          python3 tools/patch-dock-ceg-already-prepared.py madeira-dock/src/launch.c madeira-dock/src/validation.c || echo "::warning::Dock CEG already-prepared patch not applied"
+          # 2026-11-20 (a Discord request: Steam launch options): a Steam game's Launch arguments go to Valve's LaunchApp as its user arguments
+          # (MADEIRA_STEAM_HOST_ARGUMENTS, set by the app only when the game has some; none: "" as before)
+          python3 tests/host/check-dock-user-args.py
+          python3 tools/patch-dock-user-args.py madeira-dock/src/launch.c || echo "::warning::Dock user arguments patch not applied"
+          bash build/madeira-dock/build.sh
+
+      - name: Patch DXMT present pacing with 30/40 FPS modes
+        run: python3 tools/patch-dxmt-frame-limits.py
+
+      - name: Patch DXMT with frame generation
+        run: python3 tools/patch-dxmt-framegen.py
+
+      - name: Patch DXMT with GPU fault attribution
+        run: python3 tools/patch-dxmt-gpu-fault-info.py
+
+      - name: Patch DXMT buffer->texture blits with a depth/stencil aspect
+        run: python3 tools/patch-dxmt-b2t-aspect.py
+
+      - name: Patch DXMT with DXIL tessellation emulation
+        run: python3 tools/patch-dxmt-dxil-tess.py
+
+      - name: Patch DXMT constant buffers bound short
+        run: python3 tools/patch-dxmt-cb-short.py
+
+      - name: Patch DXMT to realign 16-bit index ranges
+        run: python3 tools/patch-dxmt-idx-align.py
+
+      - name: Patch DXMT vertex fetch bounds
+        run: python3 tools/patch-dxmt-vfetch-bounds.py
+
+      - name: Patch DXMT byte-aligned vertex fetch
+        run: python3 tools/patch-dxmt-vb-align.py
+
+      - name: Patch DXMT context state swap
+        run: python3 tools/patch-dxmt-context-state-swap.py
+
+      - name: Patch DXMT CopyStructureCount without a buffer
+        run: python3 tools/patch-dxmt-copy-structure-count.py
+
+      - name: Patch DXMT render target views on a buffer
+        run: python3 tools/patch-dxmt-buffer-rtv.py
+
+      - name: Patch DXMT SRV GetDesc mip count
+        run: python3 tools/patch-dxmt-srv-getdesc-mips.py
+
+      - name: Patch DXMT GS/TS draw-argument marshal loops
+        run: python3 tools/patch-dxmt-gsts-marshal.py
+
+      - name: Patch DXMT d3d9.customDriver
+        run: python3 tools/patch-dxmt-d3d9-custom-driver.py
+
+      - name: Patch DXMT layer format
+        run: python3 tools/patch-dxmt-layer-format.py
+
+      - name: Patch DXMT tiny fullscreen window
+        run: python3 tools/patch-dxmt-wsi-tiny-fullscreen.py
+
+      - name: Patch DXMT D3D9 fullscreen extent
+        run: python3 tools/patch-dxmt-fullscreen-extent.py
+
+      - name: Patch DXMT D3D9 index-buffer range refresh
+        run: python3 tools/patch-dxmt-d9-ib-range.py
+
+      - name: Patch DXMT D3D9 vertex-buffer range refresh
+        run: python3 tools/patch-dxmt-d9-vb-range.py
+
+      - name: Patch DXMT D3D9 query park time
+        run: python3 tools/patch-dxmt-d3d9-query-park.py
+
+      - name: Patch DXMT D3D9 texture format log
+        run: python3 tools/patch-dxmt-d9-texfmt-log.py
+
+      - name: Patch DXMT D3D9 stuck query report
+        run: python3 tools/patch-dxmt-d9-query-stuck.py
+
+      - name: Patch DXMT D3D11 stuck query report
+        run: python3 tools/patch-dxmt-d11-query-stuck.py
+
+      - name: Patch DXMT D3D9 SM3 vertex interface
+        run: python3 tools/patch-dxmt-d9-sm3-vs-interface.py
+
+      - name: Patch DXMT D3D9 lock statistics
+        run: python3 tools/patch-dxmt-d9-lock-stats.py
+
+      - name: Patch DXMT mesh pipeline failures
+        run: python3 tools/patch-dxmt-tess-pso-failed.py
+
+      - name: Patch DXMT UpdateSubresource on a staging buffer
+        run: python3 tools/patch-dxmt-update-subresource-staging.py
+
+      - name: Patch DXMT swap chain rotation
+        run: python3 tools/patch-dxmt-d11-swapchain-rotation.py
+
+      - name: Patch DXMT opt-in x64 swapchain entries
+        run: python3 tools/patch-dxmt-x64-swapchain-entry.py
+
+      - name: Patch DXMT texture size limits
+        run: python3 tools/patch-dxmt-texture-limit.py
+
+      - name: Patch DXMT view private references (opt-in)
+        run: python3 tools/patch-dxmt-view-private-ref.py
+
+      - name: Patch DXMT Lossless Scaling frame generation (opt-in)
+        run: python3 tools/patch-dxmt-lsfg.py
+
+      - name: Patch DXMT to mark the frames frame generation made
+        run: python3 tools/patch-dxmt-frames-made.py
+
+      - name: Patch DXMT fault info
+        run: python3 tools/patch-dxmt-d3d11-fault-info.py
+
+      - name: Patch DXMT M5 low-latency and quiet bc-stream
+        run: python3 tools/patch-dxmt-m5-latency.py
+
+      - name: Patch airconv lean SM50 shaders
+        run: python3 tools/patch-airconv-sm50-lean.py
+
+      - name: Patch winemetal includes for the new layout
+        run: python3 tools/patch-winemetal-layout.py
+
+      - name: Patch winemetal shared textures for iOS
+        run: python3 tools/patch-winemetal-ios-shared-texture.py
+
+      - name: Patch winemetal RAM cap for 8 GB devices
+        run: python3 tools/patch-winemetal-ram-cap.py
+
+      - name: Patch airconv float experiments
+        run: python3 tools/patch-airconv-float-experiments.py
+
+      - name: Patch airconv texture load bounds
+        run: python3 tools/patch-airconv-ld-bounds.py
+
+      - name: Patch airconv typed UAV store bounds
+        run: python3 tools/patch-airconv-uav-store-bounds.py
+
+      - name: Patch winemetal luminance probe
+        run: python3 tools/patch-winemetal-lum-probe.py
+
+      - name: Patch winemetal readback census
+        run: python3 tools/patch-winemetal-readback-census.py
+
+      - name: Patch winemetal probe safe read
+        run: python3 tools/patch-winemetal-probe-safe-read.py
+
+      - name: Patch winemetal sampler reduction
+        run: python3 tools/patch-winemetal-sampler-reduction.py
+
+      - name: Patch winemetal pipeline cache warm-up
+        run: python3 tools/patch-winemetal-pso-warm.py
+
+      - name: Patch winemetal native shader-cache access
+        run: python3 tools/patch-winemetal-sc-native.py
+
+      - name: Patch winemetal empty fragment function
+        run: python3 tools/patch-winemetal-null-fragment.py
+
+      - name: Patch winemetal impossible texture sizes
+        run: python3 tools/patch-winemetal-mtl-tex-fail.py
+
+      - name: Patch winemetal GPU error description
+        run: python3 tools/patch-winemetal-gpu-error-info.py
+
+      - name: Patch winemetal GPU timeline for [frame]
+        run: python3 tools/patch-winemetal-gpu-span.py
+
+      - name: Patch airconv God of War experiments
+        run: python3 tools/patch-airconv-gow-experiments.py
+
+      - name: Patch airconv geometry shader input system values
+        run: python3 tools/patch-airconv-gs-input-siv.py
+
+      - name: Patch airconv DEC3N and UDEC3 vertex formats
+        run: python3 tools/patch-airconv-dec3n.py
+
+      - name: Patch airconv D3D9 point size in triangle pipelines
+        run: python3 tools/patch-airconv-d9-psize-topology.py
+
+      - name: Patch airconv geometry shader instance id
+        run: python3 tools/patch-airconv-gs-instance-id.py
+
+      - name: Patch winemetal GPU trace and render-pass experiment
+        run: python3 tools/patch-winemetal-gpu-trace.py
+
+      - name: Patch winemetal GPU stall watch and slow-frame trace
+        run: python3 tools/patch-winemetal-gpu-stall.py
+
+      - name: Patch winemetal GPU time for 32-bit callers
+        run: python3 tools/patch-winemetal-ctl-gpu-time-wow64.py
+
+      - name: Patch winemetal lean render-pass descriptors
+        run: python3 tools/patch-winemetal-rp-lean.py
+
+      - name: Patch winemetal frame cap for the power governor
+        run: python3 tools/patch-winemetal-fps-cap.py
+
+      - name: Patch winemetal frame-time ring
+        run: python3 tools/patch-winemetal-frame-ring.py
+
+      - name: Patch winemetal GL presents
+        run: python3 tools/patch-winemetal-gl-present.py
+
+      - name: Patch winemetal late render-pass store actions
+        run: python3 tools/patch-winemetal-rp-store.py
+
+      - name: Patch winemetal untracked placement heaps
+        run: python3 tools/patch-winemetal-heap-untracked.py
+
+      - name: Patch winemetal weak shader-cache SPI
+        run: python3 tools/patch-winemetal-cache-spi-weak.py
+
+      - name: Patch winemetal frame generation below iOS 26
+        run: python3 tools/patch-winemetal-framegen-ios26.py
+
+      - name: Patch winemetal frame generation live control
+        run: python3 tools/patch-winemetal-framegen-live.py
+
+      - name: Patch winemetal pause while inactive
+        run: python3 tools/patch-winemetal-pause-inactive.py
+
+      - name: Patch winemetal present-fx
+        run: python3 tools/patch-winemetal-present-fx.py
+
+      - name: Patch winemetal Lossless Scaling pacing
+        run: python3 tools/patch-winemetal-lsfg-pacing.py
+
+      - name: Patch winemetal VideoToolbox frame interpolation (experiment, opt-in)
+        run: python3 tools/patch-winemetal-vt-interp.py
+
+      - name: Patch winemetal to count the frames frame generation made apart
+        run: python3 tools/patch-winemetal-frames-made.py
+
+      - name: Patch wine for the opt-in x64 machine answer (i386 farm only)
+        run: |
+          python3 tests/host/check-x64-machine.py
+          python3 tools/patch-wine-x64-machine.py wine
+
+      - name: Patch wine with the exception-handler registration log (i386 farm only)
+        run: |
+          python3 tests/host/check-veh-add-log.py
+          python3 tools/patch-wine-veh-add-log.py wine
+
+      - name: Patch wine so the exception dispatcher reads the next handler under the lock (i386 farm only)
+        run: |
+          python3 tests/host/check-veh-next-handler.py
+          python3 tools/patch-wine-veh-next-handler.py wine
+
+      - name: Patch wine with the msvcrt init diagnostics (i386 farm only)
+        run: |
+          python3 tests/host/check-msvcrt-initdiag.py
+          python3 tools/patch-wine-msvcrt-initdiag.py wine
+
+      - name: Patch wine with the executable-heap flush (i386 farm only)
+        run: |
+          python3 tests/host/check-heap-exec-flush.py
+          python3 tools/patch-wine-heap-exec-flush.py wine/dlls/ntdll/heap.c
+
+      - name: Patch wine with the loader's import diagnostics (i386 farm only)
+        run: python3 tools/patch-wine-loader-import-diag.py wine
+
+      - name: Patch wine with the loader's missing-import line and the keyed application-folder search (i386 farm only)
+        run: python3 tools/patch-wine-loader-import-appdir.py wine
+
+      - name: Patch wine so DirectInput's callbacks to the program restore the stack (i386 farm only)
+        run: |
+          python3 tests/host/check-dinput-cdecl-callbacks.py
+          python3 tools/patch-wine-dinput-cdecl-callbacks.py wine
+
+      - name: i386 farm revision
+        id: i386rev
+        shell: bash
+        run: echo "key=i386-farm-$(git -C wine rev-parse HEAD)-$(git -C dxmt rev-parse HEAD)-${{ hashFiles('build/wine-i386/build.sh', 'tools/patch-dxmt-*.py', 'tools/patch-wine-*.py') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore i386 farm
+        id: i386cache
+        uses: actions/cache/restore@v4
+        with:
+          path: app/Madeira/i386-windows
+          key: ${{ steps.i386rev.outputs.key }}
+
+      - name: Build i386 farm (WoW64)
+        id: i386build
+        if: steps.i386cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          bash build/wine-i386/build.sh 2>&1 | tail -60; rc=${PIPESTATUS[0]}
+          N=$(ls app/Madeira/i386-windows | wc -l | tr -d ' ')
+          echo "::notice::i386 farm: $N files (build exit $rc)"
+          [ "$rc" -eq 0 ] || { tail -40 wine/build-i386/madeira-i386-build.log 2>/dev/null; exit "$rc"; }
+
+      - name: Save i386 farm
+        if: steps.i386cache.outputs.cache-hit != 'true' && steps.i386build.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: app/Madeira/i386-windows
+          key: ${{ steps.i386rev.outputs.key }}
+
+      - name: Put back the files patched for the i386 farm only (x64 machine answer)
+        if: always()
+        run: |
+          git -C wine checkout -- dlls/ntdll/env.c dlls/kernelbase/process.c dlls/ntdll/exception.c dlls/kernelbase/debug.c dlls/msvcrt/main.c
+          git -C wine checkout -- dlls/ntdll/heap.c
+          git -C wine checkout -- dlls/ntdll/loader.c
+          git -C wine checkout -- dlls/dinput   # round 669: tools/patch-wine-dinput-cdecl-callbacks.py
+          git -C wine checkout -- dlls/kernelbase/file.c   # build 666: the overlapped poll (i386 farm here; arm64ec only in kernelbase-optin.dll)
+
+      - name: Build d3d9-dxmt.dll (DXMT Direct3D 9 for 64-bit games, arm64ec)
+        continue-on-error: true
+        shell: bash
+        run: |
+          shipped() {
+            for f in app/Madeira/arm64ec-windows/{d3d9,d3d11,dxgi,d3d10core,winemetal}.dll \
+                     app/Madeira/i386-windows/{d3d9,d3d9shim,d3d9-emulated,d3d11,dxgi,d3d10core,winemetal}.dll; do
+              [ -f "$f" ] && shasum -a 256 "$f"
+            done
+            return 0
+          }
+          T="$(mktemp -d)"
+          shipped > "$T/before"
+          rc=0
+          bash tools/build-d3d9-x64-dll.sh || rc=$?
+          shipped > "$T/after"
+          if ! cmp -s "$T/before" "$T/after"; then
+            echo "::error::a shipped Direct3D / DXGI / winemetal DLL changed while d3d9-dxmt.dll was built:"
+            diff "$T/before" "$T/after" || true
+            exit 1
+          fi
+          echo "::notice::the $(wc -l < "$T/before" | tr -d ' ') shipped d3d9, d3d11, dxgi, d3d10core and winemetal DLLs are byte for byte what they were before d3d9-dxmt.dll was built"
+          exit "$rc"
+
+      - name: Build d3d8to9.dll (Direct3D 8 on Direct3D 9, i386)
+        continue-on-error: true
+        shell: bash
+        run: |
+          shipped() {
+            for f in app/Madeira/i386-windows/{d3d8,d3d9,d3d9shim,d3d9-emulated,d3d11,dxgi,d3d10core,winemetal,ddraw,wined3d,d3dx9_43}.dll; do
+              [ -f "$f" ] && shasum -a 256 "$f"
+            done
+            return 0
+          }
+          T="$(mktemp -d)"
+          shipped > "$T/before"
+          rc=0
+          bash tools/build-d3d8to9-dll.sh || rc=$?
+          shipped > "$T/after"
+          if ! cmp -s "$T/before" "$T/after"; then
+            echo "::error::a shipped Direct3D / DirectDraw / DXGI / winemetal DLL of the i386 farm changed while d3d8to9.dll was built:"
+            diff "$T/before" "$T/after" || true
+            exit 1
+          fi
+          exit "$rc"
+
+      - name: Build cnc-ddraw.dll (DirectDraw replacement, i386)
+        continue-on-error: true
+        shell: bash
+        run: |
+          shipped() {
+            for f in app/Madeira/i386-windows/{d3d8,d3d9,d3d9shim,d3d9-emulated,d3d11,dxgi,d3d10core,winemetal,ddraw,wined3d,d3dx9_43}.dll; do
+              [ -f "$f" ] && shasum -a 256 "$f"
+            done
+            return 0
+          }
+          T="$(mktemp -d)"
+          shipped > "$T/before"
+          rc=0
+          bash tools/build-cnc-ddraw-dll.sh || rc=$?
+          shipped > "$T/after"
+          if ! cmp -s "$T/before" "$T/after"; then
+            echo "::error::a shipped Direct3D / DirectDraw / DXGI / winemetal DLL of the i386 farm changed while cnc-ddraw.dll was built:"
+            diff "$T/before" "$T/after" || true
+            exit 1
+          fi
+          exit "$rc"
+
+      - name: Build the fork-only smoke tests (bcd-smoke)
+        if: env.MINGW_OK == '1'
+        run: bash bcd-smoke/build.sh
+
+      - name: Build BCD Host
+        if: env.MINGW_OK == '1'
+        continue-on-error: true
+        run: |
+          bash build/bcd-host/build.sh || echo "::warning::BCD Host not built: Epic games start without the Epic sign-in"
+
+      - name: Build dxmt-ios
+        shell: bash
+        run: |
+          set +e
+          bash build/dxmt-ios/build.sh
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            for f in build/dxmt-ios/obj/*.err; do
+              [ -s "$f" ] || continue
+              grep -q "error:" "$f" || continue
+              echo "===== $f ====="
+              grep -m 10 -B2 -A6 "error:" "$f"
+            done
+          fi
+          exit "$rc"
+
+      - name: Combine DXMT + LLVM into libdxmt_combined.a
+        shell: bash
+        run: |
+          cd build/dxmt-ios
+          xcrun -sdk iphoneos libtool -static -o libdxmt_combined.a \
+            obj/*.o "$GITHUB_WORKSPACE"/toolchains/llvm-ios-build/lib/*.a
+          cp libdxmt_combined.a "$GITHUB_WORKSPACE/app/Madeira/"
+          echo "::notice::libdxmt_combined.a $(wc -c < libdxmt_combined.a | tr -d ' ') bytes"
+
+      - name: Build madeira_d3d12.dll from source
+        env:
+          MAD_BUILD_ID: ipa ${{ steps.bn.outputs.n }}
+        run: bash tools/build-madeira-d3d12-dll.sh
+
+      - name: Build the Direct3D 9, 10 and 11 test programs
+        continue-on-error: true
+        run: bash tools/build-dx-tests.sh
+
+      - name: Build the system test programs (x64 and x86)
+        continue-on-error: true
+        run: bash tools/build-systests.sh
+
+      - name: Build the runtime installer (bcd-runtimes-x64.exe)
+        continue-on-error: true
+        run: bash tools/build-bcd-runtimes.sh
+
+      - name: Build the start helper (bcd-helper-x64.exe)
+        continue-on-error: true
+        run: bash tools/build-bcd-helper.sh
+
+      - name: Build BCD's winebrowser.exe (three farms)
+        continue-on-error: true
+        shell: bash
+        run: |
+          bash tools/build-bcd-openurl.sh
+          for f in app/Madeira/arm64ec-windows/winebrowser.exe app/Madeira/aarch64-windows/winebrowser.exe app/Madeira/i386-windows/winebrowser.exe; do
+            if [ -f "$f" ] && LC_ALL=C grep -aq "\[open-url\] madeira-bcd" "$f"; then echo "::notice::$f is BCD's"; else echo "::warning::$f is not BCD's winebrowser.exe"; fi
+          done
+
+      - name: Build 7-Zip (7zFM.exe and 7z.exe, without the RAR code)
+        continue-on-error: true
+        run: bash tools/build-7zip.sh
+
+      - name: Build DXMT nvapi64.dll
+        continue-on-error: true
+        run: bash tools/build-dxmt-nvapi.sh
+
+      - name: Build faultrep.dll
+        continue-on-error: true
+        run: bash tools/build-faultrep-dll.sh
+
+      - name: Build d3d12core.dll
+        continue-on-error: true
+        run: bash tools/build-d3d12core-dll.sh
+
+      - name: Restore wine arm64ec build
+        id: wineeccache
+        uses: actions/cache/restore@v4
+        with:
+          path: wine/build-arm64ec
+          key: wine-arm64ec-${{ steps.winerev.outputs.sha }}-v1
+
+      - name: Build extra Wine DLLs for arm64ec
+        continue-on-error: true
+        run: bash tools/build-wine-extra-dlls.sh "$GITHUB_WORKSPACE/wine/build-native"
+
+      - name: Check kernel32-usd.dll (tick count without a fault per call)
+        run: |
+          python3 tests/host/check-kernel32-usd-direct.py
+          test -f app/Madeira/arm64ec-windows/kernel32-usd.dll || { echo "::error::kernel32-usd.dll was not built (tools/build-wine-extra-dlls.sh, KUD)"; exit 1; }
+
+      - name: Build M5 x64 fast-path Wine DLLs
+        if: env.MINGW_OK == '1'
+        run: bash tools/build-wine-m5-dlls.sh
+
+      - name: Build d3d10core-src.dll and winemetal-src.dll (the fresh 64-bit DXMT set)
+        shell: bash
+        run: |
+          shipped() {
+            for f in app/Madeira/arm64ec-windows/{d3d9,d3d11,dxgi,d3d10core,winemetal}.dll; do
+              [ -f "$f" ] && shasum -a 256 "$f"
+            done
+            return 0
+          }
+          T="$(mktemp -d)"
+          shipped > "$T/before"
+          bash tools/build-dxmt-src-dlls.sh || echo "::warning::tools/build-dxmt-src-dlls.sh failed: no d3d10core-src.dll / winemetal-src.dll in this build"
+          shipped > "$T/after"
+          if ! cmp -s "$T/before" "$T/after"; then
+            echo "::error::a committed Direct3D / DXGI / winemetal DLL changed while d3d10core-src.dll and winemetal-src.dll were built:"
+            diff "$T/before" "$T/after" || true
+            exit 1
+          fi
+          echo "::notice::the $(wc -l < "$T/before" | tr -d ' ') committed arm64ec d3d9, d3d11, dxgi, d3d10core and winemetal DLLs are byte for byte what they were before the fresh DXMT DLLs were built"
+
+      - name: Build winevulkan.dll and vulkan-1.dll (Windows Vulkan)
+        continue-on-error: true
+        run: bash tools/build-vulkan-dlls.sh
+
+      - name: Restore the rebuilt 64-bit Wine set's build trees
+        id: winefreshcache
+        uses: actions/cache/restore@v4
+        with:
+          path: wine-fresh
+          key: wine-fresh-${{ steps.winerev.outputs.sha }}-v1
+
+      - name: Build the rebuilt 64-bit Wine set (env.MADEIRA_WIN64_FRESH)
+        continue-on-error: true
+        env:
+          FRESH_EXCLUDE: shell32.dll
+        run: bash tools/build-wine-fresh-dlls.sh "$GITHUB_WORKSPACE/wine/build-native"
+
+      - name: Save the rebuilt 64-bit Wine set's build trees
+        if: steps.winefreshcache.outputs.cache-hit != 'true' && hashFiles('wine-fresh/build-arm64ec/dlls/ntdll/arm64ec-windows/ntdll.dll') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: wine-fresh
+          key: wine-fresh-${{ steps.winerev.outputs.sha }}-v1
+
+      - name: Verify the rebuilt 64-bit Wine set
+        run: python3 tools/check-wine-fresh-shipped.py app/Madeira
+
+      - name: Verify Wine media reader DLLs
+        run: python3 tools/check-wine-media-dlls.py app/Madeira/arm64ec-windows
+
+      - name: Restore dxcompiler.dll (DirectX Shader Compiler, x86-64)
+        id: dxccache
+        uses: actions/cache/restore@v4
+        with:
+          path: build/dxc-win/out
+          key: dxc-win-x64-v1-${{ hashFiles('build/dxc-win/0001-mingw-w64-build.patch', 'build/dxc-win/mingw-x86_64.cmake', 'tools/build-dxcompiler.sh') }}
+
+      - name: Build dxcompiler.dll and ship it as dxcompiler-optin.dll
+        if: env.MINGW_OK == '1'
+        continue-on-error: true
+        run: bash tools/build-dxcompiler.sh
+
+      - name: Save dxcompiler.dll
+        if: steps.dxccache.outputs.cache-hit != 'true' && hashFiles('build/dxc-win/out/dxcompiler.dll') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: build/dxc-win/out
+          key: dxc-win-x64-v1-${{ hashFiles('build/dxc-win/0001-mingw-w64-build.patch', 'build/dxc-win/mingw-x86_64.cmake', 'tools/build-dxcompiler.sh') }}
+
+      - name: Restore ICU (icuuc.dll and icuin.dll, ARM64EC)
+        id: icucache
+        uses: actions/cache/restore@v4
+        with:
+          path: build/icu-win/out
+          key: icu-win-arm64ec-v1-${{ hashFiles('tools/build-icu-optin.sh', 'build/icu-win/trim-data.py', 'build/icu-win/icu-probe.c', 'build/icu-win/icu-probe.expected', 'build/icu-win/check-icu-dlls.py', 'build/icu-win/ICU-LICENSE.txt') }}
+
+      - name: Build ICU and ship it as icuuc-optin.dll and icuin-optin.dll
+        if: env.MINGW_OK == '1'
+        continue-on-error: true
+        run: bash tools/build-icu-optin.sh
+
+      - name: Save ICU (icuuc.dll and icuin.dll, ARM64EC)
+        if: steps.icucache.outputs.cache-hit != 'true' && hashFiles('build/icu-win/out/icuuc.dll') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: build/icu-win/out
+          key: icu-win-arm64ec-v1-${{ hashFiles('tools/build-icu-optin.sh', 'build/icu-win/trim-data.py', 'build/icu-win/icu-probe.c', 'build/icu-win/icu-probe.expected', 'build/icu-win/check-icu-dlls.py', 'build/icu-win/ICU-LICENSE.txt') }}
+
+      - name: Verify the opt-in DLLs the lists and rules name
+        run: python3 tools/check-optin-dlls-shipped.py app/Madeira/arm64ec-windows
+
+      - name: Save wine arm64ec build
+        if: steps.wineeccache.outputs.cache-hit != 'true' && hashFiles('wine/build-arm64ec/dlls/msvcr80/arm64ec-windows/msvcr80.dll') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: wine/build-arm64ec
+          key: wine-arm64ec-${{ steps.winerev.outputs.sha }}-v1
+
+      - name: Build stand-in DLLs (d3d10, avifil32, vulkan-1)
+        continue-on-error: true
+        run: |
+          M=toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin
+          python3 tools/build-stub-dlls.py wine build/stub-dlls "$M/arm64ec-w64-mingw32-clang" \
+            "$M/llvm-readobj" app/Madeira/arm64ec-windows
+
+      - name: Verify committed PE DLLs
+        shell: bash
+        run: |
+          MISSING=""
+          for d in d3d11.dll dxgi.dll winemetal.dll d3d10core.dll; do
+            [ -f "app/Madeira/aarch64-windows/$d" ] || MISSING="$MISSING aarch64/$d"
+          done
+          # srvcli.dll comes from the extra Wine DLL build: Microsoft Flight
+          # Simulator 2024's program does not load without it (build 534).
+          for d in d3d11.dll dxgi.dll winemetal.dll d3d12.dll madeira_d3d12.dll xtajit64.dll ntdll.dll srvcli.dll; do
+            [ -f "app/Madeira/arm64ec-windows/$d" ] || MISSING="$MISSING arm64ec/$d"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::PE DLLs missing from app/Madeira ::$MISSING"
+            exit 1
+          fi
+          echo "::notice::all PE DLLs present"
+          # The ARM64EC source build permits a fallback on failure. This
+          # allocator change requires its rebuilt module before archiving.
+          python3 - <<'PYEOF'
+          from pathlib import Path
+          module = Path('app/Madeira/arm64ec-windows/xtajit64.dll').read_bytes()
+          if b'rpmalloc-span4 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC rpmalloc span4 module was not built; refusing the fallback IPA')
+          if b'branch-history-v1 madeira-bcd' not in module or b'IosGuestBranchTraceLayout' not in module:
+              raise SystemExit('Required ARM64EC branch-history module was not built; refusing the fallback IPA')
+          if b'launcher-smc-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC Launcher SMC module was not built; refusing the fallback IPA')
+          if b'smc-store-fastpath-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC SMC store fast-path module was not built; refusing the fallback IPA')
+          if b'callret-elide-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC call-ret elision module was not built; refusing the fallback IPA')
+          if b'ec-ret-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC EC-return module was not built; refusing the fallback IPA')
+          if b'ec-bitmap-cache-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC EC-bitmap cache module was not built; refusing the fallback IPA')
+          if b'ec-exit-lean-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC lean JIT exit module was not built; refusing the fallback IPA')
+          if b'ec-exit-pool-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC pool-target exit hint module was not built; refusing the fallback IPA')
+          if b'ec-ret-direct-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC direct return module was not built; refusing the fallback IPA')
+          if b'callret-small-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC small call-ret region module was not built; refusing the fallback IPA')
+          if b'madeira-m5-opt-v1' not in module:
+              raise SystemExit('Required ARM64EC M5 optimization patch (madeira-m5-opt-v1) was not built into xtajit64.dll')
+          print('ARM64EC rpmalloc + madeira-m5-opt-v1 build markers verified')
+          PYEOF
+          # Verify the linked x64 entries; never silently ship a fallback DLL
+          # that accepts the option but lacks the required interop ABI.
+          D3D11_CHECK=app/Madeira/arm64ec-windows/d3d11.dll
+          if [ -f app/Madeira/arm64ec-windows/d3d11-src.dll ]; then
+            D3D11_CHECK=app/Madeira/arm64ec-windows/d3d11-src.dll
+          fi
+          python3 tests/host/check-x64-graphics-entry.py \
+            --factory app/Madeira/arm64ec-windows/dxgi-src.dll \
+            --d3d12 app/Madeira/arm64ec-windows/madeira_d3d12.dll \
+            --d3d11 "$D3D11_CHECK"
+          # Likewise tools/build-d3d11-dll.sh (env.MADEIRA_D3D11_SRC). Round 620: BCD's Direct3D 11
+          # patches reach a 64-bit game only through d3d11-src.dll, and recommended lists ask for it
+          # (F1 2020), so an IPA in which no 64-bit d3d11.dll carries them is refused.
+          NEED=""
+          # Round 624: Dark Souls III's [srv-getdesc] and WRC 9's [query-stuck] too (build 624's first IPA shipped a
+          # d3d11-src.dll without the second: tools/build-d3d11-dll.sh's BCD_PATCHES did not name it). Night round 2026-11-11: FIFA 23's
+          # [update-subresource-staging], Wesnoth's [swapchain-rotation], [dxmt-tex-limit] and Hatred's [view-ref] too.
+          # Round 660: LEGO City Undercover's [layer-format] too (BHZRNE, 536JZ2: a 64-bit game never had the 32-bit DLLs' fix).
+          # 2026-11-15 (owner's decision): the short constant buffers and 16-bit index realignment the pin compiles for i386 only, the tiny
+          # fullscreen window and the opt-in fault report too (tools/patch-d3d11-src-all-arch.py, BCD_PATCHES).
+          for m in "[copy-structure-count] skipped #" "[rtv-fail] #" "[srv-getdesc] madeira-bcd #" "[query-stuck] madeira-bcd query=" "[mesh-skip] ml870 " "[update-subresource-staging] skipped #" "[swapchain-rotation] madeira-bcd: SetRotation(" "[dxmt-tex-limit] CreateTexture2D refused " "[layer-format] madeira-bcd: back buffer format " "[view-ref] madeira-bcd #" "[lsfg] madeira-bcd " "[cb-short] madeira-bcd #" "[idx-align] madeira-bcd" "[wsi-fullscreen] a fullscreen swapchain" "[fault-enc] madeira-bcd frame "; do
+            LC_ALL=C grep -aqF "$m" app/Madeira/arm64ec-windows/d3d11.dll && continue
+            [ -f app/Madeira/arm64ec-windows/d3d11-src.dll ] && LC_ALL=C grep -aqF "$m" app/Madeira/arm64ec-windows/d3d11-src.dll && continue
+            NEED="$NEED \"$m\""
+          done
+          if [ -n "$NEED" ]; then
+            echo "::error::no 64-bit d3d11.dll carries BCD's Direct3D 11 patches ($NEED): tools/build-d3d11-dll.sh did not ship d3d11-src.dll (see its step)"
+            exit 1
+          fi
+          if [ -f app/Madeira/arm64ec-windows/d3d11-src.dll ]; then
+            echo "::notice::d3d11-src.dll present ($(wc -c < app/Madeira/arm64ec-windows/d3d11-src.dll | tr -d ' ') bytes): env.MADEIRA_D3D11_SRC = 1 selects it"
+          elif LC_ALL=C grep -aqF "madeira-bcd: SwapDeviceContextState in use" app/Madeira/arm64ec-windows/d3d11.dll; then
+            echo "::notice::no d3d11-src.dll: upstream's d3d11.dll carries SwapDeviceContextState itself (dxmt pin 2026-10-15 and later); env.MADEIRA_D3D11_SRC = 1 keeps it"
+          else
+            echo "::warning::d3d11-src.dll missing: this IPA has only upstream's d3d11.dll (no SwapDeviceContextState); env.MADEIRA_D3D11_SRC = 1 does nothing"
+          fi
+          # 2026-11-15 (owner's decision): the fresh 64-bit DXMT set of env.MADEIRA_DXMT_FRESH = 1. An incomplete set is no error (the key
+          # then links nothing and every game keeps the committed DLLs), but it is said; so is a d3d11-src.dll without the internal
+          # shaders compiled from the pin.
+          FRESH_MISSING=""
+          for f in d3d11-src dxgi-src d3d10core-src winemetal-src; do
+            [ -f "app/Madeira/arm64ec-windows/$f.dll" ] || FRESH_MISSING="$FRESH_MISSING $f.dll"
+          done
+          if [ -n "$FRESH_MISSING" ]; then
+            echo "::warning::the fresh 64-bit DXMT set is incomplete (missing:$FRESH_MISSING): env.MADEIRA_DXMT_FRESH = 1 links nothing in this IPA"
+          elif ! LC_ALL=C grep -aqF "[dxmt-shaders] madeira-bcd" app/Madeira/arm64ec-windows/d3d11-src.dll; then
+            echo "::warning::d3d11-src.dll has no [dxmt-shaders] switch: env.MADEIRA_DXMT_FRESH = 1 links the fresh set with upstream's internal shaders"
+          else
+            echo "::notice::the fresh 64-bit DXMT set is complete (d3d11-src, dxgi-src, d3d10core-src, winemetal-src and the internal shaders compiled from the pin): env.MADEIRA_DXMT_FRESH = 1 selects it"
+          fi
+          # And tools/build-wine-extra-dlls.sh's ucrtbase-x64math.dll
+          # (env.MADEIRA_UCRT_X64_MATH): never ship one whose four exports are
+          # not the x64 bodies.
+          if [ -f app/Madeira/arm64ec-windows/ucrtbase-x64math.dll ]; then
+            python3 tools/patch-wine-ucrtbase-x64-math.py --verify app/Madeira/arm64ec-windows/ucrtbase-x64math.dll
+          else
+            echo "::warning::ucrtbase-x64math.dll missing: env.MADEIRA_UCRT_X64_MATH = 1 does nothing in this IPA"
+          fi
+          # And its kernelbase-fibertrace.dll (env.MADEIRA_FIBER_TRACE): never ship
+          # one without the trace or with other exports than the shipped kernelbase.dll.
+          if [ -f app/Madeira/arm64ec-windows/kernelbase-fibertrace.dll ]; then
+            python3 tools/patch-wine-kernelbase-fibertrace.py --verify app/Madeira/arm64ec-windows/kernelbase-fibertrace.dll \
+              app/Madeira/arm64ec-windows/kernelbase.dll
+          else
+            echo "::warning::kernelbase-fibertrace.dll missing: env.MADEIRA_FIBER_TRACE = 1 does nothing in this IPA"
+          fi
+          # And its setupapi-optin.dll (env.MADEIRA_OPTIN_DLLS = setupapi): never ship one without the
+          # device node lock or with other exports than the shipped setupapi.dll.
+          if [ -f app/Madeira/arm64ec-windows/setupapi-optin.dll ]; then
+            python3 tools/patch-wine-setupapi-devinst-lock.py --verify app/Madeira/arm64ec-windows/setupapi-optin.dll \
+              app/Madeira/arm64ec-windows/setupapi.dll
+          else
+            echo "::warning::setupapi-optin.dll missing: env.MADEIRA_OPTIN_DLLS = setupapi does nothing in this IPA"
+          fi
+          # And the ASF source of env.MADEIRA_OPTIN_DLLS = mfasfsrcsnk,wmvdecod,wmadmod (Resident Evil 2/7): never ship the
+          # handler without the winedmo patch (an unpatched one hands the game to the generic handler, which cannot read ASF).
+          if [ -f app/Madeira/arm64ec-windows/mfasfsrcsnk-optin.dll ]; then
+            python3 tools/patch-wine-mfasfsrcsnk-winedmo.py --verify app/Madeira/arm64ec-windows/mfasfsrcsnk-optin.dll
+          else
+            echo "::warning::mfasfsrcsnk-optin.dll missing: env.MADEIRA_OPTIN_DLLS = mfasfsrcsnk does nothing in this IPA"
+          fi
+          for d in winedmo.dll wmvdecod-optin.dll wmadmod-optin.dll; do
+            [ -f "app/Madeira/arm64ec-windows/$d" ] || echo "::warning::$d missing: Resident Evil 2's cutscenes still end the game in this IPA"
+          done
+          # And the DxDiag provider of env.MADEIRA_OPTIN_DLLS = dxdiagn,ddraw (Far Cry 4): never ship one without the DirectShow
+          # patch (an unpatched one fails IDxDiagProvider::Initialize without devenum.dll, which a program treats as no provider).
+          if [ -f app/Madeira/arm64ec-windows/dxdiagn-optin.dll ]; then
+            python3 tools/patch-wine-dxdiagn-directshow.py --verify app/Madeira/arm64ec-windows/dxdiagn-optin.dll
+          else
+            echo "::warning::dxdiagn-optin.dll missing: env.MADEIRA_OPTIN_DLLS = dxdiagn does nothing in this IPA"
+          fi
+          # And the combase-optin.dll of env.MADEIRA_OPTIN_DLLS = combase (Unreal Engine 5's loading thread): never ship one without the
+          # implicit MTA, of another machine type, or with other exports than the shipped combase.dll.
+          if [ -f app/Madeira/arm64ec-windows/combase-optin.dll ]; then
+            python3 tools/patch-wine-combase-implicit-mta.py --verify app/Madeira/arm64ec-windows/combase-optin.dll \
+              app/Madeira/arm64ec-windows/combase.dll
+          else
+            echo "::warning::combase-optin.dll missing: env.MADEIRA_OPTIN_DLLS = combase does nothing in this IPA"
+          fi
+          # And its ntdll-sync.dll, which the unix loader maps by default: never
+          # ship one whose SRW and critical-section exports are not the x64 bodies
+          # or whose exports are not the shipped ntdll.dll's plus madeira_sync_x64_off.
+          if [ -f app/Madeira/arm64ec-windows/ntdll-sync.dll ]; then
+            python3 tools/patch-wine-ntdll-sync.py --verify app/Madeira/arm64ec-windows/ntdll-sync.dll \
+              app/Madeira/arm64ec-windows/ntdll.dll
+          else
+            echo "::warning::ntdll-sync.dll missing: every game maps the shipped ntdll.dll"
+          fi
+          # And ntdll-xsec.dll (thebcd69/bcd-games#4), mapped only by a game with env.MADEIRA_NTDLL_XSEC = 1
+          # (Diablo II: Resurrected): an ARM64EC image with the marker, the three log strings and the shipped ntdll.dll's exports.
+          if [ -f app/Madeira/arm64ec-windows/ntdll-xsec.dll ]; then
+            python3 tools/patch-wine-ntdll-xsec.py --verify app/Madeira/arm64ec-windows/ntdll-xsec.dll \
+              app/Madeira/arm64ec-windows/ntdll.dll
+          else
+            echo "::warning::ntdll-xsec.dll missing: Diablo II: Resurrected's env.MADEIRA_NTDLL_XSEC = 1 maps the shipped ntdll.dll"
+          fi
+
+      - name: Report vcruntime contents
+        shell: bash
+        run: |
+          shopt -s nullglob
+          DLLS=(app/Madeira/x86_64-vcruntime/*.dll)
+          echo "x86_64-vcruntime DLLs present: ${#DLLS[@]} of 14 (12 C++ runtime + MFC's 2)"
+          if [ "${#DLLS[@]}" -lt 14 ]; then
+            echo "::warning::IPA will build, but games built with MSVC will not \
+          start until the VC++ runtime DLLs are added -- see tools/fetch-vcruntime.md"
+          fi
+
+      - name: Verify the Windows farms are complete
+        run: |
+          python3 tools/check-farm-imports.py --warn-only app/Madeira/arm64ec-windows
+          python3 tools/check-farm-imports.py --warn-only app/Madeira/aarch64-windows
+          python3 tools/check-farm-imports.py --warn-only app/Madeira/i386-windows
+
+      - name: Build libmadeira_rppairing.a (Built-in StikJIT pairing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v rustup >/dev/null || { echo "::error::rustup is not available on this runner"; exit 1; }
+          rustup target add aarch64-apple-ios
+          bash build/rppairing-ios/build.sh
+
+      - name: Verify the OpenGL pieces
+        run: python3 tools/check-opengl-shipped.py
+
+      - name: Verify the Windows Vulkan pieces
+        run: python3 tools/check-vulkan-shipped.py
+
+      - name: Verify all linked archives exist
+        shell: bash
+        run: |
+          set +e
+          MISSING=""
+          for a in libgmp.a libgnutls.a libhogweed.a libnettle.a \
+                   libntdll_unix.a libwin32u_unix.a libwineserver.a \
+                   libdxmt_combined.a libmadeira_rppairing.a; do
+            [ -f "app/Madeira/$a" ] || MISSING="$MISSING app/Madeira/$a"
+          done
+          for a in FEXCore/Source/libFEXCore.a FEXCore/Source/libFEXCore_Base.a \
+                   FEXCore/Source/libJemallocLibs.a External/cephes/libcephes_128bit.a \
+                   External/fmt/libfmt.a External/SoftFloat-3e/libsoftfloat_3e.a \
+                   External/xxhash/cmake_unofficial/libxxhash.a; do
+            [ -f "FEX/build-ios/$a" ] || MISSING="$MISSING FEX/build-ios/$a"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::archives missing before archive step ::$MISSING"
+            exit 1
+          fi
+          echo "::notice::all 16 linked archives present"
+
+      - name: Stage licence copies and bundle resource folders
+        run: |
+          mkdir -p app/Madeira/compat app/Madeira/gl app/Madeira/vulkan
+          bash build/stage-licenses.sh
+
+      - name: Stamp version 0.1.${{ steps.bn.outputs.n }}
+        shell: bash
+        run: |
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleShortVersionString 0.1.${{ steps.bn.outputs.n }}" \
+            -c "Set :CFBundleVersion ${{ steps.bn.outputs.n }}" \
+            app/Madeira/Info.plist
+          echo "::notice::version 0.1.${{ steps.bn.outputs.n }} (build ${{ steps.bn.outputs.n }})"
+          # madeira-bcd: which commit and run this IPA is; the D3D12 shader
+          # cache identity (tools/build-madeira-d3d12-dll.sh) is only printed:
+          # a new one means every D3D12 game converts its shaders once again.
+          SCID=$(cat build/madeira-d3d12/out-pe/scid.txt 2>/dev/null || true)
+          P=app/Madeira/Info.plist
+          for kv in "MadeiraCommit:${GITHUB_SHA}" "MadeiraRepo:${GITHUB_REPOSITORY}" \
+                    "MadeiraBuilt:$(date -u +%Y-%m-%dT%H:%M:%SZ)"; do
+            k=${kv%%:*}; v=${kv#*:}
+            /usr/libexec/PlistBuddy -c "Delete :$k" "$P" > /dev/null 2>&1 || true
+            /usr/libexec/PlistBuddy -c "Add :$k string $v" "$P"
+          done
+          echo "::notice::shader cache identity ${SCID:-none}"
+
+      - name: StikJIT interface for the runner's Swift
+        shell: bash
+        run: |
+          echo "::notice::$(xcrun swift --version 2>&1 | grep -m1 'Swift version')"
+          python3 tools/stikjit-interface-compat.py app/Frameworks/StikJIT.xcframework
+
+      - name: Archive (unsigned)
+        shell: bash
+        run: |
+          set +e
+          # madeira-bcd pool-reserve: BCD_POOL_BSS_MB=1152 in the environment (run.sh / local_ci.py pass
+          # it through) compiles JITAllocator.c's exec-time JIT pool reservation in. Unset or 0: the
+          # command is exactly the one before, and the build carries no reservation.
+          pool_bss=()
+          if [ -n "${BCD_POOL_BSS_MB:-}" ] && [ "${BCD_POOL_BSS_MB}" != "0" ]; then
+            pool_bss=("GCC_PREPROCESSOR_DEFINITIONS=\$(inherited) BCD_POOL_BSS_MB=${BCD_POOL_BSS_MB}")
+            echo "::notice::JIT pool reservation compiled in: BCD_POOL_BSS_MB=${BCD_POOL_BSS_MB} (pool-bss)"
+          fi
+          xcodebuild -project app/Madeira.xcodeproj \
+            -scheme Madeira -sdk iphoneos -configuration Release \
+            CODE_SIGNING_ALLOWED=NO DEAD_CODE_STRIPPING=NO "${pool_bss[@]}" \
+            archive -archivePath build-out/Madeira.xcarchive \
+            > "$GITHUB_WORKSPACE/archive.log" 2>&1
+          rc=$?
+          # A failing xcodebuild buries the diagnostic under a multi-kilobyte
+          # swift-frontend invocation, so surface just the errors.
+          if [ "$rc" -ne 0 ]; then
+            echo "===== compiler errors ====="
+            grep -E "^[^ ].*: (error|fatal error):" "$GITHUB_WORKSPACE/archive.log" | head -30
+            # Linker diagnostics carry no "error:" prefix, so the undefined
+            # symbol list needs matching on its own terms.
+            echo "===== linker diagnostics ====="
+            grep -E "Undefined symbol|^ld: |symbol\(s\) not found|referenced from|duplicate symbol" \
+              "$GITHUB_WORKSPACE/archive.log" | head -40
+            echo "===== failing build commands ====="
+            sed -n '/The following build commands failed/,/failures)/p' \
+              "$GITHUB_WORKSPACE/archive.log" | cut -c1-200 | head -15
+          fi
+          exit "$rc"
+
+      - name: Verify the macdrv symbols DXMT resolves at runtime
+        shell: bash
+        run: |
+          set +e
+          BIN=$(find build-out/Madeira.xcarchive -type f -path "*/Madeira.app/Madeira" | head -1)
+          if [ -z "$BIN" ]; then
+            echo "::warning::app binary not found in the archive -- skipping export check"
+            exit 0
+          fi
+          echo "binary: $BIN"
+          xcrun dyld_info -exports "$BIN" > exports.txt 2>&1
+          # Show that the tool produced a listing at all. Reading "MISS" off an
+          # exports.txt that actually holds an error message would look exactly
+          # like a stripped symbol, and the whole point of this step is to tell
+          # those two apart.
+          echo "-- dyld_info output: $(wc -l < exports.txt | tr -d ' ') lines --"
+          head -5 exports.txt
+          # Did the setting reach the link at all? Two rounds were lost to
+          # flags that silently never arrived.
+          echo "-- did the linker see the export list? --"
+          grep -c "madeira-exports\|exported_symbol" archive.log 2>/dev/null \
+            | sed "s/^/  archive.log mentions it this many times: /"
+          echo "-- are the definitions even in the binary? (nm) --"
+          nm -gU "$BIN" 2>&1 | grep -i "macdrv\|win_data" | head -10 \
+            || echo "  (nm finds no macdrv symbol -- they are not in the binary at all)"
+          echo "-- every macdrv symbol in the export trie --"
+          grep -i "macdrv\|win_data" exports.txt | head -20
+          MISSING=""
+          for sym in macdrv_functions get_win_data release_win_data \
+                     macdrv_view_create_metal_view macdrv_view_get_metal_layer \
+                     macdrv_view_release_metal_view; do
+            if grep -qE "_$sym\$" exports.txt; then
+              echo "  OK   $sym"
+            else
+              echo "  MISS $sym"; MISSING="$MISSING $sym"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::main binary does not export ::$MISSING -- DXMT's dlsym will fail and every D3D11 title renders black"
+            # Was a warning while the cause was unknown. Now that a build with
+            # all six renders, shipping one without them is a regression, and
+            # its only symptom is a black screen that says nothing -- three
+            # days were spent reaching that conclusion once.
+            exit 1
+          else
+            echo "::notice::all six macdrv symbols are exported"
+          fi
+
+      - name: Check the app for weak C imports newer than its oldest iOS
+        run: python3 tools/check-weak-libsystem.py build-out/Madeira.xcarchive/Products/Applications/Madeira.app
+
+      - name: Check the app against older iOS runtimes
+        run: python3 tools/check-ios-runtime-symbols.py build-out/Madeira.xcarchive/Products/Applications/Madeira.app --auto
+
+      - name: Check compiler availability warnings above the app's oldest iOS
+        run: |
+          MIN=$(plutil -extract MinimumOSVersion raw build-out/Madeira.xcarchive/Products/Applications/Madeira.app/Info.plist)
+          python3 tools/check-availability-warnings.py --min "$MIN" build archive.log ntdll.log win32u.log
+
+      - name: Package Madeira and Madeira2 unsigned IPAs
+        run: python3 tools/ota-variants.py package build-out/Madeira.xcarchive/Products/Applications/Madeira.app build-out ${{ steps.bn.outputs.n }}
+
+      - name: Verify open-source IPA hygiene and required extensions
+        shell: bash
+        run: |
+          IPA="build-out/Madeira-0.1.${{ steps.bn.outputs.n }}-unsigned.ipa"
+          python3 - "$IPA" <<'PY'
+          import sys, zipfile
+          z = zipfile.ZipFile(sys.argv[1])
+          names = z.namelist()
+          if any("libmetalirconverter.dylib" in n for n in names):
+              sys.exit("ERROR: proprietary libmetalirconverter.dylib must never be uploaded in a public artifact")
+          if any(n.startswith("Payload/Madeira.app/x86_64-vcruntime/") and n.endswith(".dll") for n in names):
+              sys.exit("ERROR: proprietary Microsoft x86_64-vcruntime DLLs must not be uploaded in a public artifact")
+          for req in ("Payload/Madeira.app/PlugIns/MadeiraJITHelper.appex/",
+                      "Payload/Madeira.app/PlugIns/MadeiraMemoryHost.appex/",
+                      "Payload/Madeira.app/arm64ec-windows/ntdll-sync.dll",
+                      "Payload/Madeira.app/arm64ec-windows/d3d11-src.dll",
+                      "Payload/Madeira.app/arm64ec-windows/xtajit64.dll"):
+              if not any(n.startswith(req) for n in names):
+                  sys.exit(f"ERROR: missing required file/extension {req} in unsigned IPA")
+          if b"madeira-m5-opt-v1" not in z.read("Payload/Madeira.app/arm64ec-windows/xtajit64.dll"):
+              sys.exit("ERROR: xtajit64.dll missing madeira-m5-opt-v1 marker")
+          if b"[m5-latency] madeira-m5" not in z.read("Payload/Madeira.app/arm64ec-windows/d3d11-src.dll"):
+              sys.exit("ERROR: d3d11-src.dll missing [m5-latency] madeira-m5 marker")
+          for opt in ("Payload/Madeira.app/arm64ec-windows/kernelbase-x64tls.dll",
+                      "Payload/Madeira.app/arm64ec-windows/kernel32-x64tid.dll"):
+              print("present:" if opt in names else "WARN missing:", opt)
+          print(f"OK: {sys.argv[1]} verified clean (no proprietary binaries; both PlugIns and M5 markers present)")
+          PY
+
+      - name: Upload unsigned M5 IPA artifact (no Apple converter dylib)
+        uses: actions/upload-artifact@v4
+        with:
+          name: BCD-M5-0.1.${{ steps.bn.outputs.n }}-unsigned-ipa
+          path: build-out/Madeira-0.1.${{ steps.bn.outputs.n }}-unsigned.ipa
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: "*.log"
+          if-no-files-found: ignore
+
+      - name: Dump first build errors (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          for L in ntdll wineserver win32u; do
+            if [ -f "$L.log" ]; then
+              T=$(grep -E "^(Results:|Failed:|ERROR)" "$L.log" | head -5 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+              echo "::error::$L.log summary :: $T"
+            fi
+          done
+          N=0
+          for f in $(grep -rl "error:" build --include="*.err" 2>/dev/null | head -4); do
+            N=$((N+1))
+            MSG=$(grep -A4 -m3 "error:" "$f" | head -c 1500 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::REAL ERROR in $f :: $MSG"
+          done
+          if [ "$N" -eq 0 ]; then
+            echo "::error::no .err file contains 'error:' -- failure is from a script exit or ar/link stage"
+            for L in ntdll wineserver win32u; do
+              if [ -f "$L.log" ]; then
+                T=$(tail -n 25 "$L.log" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+                echo "::error::$L.log tail :: $T"
+              fi
+            done
+          fi

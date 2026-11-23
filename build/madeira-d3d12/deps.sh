@@ -44,6 +44,15 @@ _msc_resolve() {
         { _msc_fail "vendored converter headers do not match $vend/SHA256SUMS"; return 1; }
     MSC_INCLUDE="$vend/include"
 
+    if [[ "${MADEIRA_MSC_HEADERS_ONLY:-0}" == "1" ]]; then
+        # madeira-m5 (2026-11-23): public CI compiles madeira-d3d12 purely against the
+        # Apache-2.0 vendored headers (madeira_ir_unix.mm dlopen()s libmetalirconverter.dylib
+        # at runtime on device). Never require Apple's proprietary dylib in public CI.
+        MSC_LIB_IOS=""
+        MSC_HAVE_PKG=0 MSC_ROOT="" MSC_PAYLOAD="" MSC_LIB_MACOS=""
+        return 0
+    fi
+
     [[ -f "$ios_lib" ]] || { _msc_fail "missing $ios_lib"; return 1; }
     have="$(shasum -a 256 "$ios_lib" | cut -d' ' -f1)"
     [[ "$have" == "$ios_lib_sha" ]] ||

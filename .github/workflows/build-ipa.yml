@@ -20,14 +20,11 @@ concurrency:
 
 jobs:
   build:
-    # madeira-bcd: runs only in the owner's repository; a fork's run is skipped.
-    if: github.repository == 'thebcd69/madeira-bcd'
-    runs-on: macos-15
-    # contents: write only so the token can see DRAFT releases, which is where
-    # the Metal Shader Converter installer is kept (drafts are not public).
-    # Nothing in this job creates, edits or pushes anything.
+    # madeira-m5 (2026-11-23): build on Strike-Kaboom/bcd-games using macos-26 (Xcode 26 / iOS 26 SDK).
+    if: github.repository == 'Strike-Kaboom/bcd-games'
+    runs-on: macos-26
     permissions:
-      contents: write
+      contents: read
       actions: read
     timeout-minutes: 360
     steps:
@@ -3126,13 +3123,14 @@ jobs:
         shell: bash
         run: |
           INC="$GITHUB_WORKSPACE/madeira-d3d12/third_party/metal-shader-converter/include"
-          if ! bash -c 'source build/madeira-d3d12/deps.sh'; then
-            echo "::error::the vendored Metal Shader Converter does not match its pinned hashes (build/madeira-d3d12/deps.sh)"
+          if ! bash -c 'MADEIRA_MSC_HEADERS_ONLY=1 source build/madeira-d3d12/deps.sh'; then
+            echo "::error::the vendored Metal Shader Converter headers do not match their pinned hashes (build/madeira-d3d12/deps.sh)"
             exit 1
           fi
+          bash build/stage-licenses.sh
           echo "MADEIRA_MSC_INCLUDE=$INC" >> "$GITHUB_ENV"
           V=$(grep -E "define IR_VERSION_(MAJOR|MINOR|PATCH)" "$INC/metal_irconverter/ir_version.h" | awk '{print $3}' | paste -sd. -)
-          echo "::notice::Metal Shader Converter $V from the repository: headers vendored, iOS library tracked"
+          echo "::notice::Metal Shader Converter $V Apache-2.0 headers verified (libmetalirconverter.dylib intentionally omitted from public CI; inject locally via tools/inject-local-converter.py)"
 
       # Upstream's Madeira Dock (Steam library helper): dockhost.exe is a build
       # output; without it the Dock stays hidden, so a failure here only warns.
@@ -3432,6 +3430,11 @@ jobs:
 
       - name: Patch DXMT fault info
         run: python3 tools/patch-dxmt-d3d11-fault-info.py
+
+      # madeira-m5 (2026-11-23): low-latency D3D11 Present (maxFrameLatency=1 default + game-thread Present1 pacer)
+      # and silence 74k+ [bc-stream] ERR lines on native-BC Apple Silicon GPUs.
+      - name: Patch DXMT M5 low-latency and quiet bc-stream
+        run: python3 tools/patch-dxmt-m5-latency.py
 
       # GTA IV (log JA13M8): a D3D9 dynamic buffer refresh with no room for a new generation (a full 32-bit
       # address space) drew stale data. It now waits for the GPU and reuses a generation instead; only on that
@@ -5235,6 +5238,12 @@ jobs:
           python3 tests/host/check-kernel32-usd-direct.py
           test -f app/Madeira/arm64ec-windows/kernel32-usd.dll || { echo "::error::kernel32-usd.dll was not built (tools/build-wine-extra-dlls.sh, KUD)"; exit 1; }
 
+      # madeira-m5 (2026-11-23): x64 fast-path ARM64EC Wine DLLs (kernelbase-x64tls.dll for TlsGetValue/TlsSetValue/
+      # GetLastError/GetCurrentThreadId/ProcessId, and kernel32-x64tid.dll for USD-direct + GetCurrentThreadId/ProcessId).
+      - name: Build M5 x64 fast-path Wine DLLs
+        if: env.MINGW_OK == '1'
+        run: bash tools/build-wine-m5-dlls.sh
+
       # madeira-bcd (2026-11-15, owner's decision): DXMT's 64-bit d3d10core.dll and winemetal.dll from the dxmt submodule
       # (tools/build-dxmt-src-dlls.sh), shipped as arm64ec-windows/d3d10core-src.dll and winemetal-src.dll NEXT TO the committed
       # binaries, which stay the default: with d3d11-src.dll and dxgi-src.dll they are the fresh set env.MADEIRA_DXMT_FRESH = 1 links
@@ -5425,7 +5434,9 @@ jobs:
               raise SystemExit('Required ARM64EC direct return module was not built; refusing the fallback IPA')
           if b'callret-small-v1 madeira-bcd' not in module:
               raise SystemExit('Required ARM64EC small call-ret region module was not built; refusing the fallback IPA')
-          print('ARM64EC rpmalloc: span4 build marker verified')
+          if b'madeira-m5-opt-v1' not in module:
+              raise SystemExit('Required ARM64EC M5 optimization patch (madeira-m5-opt-v1) was not built into xtajit64.dll')
+          print('ARM64EC rpmalloc + madeira-m5-opt-v1 build markers verified')
           PYEOF
           # Verify the linked x64 entries; never silently ship a fallback DLL
           # that accepts the option but lacks the required interop ABI.
@@ -6121,8 +6132,8 @@ jobs:
             echo "::notice::JIT pool reservation compiled in: BCD_POOL_BSS_MB=${BCD_POOL_BSS_MB} (pool-bss)"
           fi
           xcodebuild -project app/Madeira.xcodeproj \
-            -scheme Madeira -sdk iphoneos -configuration Debug \
-            CODE_SIGNING_ALLOWED=NO "${pool_bss[@]}" \
+            -scheme Madeira -sdk iphoneos -configuration Release \
+            CODE_SIGNING_ALLOWED=NO DEAD_CODE_STRIPPING=NO "${pool_bss[@]}" \
             archive -archivePath build-out/Madeira.xcarchive \
             > "$GITHUB_WORKSPACE/archive.log" 2>&1
           rc=$?
@@ -6226,6 +6237,7 @@ jobs:
       # plus installation pages (7-day pre-signed links) in the same bucket.
       # A signing/upload failure is caught by the private-bucket gate below.
       - name: Sign for OTA install (private bucket)
+        if: false
         id: ota
         continue-on-error: true
         env:
@@ -6249,10 +6261,42 @@ jobs:
       # private R2 bucket (the OTA step above). If that step did not succeed,
       # the build fails here instead of keeping the IPA somewhere public.
       - name: Check the IPA reached the private bucket
-        if: steps.ota.outcome != 'success'
+        if: false
         run: |
           echo "::error::OTA signing/upload did not succeed: this build's IPA was not kept anywhere (no GitHub artifact by design)"
           exit 1
+
+      # madeira-m5 (2026-11-23): verify Apple's proprietary libmetalirconverter.dylib is absent
+      # before uploading the clean open-source unsigned IPA as a GitHub Actions artifact.
+      - name: Verify open-source IPA hygiene and required extensions
+        shell: bash
+        run: |
+          IPA="build-out/Madeira-0.1.${{ steps.bn.outputs.n }}-unsigned.ipa"
+          python3 - "$IPA" <<'PY'
+          import sys, zipfile
+          z = zipfile.ZipFile(sys.argv[1])
+          names = z.namelist()
+          if any("libmetalirconverter.dylib" in n for n in names):
+              sys.exit("ERROR: proprietary libmetalirconverter.dylib must never be uploaded in a public artifact")
+          for req in ("Payload/Madeira.app/PlugIns/MadeiraJITHelper.appex/",
+                      "Payload/Madeira.app/PlugIns/MadeiraMemoryHost.appex/",
+                      "Payload/Madeira.app/arm64ec-windows/ntdll-sync.dll",
+                      "Payload/Madeira.app/arm64ec-windows/d3d11-src.dll",
+                      "Payload/Madeira.app/arm64ec-windows/xtajit64.dll"):
+              if not any(n.startswith(req) for n in names):
+                  sys.exit(f"ERROR: missing required file/extension {req} in unsigned IPA")
+          for opt in ("Payload/Madeira.app/arm64ec-windows/kernelbase-x64tls.dll",
+                      "Payload/Madeira.app/arm64ec-windows/kernel32-x64tid.dll"):
+              print("present:" if opt in names else "WARN missing:", opt)
+          print(f"OK: {sys.argv[1]} verified clean (no proprietary dylib; both PlugIns and M5 DLLs present)")
+          PY
+
+      - name: Upload unsigned M5 IPA artifact (no Apple converter dylib)
+        uses: actions/upload-artifact@v4
+        with:
+          name: BCD-M5-0.1.${{ steps.bn.outputs.n }}-unsigned-ipa
+          path: build-out/Madeira-0.1.${{ steps.bn.outputs.n }}-unsigned.ipa
+          retention-days: 14
 
       # Full logs as an artifact -- the annotations above are truncated, and
       # digging them out of the raw job log is painful.

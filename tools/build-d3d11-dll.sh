@@ -166,6 +166,7 @@ BCD_PATCHES=("patch-dxmt-copy-structure-count.py" "[copy-structure-count] skippe
              "patch-dxmt-wsi-tiny-fullscreen.py" "[wsi-fullscreen] a fullscreen swapchain"
              "patch-dxmt-d3d11-fault-info.py" "[fault-enc] madeira-bcd frame "
              "patch-dxmt-bc-half.py" "[bc-half] madeira-bcd "
+             "patch-dxmt-m5-latency.py" "[m5-latency] madeira-m5"
              "patch-d3d11-src-all-arch.py" "[cb-short] madeira-bcd #")
 SHIP_HAS_BCD=1
 for ((i = 1; i < ${#BCD_PATCHES[@]}; i += 2)); do

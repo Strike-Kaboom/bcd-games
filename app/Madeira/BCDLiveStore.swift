@@ -359,10 +359,13 @@ import os
         game.minutesPlayed = playtime?.minutes ?? 0
         game.thirtyTwoBit = entry?.bits == 32
         let folder = installed?.windowsInstallPath ?? "C:\\steamapps\\common\\" + (item.owned?.installDir ?? String(item.id))
+        // madeira-m5 (2026-11-23): only enumerate local programs/auto-tune state when the game is installed
+        // (avoids 7,400+ synchronous FileManager scans on nonexistent folders for large owned Steam libraries,
+        // which triggered 98% CPU alerts and 0x8BADF00D watchdog kills on the main thread).
         game.recommended = GameRecommendations.match(windowsPath: folder, steamAppID: item.id,
                                                      fileExists: GameRecommendations.driveFileExists,
-                                                     programsIn: GameRecommendations.drivePrograms) != nil
-        game.autoTuned = Self.autoTuned(entry?.windowsPath ?? folder)
+                                                     programsIn: installed != nil ? GameRecommendations.drivePrograms : nil) != nil
+        game.autoTuned = (installed != nil || entry != nil) ? Self.autoTuned(entry?.windowsPath ?? folder) : false
         let pictures = steamArt(item.id, owned: owned)
         // A cover the player chose for the game (its page) comes first, the store's after it.
         game.coverArt = (Self.chosenCover(entry?.coverFile).map { [$0] } ?? []) + pictures.cover

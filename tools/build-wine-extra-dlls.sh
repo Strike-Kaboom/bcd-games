@@ -696,11 +696,12 @@ PY
     : > "$B.ntdll.log"
     if ntdll_make && ntdll_ship "$B/ntdll-stock.dll" &&
        python3 "$R/tools/patch-wine-ntdll-sync.py" --same-as "$B/ntdll-stock.dll" "$SHIP/ntdll.dll"; then
-        if python3 "$R/tools/patch-wine-ntdll-sync.py" "$R/wine" && ntdll_make &&
+        if python3 "$R/tools/patch-wine-ntdll-sync.py" "$R/wine" &&
+           python3 "$R/tools/patch-wine-ntdll-ec-fwd-redirect.py" "$R/wine" && ntdll_make &&
            ntdll_ship "$SHIP/ntdll-sync.dll.tmp" &&
            python3 "$R/tools/patch-wine-ntdll-sync.py" --verify "$SHIP/ntdll-sync.dll.tmp" "$SHIP/ntdll.dll"; then
             mv "$SHIP/ntdll-sync.dll.tmp" "$SHIP/ntdll-sync.dll"
-            echo "::notice::ntdll-sync.dll (cheaper SRW locks and critical sections; opt-in, mapped only with env.MADEIRA_NTDLL_SYNC = 1 or native): built next to the shipped ntdll.dll"
+            echo "::notice::ntdll-sync.dll (cheaper SRW locks and critical sections + ARM64EC forwarder CHPE redirect fix): built next to the shipped ntdll.dll"
         else
             rm -f "$SHIP/ntdll-sync.dll.tmp"
             echo "::warning::ntdll-sync.dll did not build or failed its check; not shipped (games map the shipped ntdll.dll)"
@@ -711,6 +712,7 @@ PY
         grep -m 10 "error" "$B.ntdll.log"
     fi
     git -C "$R/wine" checkout -- dlls/ntdll/sync.c dlls/ntdll/ntdll.spec dlls/ntdll/Makefile.in
+    git -C "$R/wine" checkout -- dlls/ntdll/signal_arm64ec.c
     rm -f "$R/wine/dlls/ntdll/sync_x64.c" "$nt" "$B"/dlls/ntdll/arm64ec-windows/*.o "$B/ntdll-stock.dll"
 fi
 # madeira-bcd, from thebcd69/bcd-games#4 and thebcd69/bcd-wine#1 by mckenna654 (modified 2026-10-24): ntdll-xsec.dll (see XSE above),

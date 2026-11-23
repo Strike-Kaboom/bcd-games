@@ -23817,6 +23817,19 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
     unsigned long seq;
     int hi;
 
+    /* madeira-m5 (2026-11-23): ios_verify_commit_zero() executed mach_vm_read_overwrite()
+     * under global virtual_mutex on every fresh MEM_COMMIT (4.15M times in Dark Souls III,
+     * stale=0/0), serializing all threads and eagerly faulting physical pages. Keep it
+     * opt-in via MADEIRA_VERIFY_COMMIT_ZERO=1 for memory debugging. */
+    {
+        static int s_verify_commit = -1;
+        if (s_verify_commit < 0) {
+            const char *e = getenv( "MADEIRA_VERIFY_COMMIT_ZERO" );
+            s_verify_commit = (e && e[0] == '1' && !e[1]) ? 1 : 0;
+        }
+        if (!s_verify_commit) return;
+    }
+
     if (!base || !size) return;
     if (protect & (PAGE_NOACCESS | PAGE_GUARD)) return;
     if (!(protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
@@ -31332,13 +31345,31 @@ void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
                          "= %llu MB (hw.memsize says %llu MB)\n",
                          avail >> 20, footprint >> 20, cached_limit >> 20,
                          (unsigned long long)memsize >> 20 );
-                if (cached_limit > (unsigned long long)memsize)
+                /* madeira-m5 (2026-11-23): on 12 GB+ iPads with increased-memory-limit,
+                 * os_proc_available_memory() + phys_footprint can slightly exceed hw.memsize
+                 * (e.g. 12288 MB vs 11443 MB), which is NOT a 2048 TB sentinel. Reject only
+                 * true sentinels (> 2 * hw.memsize), and on 10 GB+ devices cap default
+                 * advertised RAM to 80% of hw.memsize so iPadOS + Metal retain headroom
+                 * instead of thrashing XNU's memory compressor. */
+                if (cached_limit > (unsigned long long)memsize * 2ull)
                 {
-                    dprintf( 2, "ml993: REJECTED %llu MB -- larger than hw.memsize (%llu MB), so "
+                    dprintf( 2, "ml993: REJECTED %llu MB -- larger than 2x hw.memsize (%llu MB), so "
                              "it is a sentinel, not a limit\n",
                              cached_limit >> 20, (unsigned long long)memsize >> 20 );
                     cached_limit = 0;
                 }
+                else if (cached_limit > (unsigned long long)memsize && (unsigned long long)memsize >= (10ull << 30))
+                {
+                    cached_limit = ((unsigned long long)memsize * 80ull) / 100ull;
+                    dprintf( 2, "ml993: madeira-m5 clamping 12GB+ RAM budget to 80%% of hw.memsize -> %llu MB\n",
+                             cached_limit >> 20 );
+                }
+            }
+            if (!cached_limit && (unsigned long long)memsize >= (10ull << 30))
+            {
+                cached_limit = ((unsigned long long)memsize * 80ull) / 100ull;
+                dprintf( 2, "ml993: madeira-m5 no jetsam limit on 12GB+ device -- reserving 20%% OS/Metal headroom -> %llu MB\n",
+                         cached_limit >> 20 );
             }
             if (!cached_limit)
                 dprintf( 2, "ml993: no usable memory limit from any source -- reporting "
