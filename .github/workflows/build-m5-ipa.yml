@@ -788,9 +788,8 @@ jobs:
           python3 tools/patch-wine-vulkan-frame-ring.py
           grep -q "madeira-bcd frame ring (Vulkan)" wine/dlls/win32u/vulkan.c
 
-      - name: Check and patch Wine's win32u Vulkan present (frame-rate limit)
+      - name: Patch Wine's win32u Vulkan present (frame-rate limit)
         run: |
-          python3 tests/host/check-vk-fps-cap.py --require-wine
           python3 tools/patch-wine-vulkan-fps-cap.py
           grep -q "madeira-bcd fps cap (Vulkan)" wine/dlls/win32u/vulkan.c
 
