@@ -475,10 +475,15 @@ struct mad_device {
     HANDLE fence_wake, fence_thread;
     volatile LONG fence_quit;   /* ml1064: device teardown stops the worker */
     /* madeira-bcd fence-early: command buffers whose fence already advanced, retired
-     * in order on retire_thread. A ring under fence_lock. */
-    obj_handle_t retire_q[256]; unsigned retire_head, nretire;
+     * in order on retire_thread. A ring under fence_lock. madeira-m5 0.1.716 P5: heap
+     * storage that doubles from 256 entries whenever a burst would overfill it
+     * (mad_retire_defer), so the fence worker never falls back to retiring inline;
+     * freed with the device. */
+    obj_handle_t *retire_q; unsigned retire_cap, retire_head, nretire;
+    volatile LONG retire_hwm;   /* P4e: the most entries the ring held since the last [perf] line (written under fence_lock, reset by the printer) */
     HANDLE retire_wake, retire_thread;
     volatile LONG retire_quit;
+    volatile DWORD fence_tid, retire_tid;   /* P4e: the fence and retire worker threads, for mad_cb_retire's wait attribution */
     volatile LONG queue_poisoned; LONG queues_recreated;   /* ml1067: driver is ignoring our submissions */
     /* ml1072: SMALL-TEXTURE SUB-ALLOCATOR. 12-15k sampled textures averaging ~22 KB
      * each were individual driver allocations (page-granular, plus per-allocation
@@ -523,6 +528,7 @@ static LONG g_f6_rar_passed; static int g_f6_rar = -1;   /* madeira-bcd f6-rar *
  * 1 of 16 frames, with what happens NEXT to each stored attachment in its list. */
 enum { BC_RAR, BC_RAW_ATT, BC_RAW_COPY, BC_RAW_UAV, BC_ALL, BC_NONE = 255 };
 static LONG g_bc_ent[5], g_f7_bsync, g_f7_none, g_f7_subset, g_f7_all;
+static LONG g_f7_subset_full;   /* madeira-m5 0.1.716 P4d: "subset" masks that name every pending encoder (m == pm): not exploitable */
 static LONG64 g_f7_fw6, g_f7_fwr;
 /* madeira-m5 fence-chain 7 (see f6_begin): why encoders synced (g_f6_att_sync above
  * counts the shared-attachment rule), and what the mode-7 rules did. The three
@@ -535,6 +541,20 @@ static int g_f7_opt_subset = -1, g_f7_opt_frag = -1, g_f7_opt_list_start = -1;
  * was already registered, and the commits the observers forced. */
 static int g_cb_coalesce = -1;
 static LONG g_cc_deferred, g_cc_delivered, g_cc_batches, g_cc_waited, g_cc_fl_seoc, g_cc_fl_gcv, g_cc_fl_wait;
+/* madeira-m5 0.1.716 P4c: WHY command buffers are committed. mad_queue_flush counts every
+ * commit (g_flush_total); a caller that knows its reason names it through mad_queue_flush_why
+ * or mad_device_flush_all_why, or counts inline at the two sites whose text host checks pin
+ * (the 48-list cap, WriteBufferImmediate). The untagged mad_device_flush_all is Present's
+ * (its call text in mad_present_run is pinned too). "other" is the difference: a ring rewind
+ * (check-ring-share compiles mad_list_rings_rewind against a stub flush, so that body stays
+ * as it is), a queue's release, gpu-sync and the capture drain. */
+enum { MAD_FLUSH_OTHER, MAD_FLUSH_SIGNAL, MAD_FLUSH_OBSERVE, MAD_FLUSH_PRESENT, MAD_FLUSH_CAP48, MAD_FLUSH_WBI, MAD_FLUSH_WAIT_SELF, MAD_FLUSH_WAIT_ALL, MAD_FLUSH_N };
+static volatile LONG g_flush_why[MAD_FLUSH_N], g_flush_total;
+/* madeira-m5 0.1.716 P4a / P4e: the queue the Present being counted runs on (mad_present_run stores it on
+ * the way to mad_perf_present, on the same thread, and the swapchain holds that queue for the whole call).
+ * queue_Release clears it before the queue is freed, so it never dangles; with several swapchains it names
+ * whichever presented last. */
+static struct mad_queue *volatile g_perf_present_q;
 static LONG64 g_ac_load, g_ac_clear, g_ac_store, g_ac_st_cleared, g_ac_st_read, g_ac_st_rebound, g_ac_st_write, g_ac_st_none;
 static LONG64 g_ac_st_discarded;   /* madeira-bcd rp-discard: stored, then discarded whole before any other use in the list */
 static LONG g_ac_frames, g_discards;
@@ -1741,6 +1761,7 @@ struct mad_fence {
     struct mad_device *dev;
     struct mad_queue *volatile deferred_q; volatile LONG ndeferred;
     unsigned nblocked;   /* threads inside SetEventOnCompletion(NULL event): no Signal is deferred past them (under lock) */
+    unsigned nqwaiters;  /* madeira-m5 0.1.716 P1b: async-submit workers asleep in mad_wait_committed on this fence: no Signal is deferred past them either (under lock) */
     struct { UINT64 value; HANDLE event; LONGLONG t_reg; } waiters[MAD_FENCE_WAITERS];   /* ml1109: t_reg = registration time */
     unsigned nwaiters;
     /* madeira-bcd fence-poll-backoff (opt-in, see mad_fpb_init): the last value a
@@ -1883,10 +1904,21 @@ static void mad_fpb_init(void) {
  * the iOS loader does not run, so every sleep was a Mach exception redirected by
  * the x18 thread (build 556, Rift Apart: ~2,900 [xlate-exec] a second). A fence
  * that moves still wakes the sleeper at once. */
+/* madeira-m5 cb-coalesce (defined before mad_signal_run): a Signal deferred into an
+ * open command buffer must reach Metal once the game or another queue looks at the
+ * fence. Called with f->lock and g_commit_lock RELEASED (the flush takes the queue's
+ * submit_lock, then the device's fence_lock, then g_commit_lock). */
+static void mad_cc_observe(struct mad_fence *f, UINT64 value, LONG *why);
 static UINT64 mad_fpb_sleep(struct mad_fence *f, UINT64 seen) {
     UINT64 t0 = mad_tick(), v;
     DWORD ms = (DWORD)((g_fpb_wait + 9999) / 10000);   /* 100 ns units, rounded up to a millisecond */
     if (!ms) ms = 1;
+    /* madeira-m5 0.1.716 P2 (cb-coalesce >= 2): a thread that has spun this long wants the next
+     * value, so a Signal still deferred for this fence is committed BEFORE the sleep; the sleep
+     * is never spent waiting for a buffer nothing has committed. Before f->lock, as every
+     * observer: the flush takes the queue's locks. */
+    if (g_cb_coalesce >= 2 && __atomic_load_n(&f->ndeferred, __ATOMIC_ACQUIRE) > 0)
+        mad_cc_observe(f, (UINT64)__atomic_load_n(&f->submitted, __ATOMIC_ACQUIRE), &g_cc_fl_gcv);
     EnterCriticalSection(&f->lock);
     if (f->value == seen) SleepConditionVariableCS(&f->cv, &f->lock, ms);
     v = f->value;
@@ -1896,15 +1928,14 @@ static UINT64 mad_fpb_sleep(struct mad_fence *f, UINT64 seen) {
     InterlockedExchangeAdd64(&g_fpb_ticks, (LONG64)(mad_tick() - t0));
     return v;
 }
-/* madeira-m5 cb-coalesce (defined before mad_signal_run): a Signal deferred into an
- * open command buffer must reach Metal once the game or another queue looks at the
- * fence. Called with f->lock and g_commit_lock RELEASED (the flush takes the queue's
- * submit_lock, then the device's fence_lock, then g_commit_lock). */
-static void mad_cc_observe(struct mad_fence *f, UINT64 value, LONG *why);
 static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
     struct mad_fence *f = (struct mad_fence *)This;
-    /* madeira-m5 cb-coalesce: two plain loads on the hot path; the newest requested value is the one polled for */
-    if (g_cb_coalesce > 0 && __atomic_load_n(&f->ndeferred, __ATOMIC_ACQUIRE) > 0)
+    /* madeira-m5 cb-coalesce: two plain loads on the hot path; the newest requested value is the one polled for.
+     * 0.1.716 P2, cb-coalesce >= 2: only while nothing committed is still outstanding (value >= committed). A poller
+     * whose value is in flight is released by that batch, so the deferred Signal stays in the open buffer until the
+     * batch lands (or until the poller backs off: mad_fpb_sleep). Mode 1 keeps the unconditional observe, for the A/B. */
+    if (g_cb_coalesce > 0 && __atomic_load_n(&f->ndeferred, __ATOMIC_ACQUIRE) > 0 &&
+        (g_cb_coalesce < 2 || __atomic_load_n(&f->value, __ATOMIC_ACQUIRE) >= (UINT64)__atomic_load_n(&f->committed, __ATOMIC_ACQUIRE)))
         mad_cc_observe(f, (UINT64)__atomic_load_n(&f->submitted, __ATOMIC_ACQUIRE), &g_cc_fl_gcv);
     if (g_fpb < 0) mad_fpb_init();
     if (g_fpb > 0) {   /* madeira-bcd fence-poll-backoff */
@@ -2257,6 +2288,7 @@ struct mad_queue {
     unsigned nring_parked, ring_parked_cap;
     unsigned open_lists;
     UINT64 batches;
+    LONGLONG perf_worker_ticks; LONG perf_jobs;   /* madeira-m5 0.1.716 P4a: this queue's worker alone (g_perf_worker_ticks / g_perf_jobs sum every worker) */
     /* ml1021: SUBMISSION LOCK.
      *
      * open_cb / open_lists / pending[] / npending were mutated with no
@@ -2347,6 +2379,7 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
         mad_queue_flush(q);                          /* ml884: never free a queue holding an open batch */
         for (i = 0; i < q->npending; i++) NSObject_release(q->pending[i]);
         q->npending = 0;
+        InterlockedCompareExchangePointer((void *volatile *)&g_perf_present_q, NULL, q);   /* madeira-m5 0.1.716 P4a: the [perf] hint never dangles */
         if (d) {
             EnterCriticalSection(&d->live_lock);
             for (i = 0; i < d->nqueues; i++) if (d->queues[i] == q) { d->queues[i] = d->queues[--d->nqueues]; break; }
@@ -2661,7 +2694,10 @@ static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
         UINT64 pm = np >= 64 ? ~0ull : ((1ull << np) - 1), m = e->f7_mask & pm;
         unsigned rw = e->f7_all ? np : (unsigned)__builtin_popcountll(m);
         InterlockedIncrement(&g_f7_bsync);
-        InterlockedIncrement(e->f7_all ? &g_f7_all : rw ? &g_f7_subset : &g_f7_none);
+        /* madeira-m5 0.1.716 P4d: a mask that names every pending encoder (m == pm) is counted apart.
+         * A subset wait there is the full wait under another name, and the full one empties the set, so
+         * the execution below asks for m != pm; g_f7_subset is now exactly what f7-subset can exploit. */
+        InterlockedIncrement(e->f7_all ? &g_f7_all : !rw ? &g_f7_none : m == pm ? &g_f7_subset_full : &g_f7_subset);
         InterlockedExchangeAdd64(&g_f7_fw6, np); InterlockedExchangeAdd64(&g_f7_fwr, rw);
         /* madeira-m5 fence-chain 7, f7-subset: wait for the named encoders only. Not at a
          * list start (that sync carries the device fence), not when the batch needs
@@ -3067,6 +3103,7 @@ static void mad_capture_pass(struct mad_exec *e, struct mad_resource **rt, unsig
     MTLCommandEncoder_endEncoding(benc);
 }
 static void mad_device_flush_all(struct mad_device *d);
+static void mad_device_flush_all_why(struct mad_device *d, int why);   /* madeira-m5 0.1.716 P4c: with the commit's cause (MAD_FLUSH_*) */
 /* madeira-bcd: CAP contact sheets (see g_cap_lock). */
 #define MAD_SH_COLS 4
 #define MAD_SH_ROWS 5
@@ -3309,7 +3346,7 @@ static void mad_capture_drain(struct mad_device *d, UINT64 frame, int final) {
     unsigned i, n0, ok = 0;
     AcquireSRWLockShared(&g_cap_lock); n0 = g_ncapbufs; ReleaseSRWLockShared(&g_cap_lock);
     if (n0) {
-        mad_device_flush_all(d);
+        mad_device_flush_all_why(d, MAD_FLUSH_OTHER);   /* madeira-m5 0.1.716 P4c: a diagnostic's commit, not Present's */
         if (d->gpu_event) MTLSharedEvent_waitUntilSignaledValue(d->gpu_event, (UINT64)d->gpu_serial_committed, 10000);
     }
     AcquireSRWLockExclusive(&g_cap_lock);
@@ -11273,6 +11310,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
         q->executed++;
         if (q->open_lists >= 48) {
             mad_rp_close(q);      /* madeira-bcd rp-carry: nothing is carried into a full batch (mad_rp_next) */
+            InterlockedIncrement(&g_flush_why[MAD_FLUSH_CAP48]);   /* madeira-m5 0.1.716 P4c: under submit_lock, with the buffer open */
             mad_queue_flush(q);   /* bound the batch */
             if (rs) mad_rs_step(RS_FLUSH, &rs_t);
         }
@@ -11282,8 +11320,11 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
     if (ml1021_q) LeaveCriticalSection(&ml1021_q->submit_lock);   /* ml1021 */
     if (q && q->wbi_flush) {   /* madeira-bcd: WriteBufferImmediate (list_WriteBufferImmediate): the batch goes to the GPU now,
                                 * as a D3D12 submission does, instead of waiting for the next Signal or the 48th list */
+        EnterCriticalSection(&q->submit_lock);   /* madeira-m5 0.1.716 P4c: the cause, counted under the lock the flush takes anyway (recursive) */
+        if (q->open_cb) InterlockedIncrement(&g_flush_why[MAD_FLUSH_WBI]);
         q->wbi_flush = 0;
         mad_queue_flush(q);
+        LeaveCriticalSection(&q->submit_lock);
     }
     if (g_sd_state > 0 && g_gpu_sync && q) {   /* madeira-bcd: gpu-sync -- this submission runs to completion before the game goes on */
         mad_queue_flush(q);
@@ -11397,6 +11438,11 @@ static void mad_cb_log_error(struct mad_device *d, obj_handle_t cb) {
 }
 static volatile int g_fence_early = -1;   /* madeira-bcd fence-early (see mad_fence_early_on): -1 = not read yet */
 static volatile LONG g_fe_early, g_fe_inline;   /* fence-early: jobs that advanced early, or the old way */
+/* madeira-m5 0.1.716 P4e: WHY a job took the old way (the fence worker retired its buffers inline): a
+ * buffer with query results pending (mad_vis_job_pending), upload-guard, no retire thread, or a ring
+ * that could not grow (mad_retire_defer). The four add up to the old-way count. */
+enum { MAD_FEW_QUERY, MAD_FEW_UG, MAD_FEW_NO_THREAD, MAD_FEW_NO_ROOM, MAD_FEW_N };
+static volatile LONG g_fe_why[MAD_FEW_N];
 static void mad_vis_retire(struct mad_device *d, obj_handle_t cb);
 static void mad_vis_retire_ex(struct mad_device *d, obj_handle_t cb, int wait_cb);
 /* ml1108: where does the frame go? GPU busy (union of command-buffer GPU
@@ -11405,10 +11451,15 @@ static void mad_vis_retire_ex(struct mad_device *d, obj_handle_t cb, int wait_cb
 static LONG g_perf_lock; static int g_perf_enabled = -1;
 static double g_perf_gpu_sum, g_perf_gpu_union, g_perf_last_end, g_perf_first_start, g_perf_wait_s;
 static LONG g_perf_cbs, g_perf_presents; static LONGLONG g_perf_t0;
+/* madeira-m5 0.1.716 P4e: cpu_blocked_in_retire by the path that sat in waitUntilCompleted (mad_cb_retire's
+ * attribution): the retire thread (fence-early; blocks nobody), the fence worker retiring inline (stalls every
+ * later fence), mad_queue_flush at 16 pending buffers (whoever flushes), the synchronous Signal. Under the perf lock. */
+enum { MAD_RET_THREAD, MAD_RET_FENCE_INLINE, MAD_RET_NPENDING16, MAD_RET_SYNC_SIGNAL, MAD_RET_N };
+static double g_perf_wait_by[MAD_RET_N];
 
 static void mad_perf_lock(void) { while (InterlockedCompareExchange(&g_perf_lock, 1, 0)) YieldProcessor(); }
 static void mad_perf_unlock(void) { InterlockedExchange(&g_perf_lock, 0); }
-static void mad_perf_cb(obj_handle_t cb, double wait_s) {
+static void mad_perf_cb(obj_handle_t cb, double wait_s, int who) {
     struct { UINT64 cb; double start, end; } t; struct madeira_ctl_args a;
     if (g_perf_enabled < 0) g_perf_enabled = (int)mad_cfg_int_pe("perf-log", 1);
     if (!g_perf_enabled) return;
@@ -11417,6 +11468,7 @@ static void mad_perf_cb(obj_handle_t cb, double wait_s) {
     MadeiraCtl(&a);
     mad_perf_lock();
     g_perf_wait_s += wait_s; g_perf_cbs++;
+    if (who >= 0 && who < MAD_RET_N) g_perf_wait_by[who] += wait_s;   /* madeira-m5 0.1.716 P4e */
     if (a.ret && t.end > t.start) {
         double s0 = t.start, e0 = t.end;
         g_perf_gpu_sum += e0 - s0;
@@ -11469,14 +11521,30 @@ static void mad_perf_present(void) {
                 }
             }
             mad_rs_report((double)g_perf_presents);   /* madeira-bcd: replay-split = 1 */
-            if (g_async_submit > 0)
-                d3d12_log("[perf] ml1120 async per frame: worker busy %.2f ms (%.1f jobs), Present drain %.2f ms, list Reset waits %.2f ms (%.1f), queue-Wait jobs blocked %.2f ms\n",
-                          g_perf_presents ? 1000.0 * g_perf_worker_ticks / (double)fq.QuadPart / g_perf_presents : 0.0,
-                          g_perf_presents ? (double)g_perf_jobs / g_perf_presents : 0.0,
-                          g_perf_presents ? 1000.0 * g_perf_drain_ticks / (double)fq.QuadPart / g_perf_presents : 0.0,
-                          g_perf_presents ? 1000.0 * g_perf_resetwait_ticks / (double)fq.QuadPart / g_perf_presents : 0.0,
-                          g_perf_presents ? (double)g_perf_resetwaits / g_perf_presents : 0.0,
-                          g_perf_presents ? 1000.0 * g_perf_waitjob_ticks / (double)fq.QuadPart / g_perf_presents : 0.0);
+            if (g_async_submit > 0) {
+                /* madeira-m5 0.1.716 P4a: the sum over every worker (3 direct + 4 copy + 1 compute in HFW) next to the
+                 * present queue's worker alone, which is the one whose lag the game thread waits for (Present drain) */
+                struct mad_queue *pq = g_perf_present_q;
+                LONGLONG pt = pq ? InterlockedExchange64(&pq->perf_worker_ticks, 0) : 0;
+                LONG pj = pq ? InterlockedExchange(&pq->perf_jobs, 0) : 0;
+                double np = g_perf_presents ? (double)g_perf_presents : 1.0, ms = 1000.0 / (double)fq.QuadPart / np;
+                d3d12_log("[perf] ml1120 async per frame: worker busy %.2f ms (%.1f jobs; the present queue's worker alone %.2f ms, %.1f jobs), Present drain %.2f ms, list Reset waits %.2f ms (%.1f), queue-Wait jobs blocked %.2f ms\n",
+                          (double)g_perf_worker_ticks * ms, (double)g_perf_jobs / np, (double)pt * ms, (double)pj / np,
+                          (double)g_perf_drain_ticks * ms, (double)g_perf_resetwait_ticks * ms, (double)g_perf_resetwaits / np,
+                          (double)g_perf_waitjob_ticks * ms);
+                {   /* madeira-m5 0.1.716 P4b: the ml1128 per-kind split (mad_xp), as the delta since the last line. The unix
+                     * sampler ([xp], MADEIRA_PROBES) reads the live cumulative counters, so nothing here writes them. */
+                    static LONG64 last[14];
+                    LONG64 *src[14] = { &g_xp.n_ecl, &g_xp.t_ecl, &g_xp.n_sig, &g_xp.t_sig, &g_xp.n_wait, &g_xp.t_wait, &g_xp.t_prs,
+                                        &g_xp.t_flush, &g_xp.n_lat, &g_xp.t_lat, &g_xp.t_draw, &g_xp.t_cmt, &g_xp.t_pool, &g_xp.t_thr };
+                    double dl[14]; unsigned k;
+                    for (k = 0; k < 14; k++) { LONG64 cur = __atomic_load_n(src[k], __ATOMIC_RELAXED); dl[k] = (double)(cur - last[k]); last[k] = cur; }
+                    d3d12_log("[perf] ml1120 worker split per frame: ExecuteCommandLists %.2f ms (%.1f jobs), Signal %.2f ms (%.1f), Wait %.2f ms (%.1f), Present %.2f ms "
+                              "(flush %.2f, GPU frame-latency wait %.2f over %.2f waits, nextDrawable %.2f, blit+present+commit %.2f), pool drains %.2f ms; caller run-ahead wait %.2f ms\n",
+                              dl[1] * ms, dl[0] / np, dl[3] * ms, dl[2] / np, dl[5] * ms, dl[4] / np, dl[6] * ms,
+                              dl[7] * ms, dl[9] * ms, dl[8] / np, dl[10] * ms, dl[11] * ms, dl[12] * ms, dl[13] * ms);
+                }
+            }
             g_perf_worker_ticks = g_perf_drain_ticks = g_perf_resetwait_ticks = g_perf_waitjob_ticks = 0; g_perf_jobs = g_perf_resetwaits = 0;
             d3d12_log("[perf] ml1116 encoders per frame: fence waits %.1f, fence updates %.1f, barriers %.1f (fence-chain %d)\n",
                       g_perf_presents ? (double)(cw - lw) / g_perf_presents : 0.0, g_perf_presents ? (double)(cu - lu) / g_perf_presents : 0.0,
@@ -11509,9 +11577,11 @@ static void mad_perf_present(void) {
                 LONG e3 = InterlockedExchange(&g_bc_ent[3], 0), e4 = InterlockedExchange(&g_bc_ent[4], 0);
                 LONG bs = InterlockedExchange(&g_f7_bsync, 0), bn = InterlockedExchange(&g_f7_none, 0), bu = InterlockedExchange(&g_f7_subset, 0), ba = InterlockedExchange(&g_f7_all, 0);
                 LONG64 f6 = InterlockedExchange64(&g_f7_fw6, 0), fr = InterlockedExchange64(&g_f7_fwr, 0);
+                LONG bf = InterlockedExchange(&g_f7_subset_full, 0);   /* madeira-m5 0.1.716 P4d */
                 d3d12_log("[perf] ml1137 barrier census per frame: entries read->read %.1f, rt/depth->read %.1f, copy->read %.1f, uav %.1f, ->write/common/alias %.1f; "
-                          "barrier-caused syncs %.1f, of which a state-aware rule needs none %.1f, a subset %.1f, all %.1f; fences waited at them %.1f -> %.1f\n",
-                          e0 / np, e1 / np, e2 / np, e3 / np, e4 / np, bs / np, bn / np, bu / np, ba / np, f6 / np, fr / np);
+                          "barrier-caused syncs %.1f, of which a state-aware rule needs none %.1f, a subset %.1f (exploitable: the mask leaves pending encoders out), "
+                          "every pending encoder by name %.1f, all %.1f; fences waited at them %.1f -> %.1f\n",
+                          e0 / np, e1 / np, e2 / np, e3 / np, e4 / np, bs / np, bn / np, bu / np, bf / np, ba / np, f6 / np, fr / np);
             }
             if (g_ac_frames) {   /* ml1137 */
                 double nf = (double)InterlockedExchange(&g_ac_frames, 0), mb = 1048576.0;
@@ -11531,13 +11601,26 @@ static void mad_perf_present(void) {
                   g_perf_presents ? 1000.0 * g_perf_wait_ticks / (double)fq.QuadPart / g_perf_presents : 0.0, 100.0 * g_perf_wait_ticks / (double)fq.QuadPart / wall,
                   g_perf_presents ? (double)g_perf_polls / g_perf_presents : 0.0, g_perf_presents ? (double)g_perf_qwait_sleeps / g_perf_presents : 0.0,
                   g_perf_sig_lat_n ? 1000.0 * g_perf_sig_lat_ticks / (double)fq.QuadPart / g_perf_sig_lat_n : 0.0, g_perf_sig_lat_n);
-        if (g_cb_coalesce > 0 && g_perf_presents) {   /* madeira-m5 cb-coalesce */
+        if (g_perf_presents) {   /* madeira-m5 cb-coalesce, and 0.1.716 P4c: every commit by its cause (with cb-coalesce off too, for the A/B) */
             double np = (double)g_perf_presents;
-            LONG de = InterlockedExchange(&g_cc_deferred, 0), dl = InterlockedExchange(&g_cc_delivered, 0), ba = InterlockedExchange(&g_cc_batches, 0);
-            LONG wr = InterlockedExchange(&g_cc_waited, 0), fs = InterlockedExchange(&g_cc_fl_seoc, 0), fg = InterlockedExchange(&g_cc_fl_gcv, 0), fw = InterlockedExchange(&g_cc_fl_wait, 0);
-            d3d12_log("[perf] cb-coalesce per frame: %.1f Signals deferred into the open command buffer (%.1f not deferred: a waiter was registered), "
-                      "%.1f delivered by %.1f commits; commits forced by SetEventOnCompletion %.1f, GetCompletedValue %.1f, queue Wait %.1f\n",
-                      de / np, wr / np, dl / np, ba / np, fs / np, fg / np, fw / np);
+            LONG w[MAD_FLUSH_N], tot = InterlockedExchange(&g_flush_total, 0), tagged = 0, other; unsigned k;
+            for (k = 0; k < MAD_FLUSH_N; k++) { w[k] = InterlockedExchange(&g_flush_why[k], 0); if (k != MAD_FLUSH_OTHER) tagged += w[k]; }
+            other = tot > tagged ? tot - tagged : 0;   /* the reads are not one snapshot: a transient skew reads as 0, never negative */
+            if (g_cb_coalesce > 0) {
+                LONG de = InterlockedExchange(&g_cc_deferred, 0), dl = InterlockedExchange(&g_cc_delivered, 0), ba = InterlockedExchange(&g_cc_batches, 0);
+                LONG wr = InterlockedExchange(&g_cc_waited, 0), fs = InterlockedExchange(&g_cc_fl_seoc, 0), fg = InterlockedExchange(&g_cc_fl_gcv, 0), fw = InterlockedExchange(&g_cc_fl_wait, 0);
+                d3d12_log("[perf] cb-coalesce %d per frame: %.1f Signals deferred into the open command buffer (%.1f not deferred: a waiter was registered or a queue Wait sleeps on it), "
+                          "%.1f delivered by %.1f commits; commits forced by SetEventOnCompletion %.1f, GetCompletedValue %.1f, queue Wait %.1f; "
+                          "commits by cause: Signal %.1f, observe (GetCompletedValue/SetEventOnCompletion/Wait) %.1f, Present %.1f, 48 lists %.1f, WriteBufferImmediate %.1f, "
+                          "Wait self %.1f, Wait flush-all %.1f, other (ring rewind, release, diagnostics) %.1f; %.1f in all\n",
+                          g_cb_coalesce, de / np, wr / np, dl / np, ba / np, fs / np, fg / np, fw / np,
+                          w[MAD_FLUSH_SIGNAL] / np, w[MAD_FLUSH_OBSERVE] / np, w[MAD_FLUSH_PRESENT] / np, w[MAD_FLUSH_CAP48] / np, w[MAD_FLUSH_WBI] / np,
+                          w[MAD_FLUSH_WAIT_SELF] / np, w[MAD_FLUSH_WAIT_ALL] / np, other / np, tot / np);
+            } else
+                d3d12_log("[perf] cb-coalesce off: %.1f commits per frame by cause: Signal %.1f, observe %.1f, Present %.1f, 48 lists %.1f, WriteBufferImmediate %.1f, "
+                          "Wait self %.1f, Wait flush-all %.1f, other (ring rewind, release, diagnostics) %.1f\n",
+                          tot / np, w[MAD_FLUSH_SIGNAL] / np, w[MAD_FLUSH_OBSERVE] / np, w[MAD_FLUSH_PRESENT] / np, w[MAD_FLUSH_CAP48] / np, w[MAD_FLUSH_WBI] / np,
+                          w[MAD_FLUSH_WAIT_SELF] / np, w[MAD_FLUSH_WAIT_ALL] / np, other / np);
         }
         if (g_fpb > 0 && g_perf_presents) {   /* madeira-bcd fence-poll-backoff */
             LONG bn = InterlockedExchange(&g_fpb_n, 0), bm = InterlockedExchange(&g_fpb_moved, 0);
@@ -11546,24 +11629,39 @@ static void mad_perf_present(void) {
                       (double)bn / g_perf_presents, (double)bm / g_perf_presents, 1000.0 * (double)bt / (double)mad_tick_freq() / g_perf_presents,
                       g_fpb, (long long)(g_fpb_wait / 10));
         }
-        if (g_fence_early > 0) {   /* madeira-bcd fence-early */
-            LONG fe = InterlockedExchange(&g_fe_early, 0), fi = InterlockedExchange(&g_fe_inline, 0);
-            d3d12_log("[perf] fence-early: %ld fences advanced when the GPU reached them, %ld the old way (query results, a full ring or no retire thread)\n",
-                      (long)fe, (long)fi);
+        {   /* madeira-bcd fence-early; madeira-m5 0.1.716 P4e: why the old way was taken, the retire ring's high-water
+             * mark, and cpu_blocked_in_retire by the path that waited (with fence-early off that split is the whole story) */
+            LONG fe = InterlockedExchange(&g_fe_early, 0), fi = InterlockedExchange(&g_fe_inline, 0), fy[MAD_FEW_N]; unsigned k;
+            struct mad_device *pd = g_perf_present_q ? g_perf_present_q->device : NULL;
+            LONG hwm = pd ? InterlockedExchange(&pd->retire_hwm, 0) : 0;
+            double np = g_perf_presents ? (double)g_perf_presents : 1.0;
+            for (k = 0; k < MAD_FEW_N; k++) fy[k] = InterlockedExchange(&g_fe_why[k], 0);
+            if (g_fence_early > 0)
+                d3d12_log("[perf] fence-early: %ld fences advanced when the GPU reached them, %ld the old way (query results %ld, upload-guard %ld, no retire thread %ld, "
+                          "ring could not grow %ld); retire ring high-water %ld of %u; cpu_blocked_in_retire per frame by path: retire thread %.2f ms, "
+                          "fence worker inline %.2f, flush at 16 pending %.2f, synchronous Signal %.2f\n",
+                          (long)fe, (long)fi, (long)fy[MAD_FEW_QUERY], (long)fy[MAD_FEW_UG], (long)fy[MAD_FEW_NO_THREAD], (long)fy[MAD_FEW_NO_ROOM],
+                          (long)hwm, pd ? pd->retire_cap : 0u, 1000.0 * g_perf_wait_by[MAD_RET_THREAD] / np, 1000.0 * g_perf_wait_by[MAD_RET_FENCE_INLINE] / np,
+                          1000.0 * g_perf_wait_by[MAD_RET_NPENDING16] / np, 1000.0 * g_perf_wait_by[MAD_RET_SYNC_SIGNAL] / np);
+            else
+                d3d12_log("[perf] retire per frame (fence-early off): cpu_blocked_in_retire by path: fence worker %.2f ms, flush at 16 pending %.2f, synchronous Signal %.2f\n",
+                          1000.0 * g_perf_wait_by[MAD_RET_FENCE_INLINE] / np, 1000.0 * g_perf_wait_by[MAD_RET_NPENDING16] / np, 1000.0 * g_perf_wait_by[MAD_RET_SYNC_SIGNAL] / np);
+            for (k = 0; k < MAD_RET_N; k++) g_perf_wait_by[k] = 0;
         }
         g_perf_t0 = now.QuadPart; g_perf_presents = 0; g_perf_cbs = 0; g_perf_gpu_sum = g_perf_gpu_union = g_perf_wait_s = 0; g_perf_first_start = 0;
         g_perf_ecl = g_perf_signals = g_perf_waits = g_perf_polls = g_perf_qwait_sleeps = 0; g_perf_wait_ticks = g_perf_sig_lat_ticks = 0; g_perf_sig_lat_n = 0;
     }
     mad_perf_unlock();
 }
-static void mad_cb_retire(struct mad_device *d, obj_handle_t cb) {
+/* madeira-m5 0.1.716 P4e: `who` (MAD_RET_*) names the path whose wait this is, for the [perf] split. */
+static void mad_cb_retire_as(struct mad_device *d, obj_handle_t cb, int who) {
     LARGE_INTEGER t0, t1, fq;
     QueryPerformanceCounter(&t0);
     MTLCommandBuffer_waitUntilCompleted(cb);
     mad_rbt_retire(cb);   /* madeira-bcd trace-buffer-size: what this buffer's traced copies left for the CPU */
     mad_tdsnap_retire(cb);   /* madeira-bcd trace-dispatch: the GPU-only buffers its traced dispatches read */
     QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&fq);
-    mad_perf_cb(cb, (double)(t1.QuadPart - t0.QuadPart) / (double)fq.QuadPart);
+    mad_perf_cb(cb, (double)(t1.QuadPart - t0.QuadPart) / (double)fq.QuadPart, who);
     InterlockedIncrement(&g_cb_retired);
     mad_vis_retire(d, cb);   /* ml1088: query results reach the readback buffers before any fence advances */
     if (MTLCommandBuffer_status(cb) == WMTCommandBufferStatusError) {
@@ -11571,6 +11669,12 @@ static void mad_cb_retire(struct mad_device *d, obj_handle_t cb) {
         mad_cb_log_error(d, cb);
     }
     NSObject_release(cb);
+}
+/* The untagged form attributes by thread: the retire thread, the fence worker (retiring inline), else the
+ * synchronous Signal (mad_signal_run), its only other caller. The workers record their ids at start. */
+static void mad_cb_retire(struct mad_device *d, obj_handle_t cb) {
+    DWORD tid = GetCurrentThreadId();
+    mad_cb_retire_as(d, cb, tid == d->retire_tid ? MAD_RET_THREAD : tid == d->fence_tid ? MAD_RET_FENCE_INLINE : MAD_RET_SYNC_SIGNAL);
 }
 /* ml1067: replace a queue the driver has given up on. Called with submit_lock
  * held, before a new command buffer is opened. The old queue object is leaked on
@@ -11604,8 +11708,9 @@ static void mad_queue_flush(struct mad_queue *q) {
     if (!q) return;
     EnterCriticalSection(&q->submit_lock);   /* ml1021 */
     if (!q->open_cb) { LeaveCriticalSection(&q->submit_lock); return; }
+    InterlockedIncrement(&g_flush_total);   /* madeira-m5 0.1.716 P4c: every commit; the tagged callers add their cause */
     if (q->npending == 16) {
-        for (unsigned k = 0; k < q->npending; k++) mad_cb_retire(q->device, q->pending[k]);
+        for (unsigned k = 0; k < q->npending; k++) mad_cb_retire_as(q->device, q->pending[k], MAD_RET_NPENDING16);   /* 0.1.716 P4e */
         q->npending = 0;
     }
     f6_join(q);   /* ml1134: mode 6 only; the batch's last encoder waits for all of it and moves the device fence */
@@ -11650,7 +11755,17 @@ static void mad_queue_flush(struct mad_queue *q) {
     }
     LeaveCriticalSection(&q->submit_lock);   /* ml1021 */
 }
-static void mad_device_flush_all(struct mad_device *d) {
+/* madeira-m5 0.1.716 P4c: a flush that names its cause. The count is taken under submit_lock (the
+ * lock the flush takes anyway; a Win32 critical section is recursive) with the buffer open, so it
+ * matches g_flush_total commit for commit. No new lock order: submit_lock -> fence_lock -> g_commit_lock. */
+static void mad_queue_flush_why(struct mad_queue *q, int why) {
+    if (!q) return;
+    EnterCriticalSection(&q->submit_lock);
+    if (q->open_cb) InterlockedIncrement(&g_flush_why[why]);
+    mad_queue_flush(q);
+    LeaveCriticalSection(&q->submit_lock);
+}
+static void mad_device_flush_all_why(struct mad_device *d, int why) {
     /* ml1021: the queue registry was read with no lock while creation and
      * destruction mutate it under live_lock, so this could flush a queue that
      * was being freed. Snapshot under the lock and hold a reference across the
@@ -11663,8 +11778,13 @@ static void mad_device_flush_all(struct mad_device *d) {
     for (i = 0; i < d->nqueues && n < 16; i++)
         if (d->queues[i]) { snap[n] = d->queues[i]; InterlockedIncrement(&snap[n]->refs); n++; }
     LeaveCriticalSection(&d->live_lock);
-    for (i = 0; i < n; i++) mad_queue_flush(snap[i]);
+    for (i = 0; i < n; i++) mad_queue_flush_why(snap[i], why);
     for (i = 0; i < n; i++) queue_Release((ID3D12CommandQueue *)snap[i]);
+}
+/* madeira-m5 0.1.716 P4c: the untagged flush-all is PRESENT's -- mad_present_run (whose call text a host
+ * check pins) and MadeiraD3D12PresenterPresent. Every other caller names its cause above. */
+static void mad_device_flush_all(struct mad_device *d) {
+    mad_device_flush_all_why(d, MAD_FLUSH_PRESENT);
 }
 
 static void mad_list_rings_rewind(struct mad_list *l) {
@@ -11717,18 +11837,20 @@ static int mad_vis_job_pending(struct mad_device *d, const obj_handle_t *cbs, un
         for (j = 0; j < ncbs; j++)
             if (d->vis_pending[k]->cb == cbs[j]) { hit = 1; break; }
     LeaveCriticalSection(&d->vis_lock);
+    if (hit) InterlockedIncrement(&g_fe_why[MAD_FEW_QUERY]);   /* madeira-m5 0.1.716 P4e: the fence worker is the only caller; a hit takes the old way */
     return hit;
 }
 /* fence-early: retire deferred command buffers in commit order. When asked to
  * quit it drains the ring first. */
 static DWORD WINAPI mad_retire_worker(void *arg) {
     struct mad_device *d = arg;
+    d->retire_tid = GetCurrentThreadId();   /* madeira-m5 0.1.716 P4e: mad_cb_retire attributes this thread's waits */
     for (;;) {   /* off the critical path: no eco-prio, the default priority */
         obj_handle_t cb = 0;
         EnterCriticalSection(&d->fence_lock);
-        if (d->nretire) {
+        if (d->nretire) {   /* retire_cap > 0 whenever nretire > 0 (mad_retire_defer) */
             cb = d->retire_q[d->retire_head];
-            d->retire_head = (d->retire_head + 1) % (sizeof d->retire_q / sizeof d->retire_q[0]);
+            d->retire_head = (d->retire_head + 1) % d->retire_cap;
             d->nretire--;
         }
         LeaveCriticalSection(&d->fence_lock);
@@ -11742,21 +11864,41 @@ static DWORD WINAPI mad_retire_worker(void *arg) {
     return 0;
 }
 /* fence-early: hand a job's command buffers to the retire thread. 0 = take the
- * old order (no thread, or the ring has no room for all of them). Fence worker only. */
+ * old order (no thread, or the ring could not be grown for all of them). Fence worker only.
+ * madeira-m5 0.1.716 P5: the ring is heap storage that doubles (from 256 entries) whenever
+ * a job would overfill it, under fence_lock, with the FIFO order kept across the wrap-around:
+ * the entries from head to the end of the old buffer first, then those from its start. A
+ * 256-deep ring filled when the retire thread fell ~10 frames behind in a burst, and every
+ * job that found it full stalled the fence worker in waitUntilCompleted (8-12 % of jobs,
+ * 0.1.715 log); now only an allocation failure can. */
 static int mad_retire_defer(struct mad_device *d, const obj_handle_t *cbs, unsigned ncbs) {
-    const unsigned cap = sizeof d->retire_q / sizeof d->retire_q[0];
     unsigned k;
     int ok = 0;
     if (!d->retire_thread) {
         if (!d->retire_wake) d->retire_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
         if (d->retire_wake) d->retire_thread = CreateThread(NULL, 0, mad_retire_worker, d, 0, NULL);
-        if (!d->retire_thread) return 0;
+        if (!d->retire_thread) { InterlockedIncrement(&g_fe_why[MAD_FEW_NO_THREAD]); return 0; }
     }
     EnterCriticalSection(&d->fence_lock);
-    if (d->nretire + ncbs <= cap) {
-        for (k = 0; k < ncbs; k++) d->retire_q[(d->retire_head + d->nretire++) % cap] = cbs[k];
-        ok = 1;
+    if (d->nretire + ncbs > d->retire_cap) {
+        unsigned ncap = d->retire_cap ? d->retire_cap : 256;
+        obj_handle_t *n;
+        while (ncap < d->nretire + ncbs) ncap *= 2;
+        n = malloc((size_t)ncap * sizeof *n);
+        if (n) {
+            unsigned first = d->retire_cap - d->retire_head;   /* entries from head to the end of the old buffer... */
+            if (first > d->nretire) first = d->nretire;         /* ...no more than there are */
+            if (first) memcpy(n, d->retire_q + d->retire_head, first * sizeof *n);
+            if (d->nretire > first) memcpy(n + first, d->retire_q, (d->nretire - first) * sizeof *n);   /* the wrapped tail */
+            free(d->retire_q);
+            d->retire_q = n; d->retire_cap = ncap; d->retire_head = 0;
+        }
     }
+    if (d->nretire + ncbs <= d->retire_cap) {   /* ncbs > 0 here implies retire_cap > 0, so the modulo is defined */
+        for (k = 0; k < ncbs; k++) d->retire_q[(d->retire_head + d->nretire++) % d->retire_cap] = cbs[k];
+        if ((LONG)d->nretire > d->retire_hwm) d->retire_hwm = (LONG)d->nretire;   /* P4e: the window's high-water mark */
+        ok = 1;
+    } else InterlockedIncrement(&g_fe_why[MAD_FEW_NO_ROOM]);   /* the allocation failed: the old order, nothing lost */
     LeaveCriticalSection(&d->fence_lock);
     if (ok && ncbs) SetEvent(d->retire_wake);
     return ok;
@@ -11775,6 +11917,7 @@ static int mad_retire_defer(struct mad_device *d, const obj_handle_t *cbs, unsig
 static DWORD WINAPI mad_fence_worker(void *arg) {
     struct mad_device *d = arg;
     mad_eco_prio_self('F');   /* madeira-bcd eco-prio (opt-in) */
+    d->fence_tid = GetCurrentThreadId();   /* madeira-m5 0.1.716 P4e: mad_cb_retire attributes this thread's inline waits */
     for (;;) {
         struct mad_fence_job job; int have = 0; unsigned k, stalled_ms = 0;
         EnterCriticalSection(&d->fence_lock);
@@ -11833,7 +11976,10 @@ static DWORD WINAPI mad_fence_worker(void *arg) {
                 for (k = 0; k < job.ncbs; k++) mad_cb_retire(d, job.cbs[k]);
                 if (g_upload_guard) mad_ug_verify(d, job.serial);   /* madeira-bcd: before the game may reuse the data */
                 ID3D12Fence_Signal(job.fence, job.value);
-                if (g_fence_early > 0) InterlockedIncrement(&g_fe_inline);
+                if (g_fence_early > 0) {   /* madeira-m5 0.1.716 P4e: why -- query results and the ring count themselves (mad_vis_job_pending, mad_retire_defer) */
+                    InterlockedIncrement(&g_fe_inline);
+                    if (g_upload_guard) InterlockedIncrement(&g_fe_why[MAD_FEW_UG]);
+                }
             }
             QueryPerformanceCounter(&t1);
             InterlockedExchangeAdd64(&g_perf_sig_lat_ticks, t1.QuadPart - t0.QuadPart); InterlockedIncrement(&g_perf_sig_lat_n);
@@ -11899,11 +12045,16 @@ static int mad_signal_async(struct mad_queue *q, ID3D12Fence *fence, UINT64 valu
  * Off with any sync diagnostic, capture, skin-check or without a GPU timeline. */
 static int mad_cc_on(void) {
     if (g_cb_coalesce < 0) {
-        g_cb_coalesce = mad_cfg_int_pe("cb-coalesce", 0) ? 1 : 0;   /* 1 = a queue Signal no longer commits the open command buffer; it is committed when the fence is observed, at Wait, Present or the 48-list cap. 0 (default): every Signal commits, as before */
+        /* madeira-m5 0.1.716: modes. 1 as before; 2 adds the value-aware GetCompletedValue observe (fence_GetCompletedValue,
+         * mad_fpb_sleep); 3 adds the own-buffer skip at an async queue Wait (mad_wait_flush), an experiment. Each includes the lower. */
+        long long v = mad_cfg_int_pe("cb-coalesce", 0);   /* 0 (default): every queue Signal commits the open command buffer, as before. 1 = Signals wait in it until the fence is observed, a Wait, Present or the 48th list. 2 = also value-aware GetCompletedValue. 3 = also no own-buffer flush at a Wait */
+        g_cb_coalesce = v <= 0 ? 0 : v >= 3 ? 3 : (int)v;
         if (g_cb_coalesce)
-            d3d12_log("[madeira-d3d12] cb-coalesce = 1 (opt-in): queue Signals are deferred into the open command buffer, which is committed "
+            d3d12_log("[madeira-d3d12] cb-coalesce = %d (opt-in): queue Signals are deferred into the open command buffer, which is committed "
                       "when the fence is observed (SetEventOnCompletion, GetCompletedValue, a queue Wait), at Present or at the 48-list cap; "
-                      "[perf] cb-coalesce lines count them\n");
+                      "a queue Wait commits its own queue's buffer only%s%s; [perf] cb-coalesce lines count them\n", g_cb_coalesce,
+                      g_cb_coalesce >= 2 ? "; GetCompletedValue commits a deferred Signal only once nothing committed is outstanding (2)" : "",
+                      g_cb_coalesce >= 3 ? "; an async queue Wait leaves even its own buffer open (3, experiment)" : "");
     }
     return g_cb_coalesce;
 }
@@ -11918,7 +12069,7 @@ static void mad_queue_flush_one(struct mad_device *d, struct mad_queue *hint) {
     for (i = 0; i < d->nqueues; i++) if (d->queues[i] == hint) { q = hint; InterlockedIncrement(&q->refs); break; }
     LeaveCriticalSection(&d->live_lock);
     if (!q) return;
-    mad_queue_flush(q);
+    mad_queue_flush_why(q, MAD_FLUSH_OBSERVE);   /* madeira-m5 0.1.716 P4c: the only caller is mad_cc_observe */
     queue_Release((ID3D12CommandQueue *)q);
 }
 /* The fence is being looked at for `value`: if a Signal that covers it is still
@@ -11931,8 +12082,9 @@ static void mad_cc_observe(struct mad_fence *f, UINT64 value, LONG *why) {
     InterlockedIncrement(why);
     mad_queue_flush_one(f->dev, f->deferred_q);
     if (__atomic_load_n(&f->ndeferred, __ATOMIC_ACQUIRE) > 0 && (UINT64)__atomic_load_n(&f->committed, __ATOMIC_ACQUIRE) < value)
-        mad_device_flush_all(f->dev);
+        mad_device_flush_all_why(f->dev, MAD_FLUSH_OBSERVE);   /* madeira-m5 0.1.716 P4c */
 }
+static void mad_commit_wake(void);   /* ml1120, defined with g_commit_lock below */
 /* At Signal: keep it in the open command buffer. 0 = not possible, take the usual path. */
 static int mad_cc_defer(struct mad_queue *q, ID3D12Fence *fence, UINT64 value) {
     struct mad_fence *f = (struct mad_fence *)fence;
@@ -11941,8 +12093,15 @@ static int mad_cc_defer(struct mad_queue *q, ID3D12Fence *fence, UINT64 value) {
     int ok;
     if (!mad_cc_on() || !d->gpu_event || d->ncap || g_sk_n || g_capture_on || g_sd_state > 0 || g_fence_strict || g_gpu_sync) return 0;
     EnterCriticalSection(&f->lock);
-    ok = !f->nblocked;
-    for (i = 0; i < f->nwaiters && ok; i++) if (f->waiters[i].value <= value) ok = 0;   /* someone waits for it already: deliver as before */
+    {   /* madeira-m5 0.1.716 P3: a waiter whose value is already committed (<= f->committed) is released by the
+         * batch in flight; deferring this Signal does not delay it. A stale-low read of committed only keeps a
+         * waiter in the count, i.e. today's behaviour. P1b: an async Wait asleep on this fence (nqwaiters, raised
+         * under this lock) needs the Signal committed now, exactly as a registered waiter does. */
+        UINT64 committed = (UINT64)__atomic_load_n(&f->committed, __ATOMIC_ACQUIRE);
+        ok = !f->nblocked && !f->nqwaiters;
+        for (i = 0; i < f->nwaiters && ok; i++)
+            if (f->waiters[i].value <= value && f->waiters[i].value > committed) ok = 0;   /* someone waits for it already: deliver as before */
+    }
     if (ok) { InterlockedExchangePointer((void *volatile *)&f->deferred_q, q); InterlockedIncrement(&f->ndeferred); }
     LeaveCriticalSection(&f->lock);
     if (!ok) { InterlockedIncrement(&g_cc_waited); return 0; }
@@ -11954,6 +12113,10 @@ static int mad_cc_defer(struct mad_queue *q, ID3D12Fence *fence, UINT64 value) {
     LeaveCriticalSection(&q->submit_lock);
     if (!ok) { InterlockedDecrement(&f->ndeferred); return 0; }
     InterlockedIncrement(&g_cc_deferred);
+    /* madeira-m5 0.1.716 P1b: a worker that entered mad_wait_committed's sleep before nqwaiters was visible here
+     * re-checks ndeferred at once instead of at its 10 ms timeout. Nothing is held at this point, so the
+     * commit lock is taken alone (the order everywhere: f->lock alone, submit_lock -> fence_lock -> g_commit_lock). */
+    mad_commit_wake();
     return 1;
 }
 /* From mad_queue_flush, right after the commit, under submit_lock: the fence jobs.
@@ -11965,7 +12128,7 @@ static void mad_cc_deliver(struct mad_queue *q, const struct mad_defsig *s, unsi
         struct mad_fence *f = (struct mad_fence *)s[i].fence;
         if (mad_signal_async(q, s[i].fence, s[i].value)) mad_fence_committed(f, s[i].value);
         else {   /* no job slot: the synchronous form of mad_signal_run */
-            for (k = 0; k < q->npending; k++) mad_cb_retire(q->device, q->pending[k]);
+            for (k = 0; k < q->npending; k++) mad_cb_retire_as(q->device, q->pending[k], MAD_RET_SYNC_SIGNAL);   /* 0.1.716 P4e */
             q->npending = 0;
             ID3D12Fence_Signal(s[i].fence, s[i].value);   /* advances f->committed too */
         }
@@ -11976,6 +12139,7 @@ static void mad_cc_deliver(struct mad_queue *q, const struct mad_defsig *s, unsi
     InterlockedIncrement(&g_cc_batches);
 }
 
+static void mad_wait_flush(struct mad_queue *q, int async_job);   /* madeira-m5 0.1.716 P1, defined with mad_wait_committed */
 static HRESULT STDMETHODCALLTYPE queue_Wait(ID3D12CommandQueue *This, ID3D12Fence *fence, UINT64 value) {
     struct mad_fence *f = (struct mad_fence *)fence;
     unsigned waited = 0;
@@ -11990,7 +12154,7 @@ static HRESULT STDMETHODCALLTYPE queue_Wait(ID3D12CommandQueue *This, ID3D12Fenc
             return S_OK;
         }
     }
-    mad_device_flush_all(((struct mad_queue *)This)->device);   /* ml884: the signal may sit in an open buffer */
+    mad_wait_flush((struct mad_queue *)This, 0);   /* ml884: the signal may sit in an open buffer; 0.1.716 P1: with cb-coalesce, this queue's only */
     /* ml1061: Wait() is a GPU-timeline dependency, not a CPU wait. Every D3D queue
      * here feeds ONE Metal queue in commit order, so once the signalling batch has
      * been COMMITTED anything submitted afterwards already runs behind it. Only a
@@ -12086,7 +12250,7 @@ mad_x64_Wait(ID3D12CommandQueue *This, ID3D12Fence *fence, UINT64 value) {
 static HRESULT mad_signal_run(struct mad_queue *q, ID3D12Fence *fence, UINT64 value) {
     if (g_sd_state < 0) mad_sync_diag_load();       /* madeira-bcd */
     if (mad_cc_defer(q, fence, value)) { InterlockedIncrement(&g_perf_signals); return S_OK; }   /* madeira-m5 cb-coalesce: the open buffer carries it; mad_queue_flush delivers it */
-    mad_queue_flush(q);                              /* ml884: commit the batch this signal covers */
+    mad_queue_flush_why(q, MAD_FLUSH_SIGNAL);        /* ml884: commit the batch this signal covers (0.1.716 P4c: a Signal not deferred) */
     InterlockedIncrement(&g_perf_signals);           /* ml1109 */
     if (mad_signal_async(q, fence, value)) { mad_fence_committed((struct mad_fence *)fence, value); return S_OK; }
     /* The fence must not advance until the work submitted before it has
@@ -12129,24 +12293,40 @@ static int mad_async_on(void) {
     return g_async_submit;
 }
 /* Signal has reached Metal (its batch is committed): release queue Waits. */
-static void mad_fence_committed(struct mad_fence *f, UINT64 value) {
-    LONG64 cur;
-    do { cur = f->committed; } while ((UINT64)cur < value && InterlockedCompareExchange64(&f->committed, (LONG64)value, cur) != cur);
+/* Wake every mad_wait_committed sleeper. g_commit_lock is the last lock in the documented order
+ * (f->lock alone; submit_lock -> fence_lock -> g_commit_lock): mad_fence_committed reaches here with
+ * submit_lock held (mad_cc_deliver, fence_lock already released) or with nothing held (mad_signal_run,
+ * fence_Signal), mad_cc_defer with nothing held. Nothing to wake without async-submit (the lock is
+ * not initialised then). */
+static void mad_commit_wake(void) {
     if (g_commit_ready == 1) {
         EnterCriticalSection(&g_commit_lock);
         WakeAllConditionVariable(&g_commit_cv);
         LeaveCriticalSection(&g_commit_lock);
     }
 }
+static void mad_fence_committed(struct mad_fence *f, UINT64 value) {
+    LONG64 cur;
+    do { cur = f->committed; } while ((UINT64)cur < value && InterlockedCompareExchange64(&f->committed, (LONG64)value, cur) != cur);
+    mad_commit_wake();
+}
 /* A queue Wait on the worker: every D3D queue feeds one Metal queue in commit
  * order, so once the signalling batch is COMMITTED, anything this queue commits
  * afterwards runs behind it (the ml1061 argument, now per worker). Waiting for
  * the commit -- not for the whole other queue to drain -- is what keeps the
- * common direct<->compute ping-pong from deadlocking two workers. */
+ * common direct<->compute ping-pong from deadlocking two workers.
+ * madeira-m5 0.1.716 P1b: with cb-coalesce the sleeper is counted on the fence (nqwaiters, under
+ * f->lock, taken alone, BEFORE the first observe) so that mad_cc_defer refuses to defer a Signal
+ * for it, and a deferral that raced the count wakes it (mad_commit_wake): a Signal landing in the
+ * sleep used to cost the full 10 ms slice -- most of "queue-Wait jobs blocked" in the 0.1.715 log. */
 static void mad_wait_committed(struct mad_fence *f, UINT64 value) {
     LARGE_INTEGER t0, t1; DWORD waited = 0; static LONG said;
+    int counted = 0;
     if ((UINT64)f->committed >= value || f->value >= value) return;
-    if (g_cb_coalesce > 0) mad_cc_observe(f, value, &g_cc_fl_wait);   /* madeira-m5 cb-coalesce: before g_commit_lock (the flush takes it after submit_lock) */
+    if (g_cb_coalesce > 0) {   /* madeira-m5 cb-coalesce: the observe before g_commit_lock (the flush takes it after submit_lock) */
+        EnterCriticalSection(&f->lock); f->nqwaiters++; LeaveCriticalSection(&f->lock); counted = 1;   /* 0.1.716 P1b: visible to mad_cc_defer from here on */
+        mad_cc_observe(f, value, &g_cc_fl_wait);   /* a deferral decided before the count: its ndeferred was raised under the same lock */
+    }
     QueryPerformanceCounter(&t0);
     EnterCriticalSection(&g_commit_lock);
     while ((UINT64)f->committed < value && f->value < value && waited < 5000) {
@@ -12159,11 +12339,31 @@ static void mad_wait_committed(struct mad_fence *f, UINT64 value) {
         }
     }
     LeaveCriticalSection(&g_commit_lock);
+    if (counted) { EnterCriticalSection(&f->lock); f->nqwaiters--; LeaveCriticalSection(&f->lock); }   /* 0.1.716 P1b: after the loop, the 5 s timeout included */
     QueryPerformanceCounter(&t1);
     InterlockedExchangeAdd64(&g_perf_waitjob_ticks, t1.QuadPart - t0.QuadPart);
     if (waited >= 5000 && InterlockedIncrement(&said) <= 4)
         d3d12_log("[madeira-d3d12] ml1120 queue Wait: fence %p value %llu not committed within 5 s (committed %lld, value %llu); continuing\n",
                   (void *)f, (unsigned long long)value, (long long)f->committed, (unsigned long long)f->value);
+}
+/* madeira-m5 0.1.716 P1: what a queue Wait commits before it waits. Without cb-coalesce, every
+ * queue's open buffer, as queue_Wait always did (a CPU-side or other-path Signal may sit in any of
+ * them). With cb-coalesce a Signal is either committed at Signal time or deferred and tracked
+ * (ndeferred / deferred_q), and the observe in mad_wait_committed commits exactly the queue
+ * holding it, so the other queues' half-filled buffers are no longer committed by this Wait --
+ * 7 of 8 submit_lock acquisitions per Wait job in HFW, and a join blit per avoided commit.
+ * This queue's own buffer IS still committed, so a buffer is fresh after a Wait as before:
+ * with f7-list-start = 0 only a buffer's first list waits on the device fence (f6_cb_dev_synced),
+ * so a list appended to a buffer kept open across the Wait would rely on Metal ordering its
+ * first encoder's fence wait against the signaller's join through commit order alone -- not the
+ * ml1061 argument, and the kind of change that shows as a one-frame flicker.
+ * cb-coalesce = 3 (opt-in experiment) skips that own-buffer commit too, for the async worker's
+ * Wait job only (async_job); test for flicker before relying on it. */
+static void mad_wait_flush(struct mad_queue *q, int async_job) {
+    int cc = mad_cc_on();   /* resolves the switch: a Wait before the first Signal must not fall into the mode-0 path by accident */
+    if (cc <= 0) { mad_device_flush_all_why(q->device, MAD_FLUSH_WAIT_ALL); return; }
+    if (cc >= 3 && async_job) return;
+    mad_queue_flush_why(q, MAD_FLUSH_WAIT_SELF);
 }
 /* madeira-bcd: SWAPCHAIN MODE-SWITCH DIAGNOSTICS ([swap-diag]), the shared part;
  * the swapchain's own lines are beside the swapchain. Red Dead Redemption 2
@@ -12262,7 +12462,7 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
             ID3D12Fence_Release(j->fence);
             break;
         case MAD_SUB_WAIT:
-            mad_device_flush_all(q->device);   /* as queue_Wait did: a CPU-side or other-path signal may sit in an open buffer */
+            mad_wait_flush(q, 1);   /* as queue_Wait does: every open buffer without cb-coalesce, this queue's with it (0.1.716 P1; mode 3: none) */
             mad_wait_committed((struct mad_fence *)j->fence, j->value);
             ID3D12Fence_Release(j->fence);
             break;
@@ -12289,6 +12489,8 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
         QueryPerformanceCounter(&t1);
         InterlockedExchangeAdd64(&g_perf_worker_ticks, t1.QuadPart - t0.QuadPart);
         InterlockedIncrement(&g_perf_jobs);
+        InterlockedExchangeAdd64(&q->perf_worker_ticks, t1.QuadPart - t0.QuadPart);   /* madeira-m5 0.1.716 P4a: this worker alone */
+        InterlockedIncrement(&q->perf_jobs);
         free(j);
 
         EnterCriticalSection(&q->sub_lock);
@@ -12947,7 +13149,7 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
          * sent signaledValue to a freed MTLSharedEvent. */
         if (d->gpu_event) { NSObject_release(d->gpu_event); d->gpu_event = 0; }
         DeleteCriticalSection(&d->fence_lock); DeleteCriticalSection(&d->ring_lock);
-        free(d->fence_jobs); free(d->ring_pool); free(d->ring_retired);
+        free(d->fence_jobs); free(d->retire_q); free(d->ring_pool); free(d->ring_retired);   /* 0.1.716 P5: the retire ring, drained by its thread above */
         /* These were retained on creation and were previously leaked. */
         if (d->dsso) NSObject_release(d->dsso);
         if (d->mtl_queue) NSObject_release(d->mtl_queue);
@@ -23859,6 +24061,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     struct wmtcmd_blit_copy_from_texture_to_texture t2t;
     if (idx >= s->nbuf) return;
     src = s->buffers[idx];
+    g_perf_present_q = s->queue;   /* madeira-m5 0.1.716 P4a/P4e: for mad_perf_present below (same thread; the swapchain holds the queue) */
     mad_mheap_reclaim(s->dev, 0);   /* ml1148: once a frame, heaps whose GPU work is long done */
     mad_swd_step(s->queue, 'F');    /* madeira-bcd: [swap-diag] steps, named by a drain that waits on this Present */
     { LONG64 tf = mad_qpc();   /* ml1128 */
