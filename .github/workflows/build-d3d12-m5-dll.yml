@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Fast Linux cross-compile workflow for ARM64EC madeira_d3d12.dll (Windows PE DLL via llvm-mingw).
-# Compiles madeira-d3d12/src/pe/madeira_d3d12.c with the pinned llvm-mingw toolchain, embeds the
-# GPL-3.0 Metal helper kernel libraries from the tracked madeira_d3d12.dll, and verifies exports
-# plus the full host & ARM64EC PE checks in tests/host/check-x64-graphics-entry.py.
+# Compiles madeira-d3d12/src/pe/madeira_d3d12.c (ARM64EC) and madeira_x64_leaf.c (pure x86-64, linked
+# into the same DLL; madeira-m5 0.1.717) with the pinned llvm-mingw toolchain, embeds the GPL-3.0 Metal
+# helper kernel libraries from the tracked madeira_d3d12.dll, and verifies exports plus the full host &
+# ARM64EC PE checks in tests/host/check-x64-graphics-entry.py and tests/host/check-x64-leaf.py.
 name: Build Madeira D3D12 M5 DLL (Linux cross-compile)
 
 on:
@@ -112,27 +113,36 @@ jobs:
               print(f"  extracted {name}: {len(blob)} bytes")
           PYEOF
 
-          echo "=== compile BCn decoders & madeira_d3d12.dll ==="
+          echo "=== compile BCn decoders, the x86-64 leaf methods & madeira_d3d12.dll ==="
           for cpp in "$SRC/mad_bcn.cpp" "$R/dxmt/src/dxmt/dxmt_bcn.cpp"; do
             "$MINGW/arm64ec-w64-mingw32-clang++" -c -O2 -std=c++17 -fno-exceptions -fno-rtti \
               -I"$R/dxmt/src/dxmt" -o "$OUT/$(basename "$cpp" .cpp).o" "$cpp"
           done
+          # madeira-m5 0.1.717 x64-leaf (madeira_x64_leaf.c): pure x86-64, zero warnings, nothing reached outside the
+          # object but the seven ARM64EC fallbacks, no code outside the leaves (see tools/build-madeira-d3d12-dll.sh)
+          "$MINGW/x86_64-w64-mingw32-clang" -c -O2 -Wall -Werror -fno-builtin -ffreestanding -I"$SRC" \
+            -o "$OUT/madeira_x64_leaf.o" "$SRC/madeira_x64_leaf.c"
+          X64LEAF_UNDEF=$("$MINGW/llvm-nm" -u "$OUT/madeira_x64_leaf.o" | awk '{ print $NF }' | grep -v '^#mad_ecfb_' || true)
+          [ -z "$X64LEAF_UNDEF" ] || { echo "::error::madeira_x64_leaf.o reaches outside itself: $X64LEAF_UNDEF"; exit 1; }
+          X64LEAF_TEXT=$("$MINGW/llvm-nm" --defined-only "$OUT/madeira_x64_leaf.o" | awk '$2 == "T" || $2 == "t" { print $3 }' | grep -v '^mad_x64l_' || true)
+          [ -z "$X64LEAF_TEXT" ] || { echo "::error::madeira_x64_leaf.o defines code that is not a leaf: $X64LEAF_TEXT"; exit 1; }
           "$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall \
             -DMAD_SC_CONVERTER_ID="\"$SCID\"" \
             -DMAD_HAVE_KERNELS -DMAD_HAVE_KERNELS_IOS18 \
             -DMAD_BUILD_ID="\"ipa $BUILD_NUM\"" \
             -o "$OUT/madeira_d3d12.dll" \
-            "$SRC/madeira_d3d12.c" "$OUT/mad_bcn.o" "$OUT/dxmt_bcn.o" "$SRC/d3d12.def" \
+            "$SRC/madeira_d3d12.c" "$OUT/madeira_x64_leaf.o" "$OUT/mad_bcn.o" "$OUT/dxmt_bcn.o" "$SRC/d3d12.def" \
             -I"$SRC" -I"$OUT" -I"$R/madeira-d3d12/src" -I"$R/dxmt/src/winemetal" \
             -L"$OUT" -lwinemetal -luuid -lole32
 
-          echo "=== verify exports, markers, and x64 graphics entry ABI ==="
+          echo "=== verify exports, markers, the x64 graphics entry ABI and the x64 leaves ==="
           exports "$SHIP/madeira_d3d12.dll" > "$OUT/tracked.exports"
           exports "$OUT/madeira_d3d12.dll" > "$OUT/built.exports"
           MISSING=$(comm -23 "$OUT/tracked.exports" "$OUT/built.exports")
           [ -z "$MISSING" ] || { echo "::error::missing exports: $MISSING"; exit 1; }
 
           python3 "$R/tests/host/check-x64-graphics-entry.py" --d3d12 "$OUT/madeira_d3d12.dll"
+          python3 "$R/tests/host/check-x64-leaf.py" --d3d12 "$OUT/madeira_d3d12.dll" --objdump "$MINGW/llvm-objdump"
 
           python3 - "$OUT/madeira_d3d12.dll" "$BUILD_NUM" "$SCID" <<'PYEOF'
           import sys
@@ -143,6 +153,7 @@ jobs:
               f"madeira_d3d12 bc1 converter {sys.argv[3]}".encode(),
               b"f7-subset", b"f7-frag", b"f7-list-start",
               b"cb-coalesce", b"untracked-cpu-bufs", b"fence-chain 7",
+              b"x64-leaf", b"conv-scratch-heap", b"queue-Wait jobs per frame by edge",   # madeira-m5 0.1.717
           ):
               assert m in data, f"Missing marker {m!r}"
           print(f"OK: {sys.argv[1]} ({len(data):,} bytes) verified")

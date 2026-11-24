@@ -126,8 +126,22 @@ for cpp in "$SRC/mad_bcn.cpp" "$R/dxmt/src/dxmt/dxmt_bcn.cpp"; do
         -I"$R/dxmt/src/dxmt" -o "$OUT/$(basename "$cpp" .cpp).o" "$cpp" 2> "$OUT/bcn.err" \
         || { grep -m 20 "error:" "$OUT/bcn.err"; exit 1; }
 done
+# madeira-m5 0.1.717 x64-leaf: the pure x86-64 COM leaf methods (madeira_x64_leaf.c), compiled for x86_64 and
+# linked into the ARM64EC DLL in their own ".x64leaf" section; the vtables use them only with bcd.cfg x64-leaf = 1.
+# No warning is tolerated, nothing may be reached outside the object but the seven ARM64EC fallbacks, and no x64
+# code may land in .text (the helpers are always_inline); tests/host/check-x64-leaf.py checks the linked result.
+echo "=== madeira_x64_leaf.o (x86_64) ==="
+"$MINGW/x86_64-w64-mingw32-clang" -c -O2 -Wall -Werror -fno-builtin -ffreestanding -I"$SRC" \
+    -o "$OUT/madeira_x64_leaf.o" "$SRC/madeira_x64_leaf.c" 2> "$OUT/x64leaf.err" \
+    || { grep -m 20 "error:\|warning:" "$OUT/x64leaf.err"; exit 1; }
+X64LEAF_UNDEF=$("$MINGW/llvm-nm" -u "$OUT/madeira_x64_leaf.o" | awk '{ print $NF }' | grep -v '^#mad_ecfb_' || true)
+[ -z "$X64LEAF_UNDEF" ] || { echo "::error::madeira_x64_leaf.o reaches outside itself: $X64LEAF_UNDEF"; exit 1; }
+X64LEAF_TEXT=$("$MINGW/llvm-nm" --defined-only "$OUT/madeira_x64_leaf.o" | awk '$2 == "T" || $2 == "t" { print $3 }' | grep -v '^mad_x64l_' || true)
+[ -z "$X64LEAF_TEXT" ] || { echo "::error::madeira_x64_leaf.o defines code that is not a leaf: $X64LEAF_TEXT"; exit 1; }
+echo "  $(wc -c < "$OUT/madeira_x64_leaf.o" | tr -d ' ') bytes, $("$MINGW/llvm-nm" --defined-only "$OUT/madeira_x64_leaf.o" | grep -c ' T mad_x64l_') leaves"
+
 "$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall -DMAD_SC_CONVERTER_ID="\"$SCID\"" $KDEF ${BUILDDEF[@]+"${BUILDDEF[@]}"} \
-    -o "$OUT/madeira_d3d12.dll" "$SRC/madeira_d3d12.c" "$OUT/mad_bcn.o" "$OUT/dxmt_bcn.o" "$SRC/d3d12.def" \
+    -o "$OUT/madeira_d3d12.dll" "$SRC/madeira_d3d12.c" "$OUT/madeira_x64_leaf.o" "$OUT/mad_bcn.o" "$OUT/dxmt_bcn.o" "$SRC/d3d12.def" \
     -I"$SRC" -I"$OUT" -I"$R/madeira-d3d12/src" -I"$R/dxmt/src/winemetal" \
     -L"$OUT" -lwinemetal -luuid -lole32 2> "$OUT/madeira_d3d12.err" \
     || { grep -m 20 "error:" "$OUT/madeira_d3d12.err"; exit 1; }
@@ -144,6 +158,9 @@ fi
 echo "  all $(wc -l < "$OUT/tracked.exports" | tr -d ' ') tracked exports present"
 
 python3 "$R/tests/host/check-x64-graphics-entry.py" --d3d12 "$OUT/madeira_d3d12.dll"
+# madeira-m5 0.1.717 x64-leaf: every leaf in an X64 code-map range on pages no ARM64EC range touches, no word an
+# ARM64 x18 patcher would rewrite, every jump out of the section onto an ARM64EC fallback with its entry-thunk word
+python3 "$R/tests/host/check-x64-leaf.py" --d3d12 "$OUT/madeira_d3d12.dll" --objdump "$MINGW/llvm-objdump"
 
 cp "$OUT/madeira_d3d12.dll" "$SHIP/madeira_d3d12.dll"
 cp "$OUT/madeira_d3d12.dll" "$SHIP/d3d12.dll"
