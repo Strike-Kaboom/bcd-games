@@ -524,6 +524,17 @@ static LONG g_f6_rar_passed; static int g_f6_rar = -1;   /* madeira-bcd f6-rar *
 enum { BC_RAR, BC_RAW_ATT, BC_RAW_COPY, BC_RAW_UAV, BC_ALL, BC_NONE = 255 };
 static LONG g_bc_ent[5], g_f7_bsync, g_f7_none, g_f7_subset, g_f7_all;
 static LONG64 g_f7_fw6, g_f7_fwr;
+/* madeira-m5 fence-chain 7 (see f6_begin): why encoders synced (g_f6_att_sync above
+ * counts the shared-attachment rule), and what the mode-7 rules did. The three
+ * switches are read once by mad_f7_init when fence-chain = 7 is selected. */
+static LONG g_f6_r_list, g_f6_r_barrier, g_f6_r_cap, g_f6_r_bab;
+static LONG g_f7_sub_used, g_f7_frag_waits, g_f7_kept_open, g_f7_ls_skipped;
+static int g_f7_opt_subset = -1, g_f7_opt_frag = -1, g_f7_opt_list_start = -1;
+/* madeira-m5 cb-coalesce (see mad_cc_on, before mad_signal_run): Signals deferred
+ * into the open command buffer, delivered at its commit, refused because a waiter
+ * was already registered, and the commits the observers forced. */
+static int g_cb_coalesce = -1;
+static LONG g_cc_deferred, g_cc_delivered, g_cc_batches, g_cc_waited, g_cc_fl_seoc, g_cc_fl_gcv, g_cc_fl_wait;
 static LONG64 g_ac_load, g_ac_clear, g_ac_store, g_ac_st_cleared, g_ac_st_read, g_ac_st_rebound, g_ac_st_write, g_ac_st_none;
 static LONG64 g_ac_st_discarded;   /* madeira-bcd rp-discard: stored, then discarded whole before any other use in the list */
 static LONG g_ac_frames, g_discards;
@@ -1724,6 +1735,12 @@ struct mad_fence {
     volatile LONG64 submitted;   /* ml1061: highest value a queue has been ASKED to signal */
     volatile LONG64 committed;   /* ml1120: highest value whose Signal batch has been COMMITTED to Metal (or signalled on the CPU) */
     struct mad_queue *volatile sig_q; volatile LONG64 sig_value, sig_batch;   /* madeira-bcd vis-trace: the newest Signal, its queue and the batch it needs committed */
+    /* madeira-m5 cb-coalesce: Signals still sitting in an open command buffer (mad_cc_defer), and
+     * the queue the newest one is on -- a HINT, resolved through the device's queue registry
+     * before use (mad_queue_flush_one); the queue may be gone. dev: for that registry. */
+    struct mad_device *dev;
+    struct mad_queue *volatile deferred_q; volatile LONG ndeferred;
+    unsigned nblocked;   /* threads inside SetEventOnCompletion(NULL event): no Signal is deferred past them (under lock) */
     struct { UINT64 value; HANDLE event; LONGLONG t_reg; } waiters[MAD_FENCE_WAITERS];   /* ml1109: t_reg = registration time */
     unsigned nwaiters;
     /* madeira-bcd fence-poll-backoff (opt-in, see mad_fpb_init): the last value a
@@ -1879,8 +1896,16 @@ static UINT64 mad_fpb_sleep(struct mad_fence *f, UINT64 seen) {
     InterlockedExchangeAdd64(&g_fpb_ticks, (LONG64)(mad_tick() - t0));
     return v;
 }
+/* madeira-m5 cb-coalesce (defined before mad_signal_run): a Signal deferred into an
+ * open command buffer must reach Metal once the game or another queue looks at the
+ * fence. Called with f->lock and g_commit_lock RELEASED (the flush takes the queue's
+ * submit_lock, then the device's fence_lock, then g_commit_lock). */
+static void mad_cc_observe(struct mad_fence *f, UINT64 value, LONG *why);
 static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
     struct mad_fence *f = (struct mad_fence *)This;
+    /* madeira-m5 cb-coalesce: two plain loads on the hot path; the newest requested value is the one polled for */
+    if (g_cb_coalesce > 0 && __atomic_load_n(&f->ndeferred, __ATOMIC_ACQUIRE) > 0)
+        mad_cc_observe(f, (UINT64)__atomic_load_n(&f->submitted, __ATOMIC_ACQUIRE), &g_cc_fl_gcv);
     if (g_fpb < 0) mad_fpb_init();
     if (g_fpb > 0) {   /* madeira-bcd fence-poll-backoff */
         UINT64 v = __atomic_load_n(&f->value, __ATOMIC_ACQUIRE), now = mad_tick();
@@ -1906,6 +1931,8 @@ static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
 static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, UINT64 value, HANDLE event) {
     struct mad_fence *f = (struct mad_fence *)This;
     HRESULT hr = S_OK;
+    int flush = 0;
+    if (g_cb_coalesce > 0) mad_cc_observe(f, value, &g_cc_fl_seoc);   /* madeira-m5 cb-coalesce: before the lock */
     EnterCriticalSection(&f->lock);
     if (value <= f->value) {
         /* Already reached. Signalling now is the documented behaviour; queueing
@@ -1918,18 +1945,34 @@ static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, U
          * can make progress. Re-checked in a loop because a condition variable
          * may wake spuriously and because an intervening signal may not have
          * reached our value yet. */
-        while (f->value < value)
-            SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
+        /* madeira-m5 cb-coalesce: nblocked is raised under the lock, so mad_cc_defer
+         * (which reads it under the same lock) defers nothing past this wait; a Signal
+         * deferred between the observe above and the lock is caught by the recheck. */
+        f->nblocked++;
+        while (f->value < value) {
+            if (g_cb_coalesce > 0 && f->ndeferred > 0) {
+                LeaveCriticalSection(&f->lock);
+                mad_cc_observe(f, value, &g_cc_fl_seoc);
+                EnterCriticalSection(&f->lock);
+                if (f->value >= value) break;
+            }
+            SleepConditionVariableCS(&f->cv, &f->lock, g_cb_coalesce > 0 ? 10 : INFINITE);
+        }
+        f->nblocked--;
     } else if (f->nwaiters < MAD_FENCE_WAITERS) {
         { LARGE_INTEGER t; QueryPerformanceCounter(&t); f->waiters[f->nwaiters].t_reg = t.QuadPart; }   /* ml1109 */
         InterlockedIncrement(&g_perf_waits);
         f->waiters[f->nwaiters].value = value;
         f->waiters[f->nwaiters].event = event;
         f->nwaiters++;
+        /* madeira-m5 cb-coalesce: registered under the lock; a deferral decided before this
+         * point is visible here, one decided after it sees the waiter (mad_cc_defer) */
+        if (g_cb_coalesce > 0 && f->ndeferred > 0) flush = 1;
     } else {
         hr = E_OUTOFMEMORY;
     }
     LeaveCriticalSection(&f->lock);
+    if (flush) mad_cc_observe(f, value, &g_cc_fl_seoc);
     return hr;
 }
 static void mad_fence_committed(struct mad_fence *f, UINT64 value);
@@ -2022,7 +2065,7 @@ struct mad_cmd {
         struct { struct mad_resource *res; UINT64 off; enum WMTIndexType type; } ib;
         struct { UINT slot; struct mad_resource *res; UINT64 off; UINT stride; } vb;
         struct { struct mad_resource *rt[8]; UINT n; struct mad_resource *depth; struct mad_rtvp v[8], dv; } rts;   /* ml925: + sub-views */
-        struct { struct mad_resource *res[8]; UINT n; UINT all; UINT8 cls[8]; UINT8 cls_noref; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow; ml1137: state classes (BC_*) */
+        struct { struct mad_resource *res[8]; UINT n; UINT all; UINT8 cls[8]; UINT8 cls_noref; UINT8 vsread; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow; ml1137: state classes (BC_*); madeira-m5: vsread = an attachment goes to a state read outside the fragment stage (f7-frag = 2) */
         struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; struct mad_rtvp v;
                  UINT nrect, rect_at; } clear;   /* ml904: flags = D3D12_CLEAR_FLAGS; ml925: v = the view cleared; madeira-bcd clear-rects: rectangles in cdata */
         struct { UINT vcount, icount, vstart, istart; } draw;
@@ -2253,6 +2296,15 @@ struct mad_queue {
      * submit_lock (the replay and mad_queue_flush both hold it). */
     obj_handle_t f6_pool[64]; unsigned f6_next;
     struct mad_f6_pend { unsigned char idx, kind, natt; struct mad_resource *att[9]; } f6_pend[40]; unsigned f6_npend;
+    /* madeira-m5 fence-chain 7, f7-list-start = 0 (under submit_lock): the open command
+     * buffer has waited for the device fence (so a later list start in it need not),
+     * and the barrier state a list ended with, for the next list's first encoder. */
+    int f6_cb_dev_synced;
+    int f6_carry, f6_carry_all, f6_carry_uav, f6_carry_vsread; UINT64 f6_carry_mask;
+    /* madeira-m5 cb-coalesce (under submit_lock): Signals the open command buffer carries;
+     * mad_queue_flush turns them into fence jobs once it has committed (mad_cc_deliver).
+     * Each holds a reference to its fence. */
+    struct mad_defsig { ID3D12Fence *fence; UINT64 value; } def_sigs[64]; unsigned ndef_sigs;
     UINT64 open_ticket;   /* madeira-bcd: sync diagnostics (upload-guard / desc-guard), the open batch's ticket; 0 = none */
     /* madeira-bcd: [swap-diag] what the worker is doing: job kind (MAD_SUB_*, 0 = none), the step
      * of a Present ('F' flush, 'L' GPU latency wait, 'A' layer setup on the main thread,
@@ -2355,7 +2407,9 @@ struct mad_exec {
     struct mad_resource *f6_att[9]; unsigned f6_natt;   /* attachments of the encoder being begun */
     int mode;                   /* ml1136: fence-chain mode for this whole list (switchable live between lists) */
     unsigned cur;               /* ml1137: index of the command being replayed */
-    UINT64 f7_mask; int f7_all, f7_open, f7_reason;   /* ml1137: what a state-aware barrier rule would wait for (census only) */
+    UINT64 f7_mask; int f7_all, f7_open, f7_reason;   /* ml1137: what a state-aware barrier rule would wait for (census; applied in mode 7) */
+    int f7_uav, f7_vsread;      /* madeira-m5 f7-frag: since the last sync, a UAV-class entry / an attachment read outside the fragment stage */
+    UINT64 f7_waited_mask; int f7_waited_frag;   /* madeira-m5 f7-subset: the pending bits the open encoder waited for at its start, any at the fragment stage */
     int f7_next_rts;            /* ml1137: exec_end called by exec_begin_render: rt/depth are the NEXT pass's targets */
     /* madeira-bcd: resources already declared (useResource) on the current
      * encoder -- see mad_use_seen */
@@ -2427,6 +2481,40 @@ static void exec_query_resolve(struct mad_exec *e, const struct mad_cmd *c);
 static void mad_vis_flush(struct mad_queue *q, obj_handle_t cb);
 
 static long long mad_cfg_int_pe(const char *key, long long dflt);
+/* madeira-m5 fence-chain 7: its three switches, read once when the mode is selected. */
+static void mad_f7_init(void) {
+    if (g_f7_opt_subset >= 0) return;
+    g_f7_opt_subset = mad_cfg_int_pe("f7-subset", 1) ? 1 : 0;   /* 1 (default with fence-chain 7): after a barrier an encoder waits only for the pending encoders that wrote what the barrier names; 0: wait for every pending encoder, as mode 6 */
+    g_f7_opt_frag = (int)mad_cfg_int_pe("f7-frag", 0);          /* 0 (default): every render wait at the vertex stage; 1: attachment-only waits at the fragment stage; 2: only when the barrier moves the attachment to pixel-shader-only read states */
+    g_f7_opt_list_start = mad_cfg_int_pe("f7-list-start", 1) ? 1 : 0;   /* 1 (default): every list start is a sync point; 0: only the first list of a command buffer (the device fence), later lists sync at their barriers */
+    if (g_f7_opt_frag < 0) g_f7_opt_frag = 0;
+    if (g_f7_opt_frag > 2) g_f7_opt_frag = 2;
+    d3d12_log("[madeira-d3d12] fence-chain 7: f7-subset = %d (%s), f7-frag = %d (%s), f7-list-start = %d (%s)\n",
+              g_f7_opt_subset, g_f7_opt_subset ? "after a barrier an encoder waits only for the pending encoders that wrote what the barrier names" : "every pending encoder, as mode 6",
+              g_f7_opt_frag, g_f7_opt_frag == 2 ? "attachment-only waits at the FRAGMENT stage when the barrier leaves the attachment in pixel-shader read states" :
+                             g_f7_opt_frag ? "attachment-only waits at the FRAGMENT stage (a vertex shader reading a texture the previous pass drew would see stale data)" : "every render wait at the vertex stage",
+              g_f7_opt_list_start, g_f7_opt_list_start ? "every list start syncs" : "only the first list of a command buffer syncs at its start");
+}
+/* madeira-m5 untracked-cpu-bufs (opt-in): hazard tracking off for the runtime's own
+ * buffers that only the CPU writes -- argument-ring chunks, shader-visible descriptor
+ * heaps, static sampler tables, typed-view shadow chunks, fill patterns. Metal keeps
+ * per-resource hazard bookkeeping on every encoder that binds them; with no GPU write
+ * to order against it is pure cost on every draw and dispatch. GPU-written buffers
+ * (k_ring, capture buffers, ds_scratch, upload-guard copies) stay tracked. The ring
+ * pool is shared with the occlusion-query slot chunks (mad_vis_chunk): the GPU adds to
+ * those, but every encoder counts into slots of its own and the CPU reads them only
+ * after the command buffer completed (mad_vis_retire), so no GPU work ever reads what
+ * another encoder wrote there. */
+static int g_untracked_cpu = -1;
+static enum WMTResourceOptions mad_cpu_buf_opts(void) {
+    if (g_untracked_cpu < 0) {
+        g_untracked_cpu = mad_cfg_int_pe("untracked-cpu-bufs", 0) ? 1 : 0;   /* 1 = the runtime's CPU-written buffers are created untracked; 0 (default): Metal's default (tracked) */
+        if (g_untracked_cpu)
+            d3d12_log("[madeira-d3d12] untracked-cpu-bufs = 1 (opt-in): argument rings, shader-visible descriptor heaps, sampler tables, "
+                      "typed-view shadow chunks and fill patterns are created with Metal hazard tracking off\n");
+    }
+    return g_untracked_cpu ? (enum WMTResourceOptions)(WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked) : WMTResourceStorageModeShared;
+}
 /* ml1091 */
 static int g_fence_chain = -1;   /* ml1110: bcd.cfg fence-chain = 0 disables the per-encoder fence (perf experiment; expect flicker) */
 /* madeira-bcd: GPU faults while fences are off (F0) are the experiment's own
@@ -2438,8 +2526,9 @@ static int g_fence_chain = -1;   /* ml1110: bcd.cfg fence-chain = 0 disables the
 static volatile LONG64 g_presents_now, g_f0_quiet_until;
 static int mad_f0_quiet(void) { return g_fence_chain == 0 || g_presents_now < g_f0_quiet_until; }
 static obj_handle_t mad_enc_fence(struct mad_device *d) {
-    if (g_fence_chain < 0) { g_fence_chain = (int)mad_cfg_int_pe("fence-chain", 1); if (g_fence_chain < 0 || g_fence_chain > 6 || g_fence_chain == 4) g_fence_chain = 1;   /* ml1114: 2 was clamped to 1 in ml1110-ml1113 */
-                             d3d12_log("[madeira-d3d12] ml1110 fence-chain = %d (%s)\n", g_fence_chain, g_fence_chain == 6 ? "ml1134: barrier-driven: an encoder waits for every pending encoder only after a ResourceBarrier, at a list start, or when it reuses a pending encoder's attachment; compute stays open across barriers" : g_fence_chain == 5 ? "ml1118: full chain; a render pass waits at its FRAGMENT stage unless a compute/blit encoder ran since the last vertex-stage wait" : g_fence_chain == 3 ? "ml1116: an encoder waits only after a barrier on a resource written since the last wait" : g_fence_chain == 2 ? "ml1111: an encoder waits only after a ResourceBarrier or at a list start" : g_fence_chain ? "every encoder waits for the previous one" : "NO inter-encoder fences: perf experiment"); }
+    if (g_fence_chain < 0) { g_fence_chain = (int)mad_cfg_int_pe("fence-chain", 1); if (g_fence_chain < 0 || g_fence_chain > 7 || g_fence_chain == 4) g_fence_chain = 1;   /* ml1114: 2 was clamped to 1 in ml1110-ml1113; madeira-m5: 7 = mode 6 with state-aware waits */
+                             if (g_fence_chain == 7) mad_f7_init();
+                             d3d12_log("[madeira-d3d12] ml1110 fence-chain = %d (%s)\n", g_fence_chain, g_fence_chain == 7 ? "madeira-m5: mode 6 with STATE-AWARE waits: after a barrier an encoder waits only for the pending encoders that wrote what the barrier names (f7-subset), optionally at the fragment stage (f7-frag); list starts inside a command buffer need not sync (f7-list-start = 0)" : g_fence_chain == 6 ? "ml1134: barrier-driven: an encoder waits for every pending encoder only after a ResourceBarrier, at a list start, or when it reuses a pending encoder's attachment; compute stays open across barriers" : g_fence_chain == 5 ? "ml1118: full chain; a render pass waits at its FRAGMENT stage unless a compute/blit encoder ran since the last vertex-stage wait" : g_fence_chain == 3 ? "ml1116: an encoder waits only after a barrier on a resource written since the last wait" : g_fence_chain == 2 ? "ml1111: an encoder waits only after a ResourceBarrier or at a list start" : g_fence_chain ? "every encoder waits for the previous one" : "NO inter-encoder fences: perf experiment"); }
     if (!g_fence_chain) return 0;
     if (!d->enc_fence) d->enc_fence = MTLDevice_newFence(d->mtl_device);
     return d->enc_fence;
@@ -2488,7 +2577,31 @@ static void exec_note_write(struct mad_exec *e, struct mad_resource *r) {   /* m
  *    for at the first sync of every list, and updated only by a join encoder
  *    at commit that waits for everything pending, so "the device fence
  *    passed" still means "every earlier batch finished", as in mode 1. The
- *    Present blit waits for it too. */
+ *    Present blit waits for it too.
+ *
+ * madeira-m5: fence-chain = 7 is mode 6 with the ml1137 census APPLIED (HFW on the
+ * M5 iPad: 182 of 219 encoders a frame synced, 50 of the 99 barrier-caused syncs
+ * needed only a subset of the pending encoders, usually not the one just closed):
+ *  - f7-subset: a sync caused only by barriers whose every entry names an
+ *    attachment (render target / depth -> read) waits for just the pending passes
+ *    that had it attached. The pending set is NOT emptied and the encoder does not
+ *    count as synced, so the next full sync still waits for what it skipped
+ *    (transitivity) and a compute encoder begun this way closes at the next
+ *    barrier. COPY_DEST -> read counts as "everything": staging passes and
+ *    decode dispatches write copy destinations a blit-only rule would miss. UAV
+ *    barriers name every pending encoder, which is a full sync. A render pass that
+ *    waited for a subset stays open at a later barrier covered by that subset.
+ *  - f7-frag: such attachment-only waits on a pending render pass with
+ *    attachments are at the FRAGMENT stage (the load happens there on a TBDR;
+ *    mode 5 measured this as the big win), so the pass's vertex and tiling work
+ *    overlaps the previous pass's fragment work. Compute, blit, attachment-less
+ *    render encoders, the device fence, BC_ALL and UAV waits stay at the vertex
+ *    stage. Mode 5's hazard (a vertex shader sampling what the previous pass drew)
+ *    applies; f7-frag = 2 keeps the vertex-stage wait whenever the barrier moves
+ *    the attachment to a state readable outside the fragment stage.
+ *  - f7-list-start = 0: a list start is a sync point only for the first list of a
+ *    command buffer (the device fence). A barrier a list ended with is carried to
+ *    the next list's first encoder. */
 enum { F6_RENDER, F6_BLIT, F6_COMPUTE };
 static int g_f6_compute_open = -1;
 union f6_op { struct wmtcmd_render_fence_op r; struct wmtcmd_blit_fence_op b; struct wmtcmd_compute_fence_op c; };
@@ -2496,13 +2609,15 @@ static obj_handle_t f6_fence(struct mad_queue *q, unsigned idx) {
     if (!q->f6_pool[idx]) q->f6_pool[idx] = MTLDevice_newFence(q->device->mtl_device);
     return q->f6_pool[idx];
 }
-/* One encodeCommands call for all of an encoder's fence operations (a chain). */
-static void f6_encode(obj_handle_t enc, int kind, const obj_handle_t *f, unsigned nwait, obj_handle_t update) {
+/* One encodeCommands call for all of an encoder's fence operations (a chain).
+ * madeira-m5 f7-frag: frag[i] != 0 puts the i-th render wait at the fragment stage (NULL: all at the vertex stage). */
+static void f6_encode(obj_handle_t enc, int kind, const obj_handle_t *f, const unsigned char *frag, unsigned nwait, obj_handle_t update) {
     union f6_op ops[48];
     unsigned i, n = 0;
     memset(ops, 0, sizeof ops);
     for (i = 0; i < nwait && n < 47; i++, n++) {
-        if (kind == F6_RENDER) { ops[n].r.type = WMTRenderCommandWaitForFence; ops[n].r.fence = f[i]; ops[n].r.stages = (enum WMTRenderStages)(WMTRenderStageVertex | WMTRenderStageObject); }
+        if (kind == F6_RENDER) { ops[n].r.type = WMTRenderCommandWaitForFence; ops[n].r.fence = f[i];
+                                 ops[n].r.stages = frag && frag[i] ? WMTRenderStageFragment : (enum WMTRenderStages)(WMTRenderStageVertex | WMTRenderStageObject); }
         else if (kind == F6_BLIT) { ops[n].b.type = WMTBlitCommandWaitForFence; ops[n].b.fence = f[i]; }
         else { ops[n].c.type = WMTComputeCommandWaitForFence; ops[n].c.fence = f[i]; }
     }
@@ -2521,31 +2636,74 @@ static void f6_encode(obj_handle_t enc, int kind, const obj_handle_t *f, unsigne
 static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
     struct mad_queue *q = e->q;
     obj_handle_t waits[48];
-    unsigned nw = 0, i, j, k;
-    int other = q->f6_npend >= 40, need;
-    for (i = 0; i < q->f6_npend && !other; i++) {
-        if (kind == F6_BLIT && q->f6_pend[i].kind == F6_BLIT) other = 1;
-        for (j = 0; j < q->f6_pend[i].natt && !other; j++)
+    unsigned char frag[48];   /* madeira-m5 f7-frag: per wait */
+    unsigned nw = 0, nfrag = 0, i, j, k, np = q->f6_npend;
+    int cap = np >= 40, bab = 0, att = 0, other, need, fr;
+    const int f7 = e->mode == 7;   /* madeira-m5 */
+    for (i = 0; i < np && !cap && !bab && !att; i++) {
+        if (kind == F6_BLIT && q->f6_pend[i].kind == F6_BLIT) { bab = 1; break; }
+        for (j = 0; j < q->f6_pend[i].natt && !att; j++)
             for (k = 0; k < e->f6_natt; k++)
-                if (e->f6_att[k] && e->f6_att[k] == q->f6_pend[i].att[j]) { other = 1; if (!e->f6_sync_needed) InterlockedIncrement(&g_f6_att_sync); break; }
+                if (e->f6_att[k] && e->f6_att[k] == q->f6_pend[i].att[j]) { att = 1; break; }
     }
+    other = cap || bab || att;
+    if (att && !e->f6_sync_needed) InterlockedIncrement(&g_f6_att_sync);
     need = e->f6_sync_needed || other;
     InterlockedIncrement(&g_f6_begins);
     g_f6_used = 1;
+    if (need) {   /* madeira-m5: the sync reason (one each; a list start or barrier outranks the structural rules), for ml1134 */
+        if (e->f7_reason & 2) InterlockedIncrement(&g_f6_r_list);
+        else if (e->f6_sync_needed) InterlockedIncrement(&g_f6_r_barrier);
+        else if (cap) InterlockedIncrement(&g_f6_r_cap);
+        else if (bab) InterlockedIncrement(&g_f6_r_bab);
+    }
     if (need && e->f6_sync_needed && !other && (e->f7_reason & 1) && !(e->f7_reason & 2)) {   /* ml1137: a sync caused only by barriers */
-        unsigned np = q->f6_npend, rw;
-        UINT64 m = e->f7_mask & (np >= 64 ? ~0ull : ((1ull << np) - 1));
-        rw = e->f7_all ? np : (unsigned)__builtin_popcountll(m);
+        UINT64 pm = np >= 64 ? ~0ull : ((1ull << np) - 1), m = e->f7_mask & pm;
+        unsigned rw = e->f7_all ? np : (unsigned)__builtin_popcountll(m);
         InterlockedIncrement(&g_f7_bsync);
         InterlockedIncrement(e->f7_all ? &g_f7_all : rw ? &g_f7_subset : &g_f7_none);
         InterlockedExchangeAdd64(&g_f7_fw6, np); InterlockedExchangeAdd64(&g_f7_fwr, rw);
+        /* madeira-m5 fence-chain 7, f7-subset: wait for the named encoders only. Not at a
+         * list start (that sync carries the device fence), not when the batch needs
+         * everything (f7_all; a UAV entry sets every pending bit, which is the same), and
+         * not when the mask is empty (the writer was already waited for: the full sync
+         * costs no more here and empties the set). np < 40 here (!cap), so every shift is
+         * below 64. The pending set stays: a later full sync still waits for the rest. */
+        if (f7 && g_f7_opt_subset > 0 && !e->f6_list_start && !e->f7_all && m && m != pm) {
+            fr = g_f7_opt_frag > 0 && kind == F6_RENDER && !e->f7_uav && (g_f7_opt_frag != 2 || !e->f7_vsread);
+            for (i = 0; i < np; i++) {
+                if (!(m & (1ull << i))) continue;
+                frag[nw] = (unsigned char)(fr && q->f6_pend[i].kind == F6_RENDER && q->f6_pend[i].natt);
+                nfrag += frag[nw];
+                waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
+            }
+            f6_encode(enc, kind, waits, frag, nw, 0);
+            InterlockedExchangeAdd(&g_fence_waits, (LONG)nw);
+            if (nfrag) InterlockedExchangeAdd(&g_f7_frag_waits, (LONG)nfrag);
+            InterlockedIncrement(&g_f7_sub_used); InterlockedIncrement(&g_f6_synced);
+            e->f7_waited_mask = m; e->f7_waited_frag = nfrag != 0;
+            e->f6_enc_synced = 0; e->f6_sync_needed = 0;
+            e->f7_mask = 0; e->f7_all = 0; e->f7_open = 0; e->f7_reason = 0; e->f7_uav = 0; e->f7_vsread = 0;
+            e->f6_cur = q->f6_next++ & 63;
+            return;
+        }
     }
-    if (need) { e->f7_mask = 0; e->f7_all = 0; e->f7_open = 0; e->f7_reason = 0; }
+    /* madeira-m5 f7-frag: a sync caused only by the shared-attachment rule is attachment-only too (the
+     * pending passes' outputs reach this pass through its attachments, loaded in the fragment stage);
+     * the waits on pending compute and blit encoders in the same chain stay at the vertex stage. */
+    fr = f7 && g_f7_opt_frag > 0 && kind == F6_RENDER && need && !e->f6_sync_needed && att && !cap && !bab;
+    e->f7_waited_mask = 0; e->f7_waited_frag = 0;
+    if (need) { e->f7_mask = 0; e->f7_all = 0; e->f7_open = 0; e->f7_reason = 0; e->f7_uav = 0; e->f7_vsread = 0; }
     if (need) {
-        if (e->f6_list_start && q->device->enc_fence) waits[nw++] = q->device->enc_fence;
-        for (i = 0; i < q->f6_npend; i++) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
-        f6_encode(enc, kind, waits, nw, 0);
+        if (e->f6_list_start && q->device->enc_fence) { frag[nw] = 0; waits[nw++] = q->device->enc_fence; q->f6_cb_dev_synced = 1; }
+        for (i = 0; i < np; i++) {
+            frag[nw] = (unsigned char)(fr && q->f6_pend[i].kind == F6_RENDER && q->f6_pend[i].natt);
+            nfrag += frag[nw];
+            waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
+        }
+        f6_encode(enc, kind, waits, frag, nw, 0);
         InterlockedExchangeAdd(&g_fence_waits, (LONG)nw);
+        if (nfrag) InterlockedExchangeAdd(&g_f7_frag_waits, (LONG)nfrag);
         q->f6_npend = 0; e->f6_sync_needed = 0; e->f6_list_start = 0; e->f6_enc_synced = 1;
         InterlockedIncrement(&g_f6_synced);
     } else e->f6_enc_synced = 0;
@@ -2554,7 +2712,7 @@ static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
 static void f6_end(struct mad_exec *e, int kind, obj_handle_t enc) {
     struct mad_queue *q = e->q;
     struct mad_f6_pend *p;
-    f6_encode(enc, kind, NULL, 0, f6_fence(q, e->f6_cur));
+    f6_encode(enc, kind, NULL, NULL, 0, f6_fence(q, e->f6_cur));
     InterlockedIncrement(&g_fence_updates);
     if (e->f7_open) { e->f7_mask |= 1ull << q->f6_npend; e->f7_open = 0; }   /* ml1137: the barrier needed this encoder */
     p = &q->f6_pend[q->f6_npend++];   /* < 40 here: a begin with 40 pending syncs and empties the set */
@@ -2572,7 +2730,7 @@ static void f6_join(struct mad_queue *q) {
     benc = MTLCommandBuffer_blitCommandEncoder(q->open_cb);
     if (!benc) return;
     for (i = 0; i < q->f6_npend; i++) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
-    f6_encode(benc, F6_BLIT, waits, nw, dfence);
+    f6_encode(benc, F6_BLIT, waits, NULL, nw, dfence);
     MTLCommandEncoder_endEncoding(benc);
     q->f6_npend = 0;
     InterlockedIncrement(&g_f6_joins);
@@ -2585,7 +2743,7 @@ static void f6_drain(struct mad_exec *e, int kind, obj_handle_t enc) {
     unsigned i, n = 0;
     if (!q->f6_npend) return;
     for (i = 0; i < q->f6_npend; i++) waits[n++] = f6_fence(q, q->f6_pend[i].idx);
-    f6_encode(enc, kind, waits, n, 0);
+    f6_encode(enc, kind, waits, NULL, n, 0);
     q->f6_npend = 0;
 }
 /* ml1137: what a STATE-AWARE rule would require for this barrier batch, against
@@ -2604,20 +2762,25 @@ static void f7_need(struct mad_exec *e, UINT8 cls, const struct mad_resource *r)
     struct mad_queue *q = e->q;
     unsigned i;
     if (cls == BC_NONE || cls == BC_RAR) return;
-    if (cls == BC_ALL) { e->f7_all = 1; return; }
-    for (i = 0; i < q->f6_npend; i++) {
+    /* madeira-m5 fence-chain 7: COPY_DEST -> read needs EVERYTHING, not just the pending
+     * blits: exec_copy_aspect, exec_copy_reinterpret and mad_bc_upload_decoded write copy
+     * destinations through staging render passes and decode dispatches a kind-only rule
+     * would miss (3 a frame in HFW). A transition without a resource is unknowable too.
+     * The ml1137 census counts these as "all" from here on. */
+    if (cls == BC_ALL || cls == BC_RAW_COPY || (!r && cls != BC_RAW_UAV)) { e->f7_all = 1; return; }
+    for (i = 0; i < q->f6_npend; i++) {   /* f6_npend <= 40: every shift is below 64 */
         const struct mad_f6_pend *p = &q->f6_pend[i];
-        if ((cls == BC_RAW_ATT && p->kind == F6_RENDER && r && f7_has_att(p, r)) ||
-            (cls == BC_RAW_COPY && p->kind == F6_BLIT) ||
-            cls == BC_RAW_UAV) e->f7_mask |= 1ull << i;
+        if ((cls == BC_RAW_ATT && p->kind == F6_RENDER && f7_has_att(p, r)) || cls == BC_RAW_UAV) e->f7_mask |= 1ull << i;
     }
-    if (cls == BC_RAW_ATT && e->renc && r) {
+    if (cls == BC_RAW_ATT && e->renc) {
         unsigned k;
         for (k = 0; k < e->enc_nrt; k++) if (e->enc_rt[k] == r) e->f7_open = 1;
         if (e->enc_depth == r) e->f7_open = 1;
     }
-    if (cls == BC_RAW_COPY && e->benc) e->f7_open = 1;
-    if (cls == BC_RAW_UAV && (e->cenc || e->renc || e->benc)) e->f7_open = 1;
+    if (cls == BC_RAW_UAV) {
+        e->f7_uav = 1;   /* madeira-m5 f7-frag: a UAV wait stays at the vertex stage */
+        if (e->cenc || e->renc || e->benc) e->f7_open = 1;
+    }
 }
 /* madeira-bcd f6-rar (default 0; opt-in, a fence relaxation): with fence-chain
  * 6, a ResourceBarrier batch whose every entry moves a resource from read
@@ -2649,6 +2812,7 @@ static void f7_census_barrier(struct mad_exec *e, const struct mad_cmd *c) {
         if (c->u.barrier.cls_noref < 5) InterlockedIncrement(&g_bc_ent[c->u.barrier.cls_noref]);
         f7_need(e, c->u.barrier.cls_noref, NULL);
     }
+    if (c->u.barrier.vsread) e->f7_vsread = 1;   /* madeira-m5 f7-frag = 2 */
     e->f7_reason |= 1;
 }
 static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) {
@@ -2657,7 +2821,7 @@ static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) 
     if (!enc || !e->mode) return;   /* ml1136: the list's own mode */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
-    if (e->mode == 6) { if (update) f6_end(e, F6_RENDER, enc); else f6_begin(e, F6_RENDER, enc); return; }   /* ml1134 */
+    if (e->mode >= 6) { if (update) f6_end(e, F6_RENDER, enc); else f6_begin(e, F6_RENDER, enc); return; }   /* ml1134; madeira-m5: and mode 7 */
     if (!update) f6_drain(e, F6_RENDER, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
     memset(&f, 0, sizeof f);
@@ -2685,7 +2849,7 @@ static void exec_fence_blit(struct mad_exec *e, obj_handle_t enc, int update) {
     if (!enc || !e->mode) return;   /* ml1136 */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
-    if (e->mode == 6) { if (update) f6_end(e, F6_BLIT, enc); else f6_begin(e, F6_BLIT, enc); return; }   /* ml1134 */
+    if (e->mode >= 6) { if (update) f6_end(e, F6_BLIT, enc); else f6_begin(e, F6_BLIT, enc); return; }   /* ml1134; madeira-m5: and mode 7 */
     if (!update) f6_drain(e, F6_BLIT, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
     memset(&f, 0, sizeof f);
@@ -2701,7 +2865,7 @@ static void exec_fence_compute(struct mad_exec *e, obj_handle_t enc, int update)
     if (!enc || !e->mode) return;   /* ml1136 */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
-    if (e->mode == 6) { if (update) f6_end(e, F6_COMPUTE, enc); else f6_begin(e, F6_COMPUTE, enc); return; }   /* ml1134 */
+    if (e->mode >= 6) { if (update) f6_end(e, F6_COMPUTE, enc); else f6_begin(e, F6_COMPUTE, enc); return; }   /* ml1134; madeira-m5: and mode 7 */
     if (!update) f6_drain(e, F6_COMPUTE, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
     memset(&f, 0, sizeof f);
@@ -4192,7 +4356,7 @@ static void exec_rp_list_end(struct mad_exec *e) {
     if (!p) return;
     if (p == 1 || !exec_rp_tail_plain(e)) why = RPM_PREFIX;
     else if (!k || e->vis_prev != ~(UINT64)0 || e->nic || e->sk || g_capture_on || g_fault_diag || g_census_on || g_sd_state > 0 ||
-             !(e->mode == 0 || e->mode == 1 || e->mode == 5 || (e->mode == 6 && e->f6_enc_synced))) why = RPM_STATE;
+             !(e->mode == 0 || e->mode == 1 || e->mode == 5 || (e->mode >= 6 && e->f6_enc_synced))) why = RPM_STATE;   /* madeira-m5: a subset-synced pass (mode 7) is not carried */
     else if (!mad_rp_carry_on()) why = RPM_OFF;
     else {
         k->renc = e->renc; k->seq = e->renc_seq; k->draws = e->pass_draws;
@@ -5148,7 +5312,7 @@ static int mad_ring_chunk_get(struct mad_device *d, struct mad_ringchunk *out) {
     if (got) return 1;
     memset(&bi, 0, sizeof bi);
     bi.length = MAD_ARG_RING_BYTES;
-    bi.options = WMTResourceStorageModeShared;
+    bi.options = mad_cpu_buf_opts();   /* madeira-m5 untracked-cpu-bufs */
     out->buf = MTLDevice_newBuffer(d->mtl_device, &bi);
     if (!out->buf || !bi.memory.ptr) return 0;
     InterlockedIncrement(&g_ring_chunks);   /* madeira-bcd metal-gap */
@@ -10486,7 +10650,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
             if (previous < 0 && configured)
                 d3d12_log("[madeira-d3d12] cs-concurrent: compute encoders are concurrent between barriers (bcd.cfg cs-concurrent)\n");
         }
-        e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, cs_concurrent > 0 && e->mode != 6); if (e->cenc) g_enc_seq++;
+        e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, cs_concurrent > 0 && e->mode < 6); if (e->cenc) g_enc_seq++;   /* madeira-m5: not in modes 6 and 7 */
         e->cenc_pso = e->cpso; e->cenc_seq = g_enc_seq;
         if (g_fault_diag) mad_label(e->cenc, "C#%u %s fn=%llx:%s", g_enc_seq, e->cpso->vs_name,
                                     (unsigned long long)e->cpso->vs_fn, e->cpso->vs_name);
@@ -10810,6 +10974,17 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     e.mode = mad_fence_mode(q->device);          /* ml1136: fixed for the whole list */
     e.f7_reason = 2;                             /* ml1137: list start */
     e.q = q; e.l = l; e.cb = cb;
+    if (e.mode == 7 && g_f7_opt_list_start == 0 && q->f6_cb_dev_synced && q->open_lists) {
+        /* madeira-m5 f7-list-start = 0: inside a command buffer that has waited for the device
+         * fence, a list start is not a sync point; a barrier the previous list ended with still
+         * is, carried here with what it named (mad_exec is per list). */
+        e.f6_list_start = 0; e.f7_reason = 0;
+        e.f6_sync_needed = q->f6_carry; e.f7_mask = q->f6_carry_mask; e.f7_all = q->f6_carry_all;
+        e.f7_uav = q->f6_carry_uav; e.f7_vsread = q->f6_carry_vsread;
+        if (q->f6_carry) e.f7_reason = 1;
+        InterlockedIncrement(&g_f7_ls_skipped);
+    }
+    q->f6_carry = 0; q->f6_carry_mask = 0; q->f6_carry_all = 0; q->f6_carry_uav = 0; q->f6_carry_vsread = 0;
     e.vis_prev = ~(UINT64)0;   /* ml1088 */
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -10881,14 +11056,23 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             if (g_barrier_render < 0) { g_barrier_render = mad_cfg_int_pe("barrier-render", 0) ? 1 : 0;
                                         d3d12_log("[madeira-d3d12] ml1098 barrier-render = %d (render passes %s at ResourceBarrier)\n", g_barrier_render, g_barrier_render ? "CLOSED" : "left open"); }
             InterlockedIncrement(&g_barrier_seen);   /* ml1116 */
-            if (e.mode == 6) {   /* ml1134: see f6_begin */
-                f7_census_barrier(&e, c);   /* ml1137: counts only */
+            if (e.mode >= 6) {   /* ml1134: see f6_begin; madeira-m5: mode 7 too */
+                f7_census_barrier(&e, c);   /* ml1137: counts; in mode 7 also what the next encoder's subset wait needs */
                 if (f6_rar_only(c)) { InterlockedIncrement(&g_f6_rar_passed); break; }   /* madeira-bcd f6-rar */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
                 e.f6_sync_needed = 1;
                 if (e.cenc && e.f6_enc_synced && g_f6_compute_open) InterlockedIncrement(&g_f6_kept_open);
                 else if (e.cenc || e.benc) exec_end(&e);
                 if (e.renc && (!e.f6_enc_synced || g_barrier_render)) {
+                    /* madeira-m5 fence-chain 7, f7-subset: a pass that waited for a subset at its start stays
+                     * open when this batch (and every earlier one since) needs nothing beyond that subset: not
+                     * everything, not the pass itself, and (f7-frag = 2) no reader outside the fragment stage
+                     * after a fragment-stage wait. The next encoder still syncs (f6_sync_needed stays). */
+                    if (e.mode == 7 && !g_barrier_render && !e.f6_enc_synced && e.f7_waited_mask && !e.f7_all && !e.f7_open &&
+                        !(e.f7_mask & ~e.f7_waited_mask) && !(e.f7_waited_frag && g_f7_opt_frag == 2 && c->u.barrier.vsread)) {
+                        InterlockedIncrement(&g_f7_kept_open);
+                        break;
+                    }
                     InterlockedIncrement(&g_barrier_renc_closed);
                     if (!e.f6_enc_synced) InterlockedIncrement(&g_f6_rclose);   /* costs a store + reload of its attachments */
                     exec_end(&e);
@@ -10951,6 +11135,10 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     if (e.renc) InterlockedIncrement(&g_pass_end_list);
     exec_end(&e);
     while (e.npend) exec_flush_clear(&e, 0);
+    if (e.mode == 7 && g_f7_opt_list_start == 0) {   /* madeira-m5 f7-list-start = 0: a barrier this list ended with reaches the next list's first encoder */
+        q->f6_carry = e.f6_sync_needed; q->f6_carry_mask = e.f7_mask; q->f6_carry_all = e.f7_all;
+        q->f6_carry_uav = e.f7_uav; q->f6_carry_vsread = e.f7_vsread;
+    }
     if (rs) {
         int b;
         rs_sum[RS_LISTEND] += (LONG64)(mad_tick() - rs_t); rs_cnt[RS_LISTEND]++;
@@ -11298,9 +11486,19 @@ static void mad_perf_present(void) {
                 double np = (double)g_perf_presents;
                 LONG b = InterlockedExchange(&g_f6_begins, 0), sy = InterlockedExchange(&g_f6_synced, 0), at = InterlockedExchange(&g_f6_att_sync, 0);
                 LONG ko = InterlockedExchange(&g_f6_kept_open, 0), jn = InterlockedExchange(&g_f6_joins, 0), rc = InterlockedExchange(&g_f6_rclose, 0);
-                d3d12_log("[perf] ml1134 fence-chain 6 per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment), %.1f overlapped; "
-                          "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins\n",
-                          b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np);
+                LONG rl = InterlockedExchange(&g_f6_r_list, 0), rb = InterlockedExchange(&g_f6_r_barrier, 0);   /* madeira-m5: sync reasons */
+                LONG rcap = InterlockedExchange(&g_f6_r_cap, 0), rbab = InterlockedExchange(&g_f6_r_bab, 0);
+                d3d12_log("[perf] ml1134 fence-chain %d per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment), %.1f overlapped; "
+                          "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins; "
+                          "sync reasons: list start %.1f, barrier %.1f, shared attachment %.1f, blit after blit %.1f, 40 pending %.1f\n",
+                          g_fence_chain, b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np, rl / np, rb / np, at / np, rbab / np, rcap / np);
+                if (g_f7_opt_subset >= 0) {   /* madeira-m5: fence-chain 7 was selected */
+                    LONG su = InterlockedExchange(&g_f7_sub_used, 0), fw = InterlockedExchange(&g_f7_frag_waits, 0);
+                    LONG k7 = InterlockedExchange(&g_f7_kept_open, 0), ls = InterlockedExchange(&g_f7_ls_skipped, 0);
+                    d3d12_log("[perf] fence-chain 7 per frame: %.1f subset waits (f7-subset %d), %.1f fragment-stage waits (f7-frag %d), "
+                              "%.1f render passes kept open at a covered barrier, %.1f list starts without a sync (f7-list-start %d)\n",
+                              su / np, g_f7_opt_subset, fw / np, g_f7_opt_frag, k7 / np, ls / np, g_f7_opt_list_start);
+                }
                 if (g_f6_rar > 0)   /* madeira-bcd f6-rar */
                     d3d12_log("[perf] f6-rar per frame: %.1f read-to-read barrier batches passed without a sync\n",
                               InterlockedExchange(&g_f6_rar_passed, 0) / np);
@@ -11333,6 +11531,14 @@ static void mad_perf_present(void) {
                   g_perf_presents ? 1000.0 * g_perf_wait_ticks / (double)fq.QuadPart / g_perf_presents : 0.0, 100.0 * g_perf_wait_ticks / (double)fq.QuadPart / wall,
                   g_perf_presents ? (double)g_perf_polls / g_perf_presents : 0.0, g_perf_presents ? (double)g_perf_qwait_sleeps / g_perf_presents : 0.0,
                   g_perf_sig_lat_n ? 1000.0 * g_perf_sig_lat_ticks / (double)fq.QuadPart / g_perf_sig_lat_n : 0.0, g_perf_sig_lat_n);
+        if (g_cb_coalesce > 0 && g_perf_presents) {   /* madeira-m5 cb-coalesce */
+            double np = (double)g_perf_presents;
+            LONG de = InterlockedExchange(&g_cc_deferred, 0), dl = InterlockedExchange(&g_cc_delivered, 0), ba = InterlockedExchange(&g_cc_batches, 0);
+            LONG wr = InterlockedExchange(&g_cc_waited, 0), fs = InterlockedExchange(&g_cc_fl_seoc, 0), fg = InterlockedExchange(&g_cc_fl_gcv, 0), fw = InterlockedExchange(&g_cc_fl_wait, 0);
+            d3d12_log("[perf] cb-coalesce per frame: %.1f Signals deferred into the open command buffer (%.1f not deferred: a waiter was registered), "
+                      "%.1f delivered by %.1f commits; commits forced by SetEventOnCompletion %.1f, GetCompletedValue %.1f, queue Wait %.1f\n",
+                      de / np, wr / np, dl / np, ba / np, fs / np, fg / np, fw / np);
+        }
         if (g_fpb > 0 && g_perf_presents) {   /* madeira-bcd fence-poll-backoff */
             LONG bn = InterlockedExchange(&g_fpb_n, 0), bm = InterlockedExchange(&g_fpb_moved, 0);
             LONG64 bt = InterlockedExchange64(&g_fpb_ticks, 0);
@@ -11391,8 +11597,10 @@ static void mad_log_nserror(const char *what, obj_handle_t err) {
     if (desc) NSString_getCString(desc, text, sizeof text, WMTUTF8StringEncoding);
     d3d12_log("[madeira-d3d12] ml1049 %s: %s\n", what, text[0] ? text : "(no description)");
 }
+static void mad_cc_deliver(struct mad_queue *q, const struct mad_defsig *s, unsigned n);   /* madeira-m5 cb-coalesce, before mad_signal_run */
 /* ml884: commit the queue's open command buffer and track it for fencing. */
 static void mad_queue_flush(struct mad_queue *q) {
+    struct mad_defsig sigs[sizeof q->def_sigs / sizeof q->def_sigs[0]]; unsigned nsigs = 0;   /* madeira-m5 cb-coalesce */
     if (!q) return;
     EnterCriticalSection(&q->submit_lock);   /* ml1021 */
     if (!q->open_cb) { LeaveCriticalSection(&q->submit_lock); return; }
@@ -11429,10 +11637,17 @@ static void mad_queue_flush(struct mad_queue *q) {
     }
     q->pending[q->npending++] = q->open_cb;      /* the reference taken at open moves here */
     q->open_cb = 0; q->open_lists = 0;
+    q->f6_cb_dev_synced = 0; q->f6_carry = 0;    /* madeira-m5 f7-list-start: the next command buffer's first list syncs at its start */
     __atomic_store_n(&q->batches, q->batches + 1, __ATOMIC_RELEASE);   /* madeira-bcd: after batch_serial, for readers without submit_lock (ARM64 reorders stores) */
     if (q->batches <= 3 || (q->batches % 500) == 0)
         d3d12_log("[madeira-d3d12] batch #%llu committed (%llu lists so far)\n",
                   (unsigned long long)q->batches, (unsigned long long)q->executed);
+    if (q->ndef_sigs) {   /* madeira-m5 cb-coalesce: the Signals this buffer carried become fence jobs now, under submit_lock (recursive) */
+        nsigs = q->ndef_sigs;
+        memcpy(sigs, q->def_sigs, nsigs * sizeof sigs[0]);
+        q->ndef_sigs = 0;
+        mad_cc_deliver(q, sigs, nsigs);
+    }
     LeaveCriticalSection(&q->submit_lock);   /* ml1021 */
 }
 static void mad_device_flush_all(struct mad_device *d) {
@@ -11656,6 +11871,111 @@ static int mad_signal_async(struct mad_queue *q, ID3D12Fence *fence, UINT64 valu
     return ok;
 }
 
+/* madeira-m5 cb-coalesce: DEFERRED SIGNALS (bcd.cfg cb-coalesce = 1, default 0).
+ *
+ * mad_signal_run committed the open command buffer at EVERY Signal: HFW on the M5
+ * iPad submits 27 command buffers a frame, one list each, each with its own join
+ * blit, commit and completion round trip, and the GPU timeline shows them back to
+ * back with no overlap (9 % idle in the heavy scene). D3D12's Signal is a timeline
+ * operation: nothing requires the batch to reach the GPU before someone looks at
+ * the fence. So a Signal is appended to the open buffer's deferred list and the
+ * buffer stays open; mad_queue_flush turns the list into fence jobs when it
+ * commits (the next Wait, Present, 48th list, WriteBufferImmediate, or an
+ * observer below), with the batch's serial. The FIRST job of a batch takes the
+ * queue's pending command buffers (mad_fence_worker's error detection and the
+ * query-result publication both need the buffers on the job that runs first; the
+ * worker is one FIFO), the rest take none, so nothing is retired twice.
+ *
+ * Observers -- the game or another queue looking at a fence whose Signal is still
+ * deferred -- commit the queue that holds it: fence_SetEventOnCompletion,
+ * fence_GetCompletedValue (polling), queue_Wait and mad_wait_committed (the
+ * async-submit worker's Wait). The Signal-vs-waiter race is closed under f->lock:
+ * mad_cc_defer reads the waiters and raises ndeferred under it, the waiter
+ * registers and reads ndeferred under it. The deferral holds a fence reference
+ * until delivery. Lock order: f->lock alone, then submit_lock -> fence_lock ->
+ * g_commit_lock (delivery under submit_lock calls mad_fence_committed); every
+ * observer flushes with f->lock and g_commit_lock RELEASED.
+ * f->committed advances only at the real commit, as async Waits require.
+ * Off with any sync diagnostic, capture, skin-check or without a GPU timeline. */
+static int mad_cc_on(void) {
+    if (g_cb_coalesce < 0) {
+        g_cb_coalesce = mad_cfg_int_pe("cb-coalesce", 0) ? 1 : 0;   /* 1 = a queue Signal no longer commits the open command buffer; it is committed when the fence is observed, at Wait, Present or the 48-list cap. 0 (default): every Signal commits, as before */
+        if (g_cb_coalesce)
+            d3d12_log("[madeira-d3d12] cb-coalesce = 1 (opt-in): queue Signals are deferred into the open command buffer, which is committed "
+                      "when the fence is observed (SetEventOnCompletion, GetCompletedValue, a queue Wait), at Present or at the 48-list cap; "
+                      "[perf] cb-coalesce lines count them\n");
+    }
+    return g_cb_coalesce;
+}
+/* Flush one queue named by a hint pointer: it is resolved through the device's
+ * registry under live_lock and held across the flush (the queue may have been
+ * released; mad_device_flush_all does the same for all of them). */
+static void mad_queue_flush_one(struct mad_device *d, struct mad_queue *hint) {
+    struct mad_queue *q = NULL;
+    unsigned i;
+    if (!d || !hint) return;
+    EnterCriticalSection(&d->live_lock);
+    for (i = 0; i < d->nqueues; i++) if (d->queues[i] == hint) { q = hint; InterlockedIncrement(&q->refs); break; }
+    LeaveCriticalSection(&d->live_lock);
+    if (!q) return;
+    mad_queue_flush(q);
+    queue_Release((ID3D12CommandQueue *)q);
+}
+/* The fence is being looked at for `value`: if a Signal that covers it is still
+ * deferred, commit the queue holding it (all queues if that was not enough: the
+ * same fence deferred on two queues). Cheap when nothing is deferred. */
+static void mad_cc_observe(struct mad_fence *f, UINT64 value, LONG *why) {
+    if (g_cb_coalesce <= 0 || __atomic_load_n(&f->ndeferred, __ATOMIC_ACQUIRE) <= 0) return;
+    if ((UINT64)__atomic_load_n(&f->committed, __ATOMIC_ACQUIRE) >= value || __atomic_load_n(&f->value, __ATOMIC_ACQUIRE) >= value) return;
+    if ((UINT64)__atomic_load_n(&f->submitted, __ATOMIC_ACQUIRE) < value) return;   /* no Signal has asked for it yet */
+    InterlockedIncrement(why);
+    mad_queue_flush_one(f->dev, f->deferred_q);
+    if (__atomic_load_n(&f->ndeferred, __ATOMIC_ACQUIRE) > 0 && (UINT64)__atomic_load_n(&f->committed, __ATOMIC_ACQUIRE) < value)
+        mad_device_flush_all(f->dev);
+}
+/* At Signal: keep it in the open command buffer. 0 = not possible, take the usual path. */
+static int mad_cc_defer(struct mad_queue *q, ID3D12Fence *fence, UINT64 value) {
+    struct mad_fence *f = (struct mad_fence *)fence;
+    struct mad_device *d = q->device;
+    unsigned i;
+    int ok;
+    if (!mad_cc_on() || !d->gpu_event || d->ncap || g_sk_n || g_capture_on || g_sd_state > 0 || g_fence_strict || g_gpu_sync) return 0;
+    EnterCriticalSection(&f->lock);
+    ok = !f->nblocked;
+    for (i = 0; i < f->nwaiters && ok; i++) if (f->waiters[i].value <= value) ok = 0;   /* someone waits for it already: deliver as before */
+    if (ok) { InterlockedExchangePointer((void *volatile *)&f->deferred_q, q); InterlockedIncrement(&f->ndeferred); }
+    LeaveCriticalSection(&f->lock);
+    if (!ok) { InterlockedIncrement(&g_cc_waited); return 0; }
+    EnterCriticalSection(&q->submit_lock);
+    if (q->open_cb && q->ndef_sigs < sizeof q->def_sigs / sizeof q->def_sigs[0]) {
+        ID3D12Fence_AddRef(fence);
+        q->def_sigs[q->ndef_sigs].fence = fence; q->def_sigs[q->ndef_sigs].value = value; q->ndef_sigs++;
+    } else ok = 0;   /* nothing open to carry it, or the list is full */
+    LeaveCriticalSection(&q->submit_lock);
+    if (!ok) { InterlockedDecrement(&f->ndeferred); return 0; }
+    InterlockedIncrement(&g_cc_deferred);
+    return 1;
+}
+/* From mad_queue_flush, right after the commit, under submit_lock: the fence jobs.
+ * mad_signal_async re-enters submit_lock (recursive) and takes fence_lock, the
+ * order every path uses; the first call takes q->pending[], the rest find none. */
+static void mad_cc_deliver(struct mad_queue *q, const struct mad_defsig *s, unsigned n) {
+    unsigned i, k;
+    for (i = 0; i < n; i++) {
+        struct mad_fence *f = (struct mad_fence *)s[i].fence;
+        if (mad_signal_async(q, s[i].fence, s[i].value)) mad_fence_committed(f, s[i].value);
+        else {   /* no job slot: the synchronous form of mad_signal_run */
+            for (k = 0; k < q->npending; k++) mad_cb_retire(q->device, q->pending[k]);
+            q->npending = 0;
+            ID3D12Fence_Signal(s[i].fence, s[i].value);   /* advances f->committed too */
+        }
+        InterlockedDecrement(&f->ndeferred);
+        ID3D12Fence_Release(s[i].fence);
+    }
+    InterlockedExchangeAdd(&g_cc_delivered, (LONG)n);
+    InterlockedIncrement(&g_cc_batches);
+}
+
 static HRESULT STDMETHODCALLTYPE queue_Wait(ID3D12CommandQueue *This, ID3D12Fence *fence, UINT64 value) {
     struct mad_fence *f = (struct mad_fence *)fence;
     unsigned waited = 0;
@@ -11701,6 +12021,15 @@ static HRESULT STDMETHODCALLTYPE queue_Wait(ID3D12CommandQueue *This, ID3D12Fenc
             if (n <= 8)
                 d3d12_log("[fence-strict] Queue::Wait for %llu: the Signal was asked for but its batch was not committed yet; "
                           "waited %u ms for the commit (%ld so far)\n", (unsigned long long)value, waited, (long)n);
+        } else if (g_cb_coalesce > 0 && (UINT64)f->committed < value && f->value < value) {
+            /* madeira-m5 cb-coalesce: the Signal may still be deferred in another queue's open
+             * buffer (or be on its way there): wait for its commit so this queue's later work
+             * commits behind it, committing that buffer as soon as the deferral is visible */
+            while ((UINT64)f->committed < value && f->value < value && waited < 5000) {
+                mad_cc_observe(f, value, &g_cc_fl_wait);
+                if ((UINT64)f->committed >= value || f->value >= value) break;
+                Sleep(1); waited++;
+            }
         }
         return S_OK;
     }
@@ -11710,6 +12039,7 @@ static HRESULT STDMETHODCALLTYPE queue_Wait(ID3D12CommandQueue *This, ID3D12Fenc
         v = f->value;
         LeaveCriticalSection(&f->lock);
         if (v >= value) return S_OK;
+        if (g_cb_coalesce > 0) mad_cc_observe(f, value, &g_cc_fl_wait);   /* madeira-m5 cb-coalesce: a Signal deferred since the flush above */
         InterlockedIncrement(&g_perf_qwait_sleeps);   /* ml1109 */
         Sleep(1);
         waited++;
@@ -11755,6 +12085,7 @@ mad_x64_Wait(ID3D12CommandQueue *This, ID3D12Fence *fence, UINT64 value) {
 }
 static HRESULT mad_signal_run(struct mad_queue *q, ID3D12Fence *fence, UINT64 value) {
     if (g_sd_state < 0) mad_sync_diag_load();       /* madeira-bcd */
+    if (mad_cc_defer(q, fence, value)) { InterlockedIncrement(&g_perf_signals); return S_OK; }   /* madeira-m5 cb-coalesce: the open buffer carries it; mad_queue_flush delivers it */
     mad_queue_flush(q);                              /* ml884: commit the batch this signal covers */
     InterlockedIncrement(&g_perf_signals);           /* ml1109 */
     if (mad_signal_async(q, fence, value)) { mad_fence_committed((struct mad_fence *)fence, value); return S_OK; }
@@ -11815,11 +12146,17 @@ static void mad_fence_committed(struct mad_fence *f, UINT64 value) {
 static void mad_wait_committed(struct mad_fence *f, UINT64 value) {
     LARGE_INTEGER t0, t1; DWORD waited = 0; static LONG said;
     if ((UINT64)f->committed >= value || f->value >= value) return;
+    if (g_cb_coalesce > 0) mad_cc_observe(f, value, &g_cc_fl_wait);   /* madeira-m5 cb-coalesce: before g_commit_lock (the flush takes it after submit_lock) */
     QueryPerformanceCounter(&t0);
     EnterCriticalSection(&g_commit_lock);
     while ((UINT64)f->committed < value && f->value < value && waited < 5000) {
         SleepConditionVariableCS(&g_commit_cv, &g_commit_lock, 10);
         waited += 10;
+        if (g_cb_coalesce > 0 && f->ndeferred > 0 && (UINT64)f->committed < value) {   /* madeira-m5 cb-coalesce: deferred since the check above */
+            LeaveCriticalSection(&g_commit_lock);
+            mad_cc_observe(f, value, &g_cc_fl_wait);
+            EnterCriticalSection(&g_commit_lock);
+        }
     }
     LeaveCriticalSection(&g_commit_lock);
     QueryPerformanceCounter(&t1);
@@ -12730,6 +13067,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateFence(ID3D12Device *This, UINT64 i
     f->vtbl = &g_fence_vtbl; f->refs = 1; f->iid = &IID_ID3D12Fence; f->name = "Fence";
     f->value = initial;
     f->flags = flags;
+    f->dev = (struct mad_device *)This;   /* madeira-m5 cb-coalesce: mad_cc_observe resolves the deferred queue through the device */
     if (flags) {
         static LONG said_flags;
         if (InterlockedIncrement(&said_flags) <= 4)
@@ -13615,7 +13953,7 @@ static obj_handle_t mad_tvs_view_x(struct mad_device *d, struct mad_resource *r,
             struct WMTBufferInfo bi;
             obj_handle_t nb;
             memset(&bi, 0, sizeof bi);
-            bi.length = MAD_TVS_CHUNK; bi.options = WMTResourceStorageModeShared; bi.memory.ptr = NULL;
+            bi.length = MAD_TVS_CHUNK; bi.options = mad_cpu_buf_opts(); bi.memory.ptr = NULL;   /* madeira-m5 untracked-cpu-bufs */
             nb = MTLDevice_newBuffer(d->mtl_device, &bi);
             if (!nb || !bi.memory.ptr) { if (nb) NSObject_release(nb); goto full; }
             mad_resident(d, nb);
@@ -16441,7 +16779,7 @@ static HRESULT device_CreateRootSignature_impl(ID3D12Device *This, UINT node,
     if (nsampler) {   /* ml923: the sampler descriptors the converter's implicit table slot points at */
         struct mad_device *dd = (struct mad_device *)This;
         struct WMTBufferInfo bi; memset(&bi, 0, sizeof bi);
-        bi.length = (uint64_t)nsampler * sizeof(struct mad_descriptor); bi.options = WMTResourceStorageModeShared;
+        bi.length = (uint64_t)nsampler * sizeof(struct mad_descriptor); bi.options = mad_cpu_buf_opts();   /* madeira-m5 untracked-cpu-bufs */
         r->stab = MTLDevice_newBuffer(dd->mtl_device, &bi);
         if (r->stab && bi.memory.ptr) {
             struct mad_descriptor *tab = (struct mad_descriptor *)bi.memory.ptr; UINT32 i, ok = 0;
@@ -17069,7 +17407,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateDescriptorHeap(ID3D12Device *This,
         struct WMTBufferInfo bi;
         memset(&bi, 0, sizeof bi);
         bi.length = (uint64_t)sizeof(struct mad_descriptor) * (desc->NumDescriptors ? desc->NumDescriptors : 1);
-        bi.options = WMTResourceStorageModeShared;
+        bi.options = mad_cpu_buf_opts();   /* madeira-m5 untracked-cpu-bufs */
         h->buffer = MTLDevice_newBuffer(d->mtl_device, &bi);
         if (!h->buffer) { free(h); return mad_creation_failure(d, "descriptor heap buffer"); }
         h->cpu = (struct mad_descriptor *)bi.memory.ptr;
@@ -20760,7 +21098,7 @@ static obj_handle_t mad_fill_pattern16(struct mad_device *d, const UINT32 v[4]) 
     for (i = 0; i < d->nfillpat; i++) if (!memcmp(d->fillpat[i].value, v, 16)) { buf = d->fillpat[i].buf; break; }
     if (!buf && d->nfillpat < (sizeof d->fillpat / sizeof d->fillpat[0])) {
         struct WMTBufferInfo bi;
-        memset(&bi, 0, sizeof bi); bi.length = MAD_FILLPAT_BYTES; bi.options = WMTResourceStorageModeShared;
+        memset(&bi, 0, sizeof bi); bi.length = MAD_FILLPAT_BYTES; bi.options = mad_cpu_buf_opts();   /* madeira-m5 untracked-cpu-bufs */
         buf = MTLDevice_newBuffer(d->mtl_device, &bi);
         if (buf && bi.memory.ptr) {
             UINT32 *w = (UINT32 *)bi.memory.ptr; UINT64 k;
@@ -21287,7 +21625,12 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
             if (b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) cls = BC_RAR;
             else if (!as || (as & W) || !bs) cls = BC_ALL;
             else if (!(bs & W)) cls = BC_RAR;
-            else if (!(bs & ~(UINT)(D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE))) cls = BC_RAW_ATT;
+            else if (!(bs & ~(UINT)(D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE))) {
+                cls = BC_RAW_ATT;
+                /* madeira-m5 f7-frag = 2: the attachment becomes readable outside the fragment stage (a vertex or
+                 * compute SRV, a copy or resolve source, indirect arguments...): its wait must stay at the vertex stage */
+                if (as & ~(UINT)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_READ)) c->u.barrier.vsread = 1;
+            }
             else if (bs == D3D12_RESOURCE_STATE_COPY_DEST) cls = BC_RAW_COPY;
             else if (bs == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) cls = BC_RAW_UAV;
         } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
@@ -23180,7 +23523,7 @@ static UINT mad_lsfg_before(struct mad_swapchain *s, struct mad_resource *src, s
     enc = cb ? MTLCommandBuffer_blitCommandEncoder(cb) : 0;
     if (!enc) { g_lsfg.abort_(lf); return 0; }
     g_enc_seq++;
-    if (g_f6_used && dv->enc_fence) { obj_handle_t df = dv->enc_fence; f6_encode(enc, F6_BLIT, &df, 1, 0); }
+    if (g_f6_used && dv->enc_fence) { obj_handle_t df = dv->enc_fence; f6_encode(enc, F6_BLIT, &df, NULL, 1, 0); }
     mad_blit_texture(enc, src->texture, (obj_handle_t)lf->input_texture, src->width, src->height);
     MTLCommandEncoder_endEncoding(enc);
     MTLCommandBuffer_encodeSignalEvent(cb, (obj_handle_t)lf->input_event, lf->input_value);
@@ -23664,7 +24007,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         enc = MTLCommandBuffer_blitCommandEncoder(cb); if (enc) g_enc_seq++;
         if (enc && g_f6_used && s->queue->device->enc_fence) {   /* ml1134: after every committed batch, not just queue order */
             obj_handle_t df = s->queue->device->enc_fence;
-            f6_encode(enc, F6_BLIT, &df, 1, 0);
+            f6_encode(enc, F6_BLIT, &df, NULL, 1, 0);
         }
         if (enc) {
             memset(&t2t, 0, sizeof t2t);

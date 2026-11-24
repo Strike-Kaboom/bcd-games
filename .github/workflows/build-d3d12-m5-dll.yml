@@ -1,0 +1,160 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Fast Linux cross-compile workflow for ARM64EC madeira_d3d12.dll (Windows PE DLL via llvm-mingw).
+# Compiles madeira-d3d12/src/pe/madeira_d3d12.c with the pinned llvm-mingw toolchain, embeds the
+# GPL-3.0 Metal helper kernel libraries from the tracked madeira_d3d12.dll, and verifies exports
+# plus the full host & ARM64EC PE checks in tests/host/check-x64-graphics-entry.py.
+name: Build Madeira D3D12 M5 DLL (Linux cross-compile)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scid:
+        description: "Shader cache converter ID (MAD_SC_CONVERTER_ID) to preserve device cache"
+        required: false
+        default: "e1a9118d4a9bdc6c"
+  push:
+    branches: [main]
+    paths:
+      - "madeira-d3d12/src/pe/**"
+      - ".github/workflows/build-d3d12-m5-dll.yml"
+
+concurrency:
+  group: build-d3d12-m5-dll
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository == 'Strike-Kaboom/bcd-games'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build number
+        id: bn
+        run: |
+          n=$(grep -v '^#' docs/local-build/BUILD-NUMBER | tr -d '[:space:]')
+          echo "n=$n" >> "$GITHUB_OUTPUT"
+          echo "::notice::building madeira_d3d12.dll for 0.1.$n"
+
+      - name: Cache llvm-mingw 20260421 (Linux x86_64)
+        id: mingw-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchains/llvm-mingw-20260421-ucrt-ubuntu-22.04-x86_64
+          key: llvm-mingw-20260421-ucrt-ubuntu-22.04-x86_64
+
+      - name: Download llvm-mingw 20260421
+        if: steps.mingw-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p toolchains
+          curl -fSL -o /tmp/llvm-mingw.tar.xz \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xJf /tmp/llvm-mingw.tar.xz -C toolchains
+          rm -f /tmp/llvm-mingw.tar.xz
+
+      - name: Build and verify madeira_d3d12.dll (ARM64EC)
+        env:
+          BUILD_NUM: ${{ steps.bn.outputs.n }}
+          SCID: ${{ inputs.scid || 'e1a9118d4a9bdc6c' }}
+        run: |
+          set -euo pipefail
+          R="$PWD"
+          MINGW="$R/toolchains/llvm-mingw-20260421-ucrt-ubuntu-22.04-x86_64/bin"
+          SRC="$R/madeira-d3d12/src/pe"
+          OUT="$R/build/madeira-d3d12/out-pe"
+          SHIP="$R/app/Madeira/arm64ec-windows"
+          mkdir -p "$OUT"
+
+          exports() { "$MINGW/llvm-readobj" --coff-exports "$1" | awk '$1 == "Name:" { print $2 }' | sort -u; }
+
+          echo "=== import library from tracked winemetal.dll ==="
+          { echo "LIBRARY winemetal.dll"; echo "EXPORTS"; exports "$SHIP/winemetal.dll"; } > "$OUT/winemetal.def"
+          "$MINGW/llvm-dlltool" -m arm64ec -d "$OUT/winemetal.def" -l "$OUT/libwinemetal.a"
+
+          echo "=== verify vtable stubs ==="
+          D3D12_H="$R/toolchains/llvm-mingw-20260421-ucrt-ubuntu-22.04-x86_64/generic-w64-mingw32/include/d3d12.h"
+          [ -f "$D3D12_H" ] || D3D12_H="$R/toolchains/llvm-mingw-20260421-ucrt-ubuntu-22.04-x86_64/include/d3d12.h"
+          python3 "$SRC/gen_vtables.py" "$D3D12_H" "$OUT/madeira_d3d12_stubs.h" > /dev/null
+          cmp -s "$OUT/madeira_d3d12_stubs.h" "$SRC/madeira_d3d12_stubs.h"
+
+          echo "=== extract GPL-3.0 helper kernel metallibs from tracked madeira_d3d12.dll ==="
+          python3 - "$SHIP/madeira_d3d12.dll" "$OUT" <<'PYEOF'
+          import struct, sys
+          from pathlib import Path
+          data = Path(sys.argv[1]).read_bytes()
+          out = Path(sys.argv[2])
+          found = []
+          pos = 0
+          while True:
+              idx = data.find(b"MTLB", pos)
+              if idx < 0:
+                  break
+              if idx + 24 <= len(data):
+                  fsize = struct.unpack_from("<Q", data, idx + 16)[0]
+                  os_ver = struct.unpack_from("<H", data, idx + 12)[0]
+                  if 30000 <= fsize <= 100000 and idx + fsize <= len(data):
+                      found.append((os_ver, data[idx:idx + fsize]))
+              pos = idx + 4
+          ios26 = [b for v, b in found if v >= 20]
+          ios18 = [b for v, b in found if v == 18]
+          assert len(ios26) == 1 and len(ios18) == 1, f"Unexpected metallibs: {[(v, len(b)) for v, b in found]}"
+          for name, blob in (("mad_kernels_metallib", ios26[0]), ("mad_kernels_ios18_metallib", ios18[0])):
+              lines = [f"unsigned char {name}[] = {{"]
+              for i in range(0, len(blob), 12):
+                  lines.append("  " + ", ".join(f"0x{x:02x}" for x in blob[i:i + 12]) + ",")
+              lines.append("};")
+              lines.append(f"unsigned int {name}_len = {len(blob)};")
+              (out / f"{name}.h").write_text("\n".join(lines) + "\n")
+              print(f"  extracted {name}: {len(blob)} bytes")
+          PYEOF
+
+          echo "=== compile BCn decoders & madeira_d3d12.dll ==="
+          for cpp in "$SRC/mad_bcn.cpp" "$R/dxmt/src/dxmt/dxmt_bcn.cpp"; do
+            "$MINGW/arm64ec-w64-mingw32-clang++" -c -O2 -std=c++17 -fno-exceptions -fno-rtti \
+              -I"$R/dxmt/src/dxmt" -o "$OUT/$(basename "$cpp" .cpp).o" "$cpp"
+          done
+          "$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall \
+            -DMAD_SC_CONVERTER_ID="\"$SCID\"" \
+            -DMAD_HAVE_KERNELS -DMAD_HAVE_KERNELS_IOS18 \
+            -DMAD_BUILD_ID="\"ipa $BUILD_NUM\"" \
+            -o "$OUT/madeira_d3d12.dll" \
+            "$SRC/madeira_d3d12.c" "$OUT/mad_bcn.o" "$OUT/dxmt_bcn.o" "$SRC/d3d12.def" \
+            -I"$SRC" -I"$OUT" -I"$R/madeira-d3d12/src" -I"$R/dxmt/src/winemetal" \
+            -L"$OUT" -lwinemetal -luuid -lole32
+
+          echo "=== verify exports, markers, and x64 graphics entry ABI ==="
+          exports "$SHIP/madeira_d3d12.dll" > "$OUT/tracked.exports"
+          exports "$OUT/madeira_d3d12.dll" > "$OUT/built.exports"
+          MISSING=$(comm -23 "$OUT/tracked.exports" "$OUT/built.exports")
+          [ -z "$MISSING" ] || { echo "::error::missing exports: $MISSING"; exit 1; }
+
+          python3 "$R/tests/host/check-x64-graphics-entry.py" --d3d12 "$OUT/madeira_d3d12.dll"
+
+          python3 - "$OUT/madeira_d3d12.dll" "$BUILD_NUM" "$SCID" <<'PYEOF'
+          import sys
+          from pathlib import Path
+          data = Path(sys.argv[1]).read_bytes()
+          for m in (
+              f"madeira-d3d12 M2 ipa {sys.argv[2]}".encode(),
+              f"madeira_d3d12 bc1 converter {sys.argv[3]}".encode(),
+              b"f7-subset", b"f7-frag", b"f7-list-start",
+              b"cb-coalesce", b"untracked-cpu-bufs", b"fence-chain 7",
+          ):
+              assert m in data, f"Missing marker {m!r}"
+          print(f"OK: {sys.argv[1]} ({len(data):,} bytes) verified")
+          PYEOF
+
+          cp "$OUT/madeira_d3d12.dll" "$OUT/d3d12.dll"
+
+      - name: Upload madeira_d3d12.dll artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: madeira-d3d12-M5-0.1.${{ steps.bn.outputs.n }}
+          path: |
+            build/madeira-d3d12/out-pe/madeira_d3d12.dll
+            build/madeira-d3d12/out-pe/d3d12.dll
+          retention-days: 14
