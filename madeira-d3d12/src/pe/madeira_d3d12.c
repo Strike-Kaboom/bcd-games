@@ -357,7 +357,7 @@ static int mad_name_in_list(const char *list, const char *name) {
     }
     return 0;
 }
-static LONG g_barrier_renc_closed, g_barrier_renc_kept, g_stencil_srv, g_barrier_seen;
+static LONG g_barrier_renc_closed, g_barrier_renc_kept, g_br2_why[4], g_stencil_srv, g_barrier_seen;
 static volatile LONG64 g_perf_draws_total;   /* madeira-m5 0.1.725: cumulative draws executed, for gameplay-gated Present role 'P' */
 static int g_attachless_split = -1; static LONG g_attachless_split_n;   /* ml1311 */
 struct mad_obj {
@@ -1263,8 +1263,8 @@ static void mad_skip_report(void) {
     d3d12_log("[madeira-d3d12] ml1088 occlusion queries: %ld begun, %ld results delivered, %ld queries counted samples > 0, %ld pass restarts; "
               "ml1089 SRVs with a min-LOD clamp folded into the view: %ld (largest clamp %.1f)\n",
               g_vis_begun, g_vis_resolved, g_vis_nonzero, g_vis_restarts, g_srv_clamped, (double)g_srv_clamp_max);
-    d3d12_log("[madeira-d3d12] ml1091 encoder fence chain: %ld waits, %ld updates; %ld ResourceBarrier calls recorded (%ld closed a render pass, %ld smart-kept); ml1311 attachment-less passes split %ld; ml1094 zero-instance draws elided %ld; ml1101 stencil SRVs %ld\n",
-              g_fence_waits, g_fence_updates, g_barriers, g_barrier_renc_closed, g_barrier_renc_kept, g_attachless_split_n, g_zero_inst, g_stencil_srv);
+    d3d12_log("[madeira-d3d12] ml1091 encoder fence chain: %ld waits, %ld updates; %ld ResourceBarrier calls recorded (%ld closed a render pass, %ld smart-kept; br2 all=%ld att=%ld uav=%ld uavflag=%ld); ml1311 attachment-less passes split %ld; ml1094 zero-instance draws elided %ld; ml1101 stencil SRVs %ld\n",
+              g_fence_waits, g_fence_updates, g_barriers, g_barrier_renc_closed, g_barrier_renc_kept, g_br2_why[0], g_br2_why[1], g_br2_why[2], g_br2_why[3], g_attachless_split_n, g_zero_inst, g_stencil_srv);
     mad_acct_report();
     d3d12_log("[madeira-d3d12] ml1050 residency set: %ld added, %ld removed (%ld members); tessellation: %ld pipelines (%ld built as mesh pipelines), "
               "%ld draws dropped, %ld drawn (%ld non-indexed); ml1147 DXBC geometry: %ld mesh pipelines, %ld draws; DXIL tessellation: %ld drawn (%ld indirect)\n",
@@ -2881,6 +2881,13 @@ static void exec_note_write(struct mad_exec *e, struct mad_resource *r) {   /* m
  *    the next list's first encoder. */
 enum { F6_RENDER, F6_BLIT, F6_COMPUTE };
 static int g_f6_compute_open = -1;
+static int mad_f6_compute_open_on(void) {
+    if (g_f6_compute_open < 0) {
+        g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;   /* 0.1.726 (default 1; fence-chain 6 and 7): 1 = keep a synced compute encoder open at a ResourceBarrier; 0 = close it on every non-RAR barrier (flushes Metal caches and enables cs-concurrent = 1 in modes 6 and 7) */
+        if (!g_f6_compute_open) d3d12_log("[madeira-d3d12] 0.1.726 f6-compute-open = 0: compute encoders close at every non-RAR ResourceBarrier (flushing Metal caches)\n");
+    }
+    return g_f6_compute_open;
+}
 static int g_f6_blit_open = -1; static LONG g_f6_bkeep;   /* madeira-m5 0.1.719 f6-blit-open (Round 6 report 4.2): a synced blit encoder stays open at a barrier */
 union f6_op { struct wmtcmd_render_fence_op r; struct wmtcmd_blit_fence_op b; struct wmtcmd_compute_fence_op c; };
 static obj_handle_t f6_fence(struct mad_queue *q, unsigned idx) {
@@ -4875,11 +4882,11 @@ static int mad_barrier_hits_renc(const struct mad_cmd *c, struct mad_resource *c
     unsigned k;
     if (mad_barrier_rar_only(c)) return 0;
     if (c->u.barrier.all || c->u.barrier.all_tex) return 1;
-    if (mad_barrier_names_att(c, rt, nrt, depth)) return 1;
+    if (mad_barrier_names_att(c, rt, nrt, depth)) return 2;
     for (k = 0; k < c->u.barrier.n && k < MAD_BAR_MAX; k++) {
         UINT8 cl = c->u.barrier.cls[k];
-        if (cl == BC_RAW_UAV) return 1;
-        if (cl == BC_ALL && c->u.barrier.res[k] && (c->u.barrier.res[k]->desc.Flags & 0x4u)) return 1;
+        if (cl == BC_RAW_UAV) return 3;
+        if (cl == BC_ALL && c->u.barrier.res[k] && (c->u.barrier.res[k]->desc.Flags & 0x4u)) return 4;
     }
     return 0;
 }
@@ -4949,7 +4956,7 @@ static int mad_rp_prefix(const struct mad_list *n, struct mad_resource *const *r
  * list's draws behind this pass). */
 static int exec_rp_tail_plain(const struct mad_exec *e) {
     unsigned j = e->l->ncmds;
-    int first = -1, synced = (g_barrier_render == 2 && e->mode == 1) || e->f6_enc_synced;
+    int first = -1, synced = (g_barrier_render == 2 && (e->mode == 1 || e->mode == 5)) || e->f6_enc_synced;
     while (j--) {
         const struct mad_cmd *c = &e->l->cmds[j];
         if (c->kind == MC_DRAW || c->kind == MC_DRAW_INDEXED || c->kind == MC_DRAW_INDIRECT || c->kind == MC_DRAW_INDEXED_INDIRECT) break;
@@ -5085,7 +5092,7 @@ static void exec_rp_list_end(struct mad_exec *e) {
         return;
     }
     p = mad_rp_prefix(q->rp_next, e->enc_rt, e->enc_rtp, e->enc_nrt, e->enc_depth, &e->enc_dp, e->has_blend,
-                      (g_barrier_render == 2 && e->mode == 1) || e->f6_enc_synced);
+                      (g_barrier_render == 2 && (e->mode == 1 || e->mode == 5)) || e->f6_enc_synced);
     if (!p) return;
     if (p == 1 || !exec_rp_tail_plain(e)) why = RPM_PREFIX;
     else if (!k || e->vis_prev != ~(UINT64)0 || e->nic || e->sk || g_capture_on || g_fault_diag || g_census_on || g_sd_state > 0 ||
@@ -11547,7 +11554,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
             if (previous < 0 && configured)
                 d3d12_log("[madeira-d3d12] cs-concurrent: compute encoders are concurrent between barriers (bcd.cfg cs-concurrent)\n");
         }
-        e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, cs_concurrent > 0 && e->mode < 6); if (e->cenc) g_enc_seq++;   /* madeira-m5: not in modes 6 and 7 */
+        e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, cs_concurrent > 0 && (e->mode < 6 || !mad_f6_compute_open_on())); if (e->cenc) g_enc_seq++;   /* madeira-m5 0.1.726: safe in modes 6 and 7 too when f6-compute-open = 0 (every non-RAR barrier closes the encoder) */
         e->cenc_pso = e->cpso; e->cenc_seq = g_enc_seq;
         if (g_fault_diag) mad_label(e->cenc, "C#%u %s fn=%llx:%s", g_enc_seq, e->cpso->vs_name,
                                     (unsigned long long)e->cpso->vs_fn, e->cpso->vs_name);
@@ -11995,39 +12002,43 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             }
             InterlockedIncrement(&g_barrier_seen);   /* ml1116 */
             if (e.mode >= 6) {   /* ml1134: see f6_begin; madeira-m5: mode 7 too */
+                int br_hit = 0;
                 f7_census_barrier(&e, c);   /* ml1137: counts; in mode 7 also what the next encoder's subset wait needs */
                 if (f6_rar_only(c)) { InterlockedIncrement(&g_f6_rar_passed); break; }   /* madeira-bcd f6-rar */
-                if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
                 if (g_f6_blit_open < 0) g_f6_blit_open = mad_cfg_int_pe("f6-blit-open", 0) ? 1 : 0;   /* 0.1.719 (default 0; fence-chain 6 and 7): 1 = a blit encoder that waited for every pending encoder at its start stays open across a ResourceBarrier, as a synced compute encoder does (blit commands run in order within one encoder, and the next encoder still syncs); 0 = every barrier ends an open blit encoder */
                 e.f6_sync_needed = 1;
-                if (e.cenc && e.f6_enc_synced && g_f6_compute_open) InterlockedIncrement(&g_f6_kept_open);
+                if (e.cenc && e.f6_enc_synced && mad_f6_compute_open_on()) InterlockedIncrement(&g_f6_kept_open);
                 else if (e.benc && e.f6_enc_synced && g_f6_blit_open > 0) InterlockedIncrement(&g_f6_bkeep);   /* madeira-m5 0.1.719 f6-blit-open: the same rule for a fully synced blit encoder */
                 else if (e.cenc || e.benc) exec_end(&e);
-                if (e.renc && (!e.f6_enc_synced || g_barrier_render == 1 || (g_barrier_render == 2 && mad_barrier_hits_renc(c, e.enc_rt, e.enc_nrt, e.enc_depth)))) {
+                if (e.renc && g_barrier_render == 2) br_hit = mad_barrier_hits_renc(c, e.enc_rt, e.enc_nrt, e.enc_depth);
+                if (e.renc && (!e.f6_enc_synced || g_barrier_render == 1 || br_hit)) {
                     /* madeira-m5 fence-chain 7, f7-subset: a pass that waited for a subset at its start stays
                      * open when this batch (and every earlier one since) needs nothing beyond that subset: not
                      * everything, not the pass itself, and (f7-frag = 2) no reader outside the fragment stage
                      * after a fragment-stage wait. The next encoder still syncs (f6_sync_needed stays). */
                     /* madeira-m5 0.1.718 f7-none: a pass whose barriers since its start need nothing (an empty mask, nothing unrecorded,
                      * not the pass itself) stays open too, whether or not it ever subset-waited */
-                    if (e.mode == 7 && !g_barrier_render && !e.f6_enc_synced && (e.f7_waited_mask || (g_f7_opt_none > 0 && !e.f7_mask)) && !e.f7_all && !e.f7_open &&
+                    if (e.mode == 7 && g_barrier_render != 1 && !br_hit && !e.f6_enc_synced && (e.f7_waited_mask || (g_f7_opt_none > 0 && !e.f7_mask)) && !e.f7_all && !e.f7_open &&
                         !(e.f7_mask & ~e.f7_waited_mask) && !(e.f7_waited_frag && g_f7_opt_frag == 2 && c->u.barrier.vsread)) {
                         InterlockedIncrement(&g_f7_kept_open);
                         break;
                     }
                     InterlockedIncrement(&g_barrier_renc_closed);
+                    if (br_hit) InterlockedIncrement(&g_br2_why[(br_hit - 1) & 3]);
                     if (!e.f6_enc_synced) { InterlockedIncrement(&g_f6_rclose); InterlockedIncrement(&g_f6_rclose_by[e.f7_unsynced_why & 3]); }   /* costs a store + reload of its attachments */
                     exec_end(&e);
                 } else if (e.renc && g_barrier_render == 2) InterlockedIncrement(&g_barrier_renc_kept);
                 break;
             }
-            if (e.mode == 1 && g_barrier_render == 2) {   /* madeira-m5 0.1.725: fence-chain 1 always syncs before every encoder; keep render pass open unless barrier hits its attachments, a UAV, or all; always close compute/blit on non-RAR barriers */
+            if ((e.mode == 1 || e.mode == 5) && g_barrier_render == 2) {   /* madeira-m5 0.1.725/0.1.726: fence-chain 1/5 always sync before every encoder; keep render pass open unless barrier hits its attachments, a UAV, or all; always close compute/blit on non-RAR barriers */
                 if (mad_barrier_rar_only(c)) { if (e.renc) InterlockedIncrement(&g_barrier_renc_kept); break; }
                 e.fence_needed = 1;
                 if (e.cenc || e.benc) exec_end(&e);
                 else if (e.renc) {
-                    if (mad_barrier_hits_renc(c, e.enc_rt, e.enc_nrt, e.enc_depth)) {
+                    int br_hit = mad_barrier_hits_renc(c, e.enc_rt, e.enc_nrt, e.enc_depth);
+                    if (br_hit) {
                         InterlockedIncrement(&g_barrier_renc_closed);
+                        InterlockedIncrement(&g_br2_why[(br_hit - 1) & 3]);
                         exec_end(&e);
                     } else InterlockedIncrement(&g_barrier_renc_kept);
                 }
