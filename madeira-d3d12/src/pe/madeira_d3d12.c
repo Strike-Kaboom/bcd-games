@@ -14981,8 +14981,8 @@ static volatile LONG g_tv_said, g_tv_fallback, g_tv_eoff_views, g_tv_exact_views
 static volatile LONG g_tv_eoff_pf[1024];   /* views made with a nonzero element offset, by pixel format (view-census) */
 /* madeira-bcd typed-view-shadow (see mad_tvs_view) */
 #define MAD_TVS_CHUNK (4u << 20)
-#define MAD_TVS_MAX_VIEW (64u << 10)
-#define MAD_TVS_MAX_BYTES (64u << 20)
+#define MAD_TVS_MAX_VIEW (512u << 10)   /* madeira-m5 0.1.721: raised from 64 KB (73 HFW UPLOAD typed SRVs > 64 KB were refused and read shifted) */
+#define MAD_TVS_MAX_BYTES (96u << 20)   /* madeira-m5 0.1.721: headroom for 512 KB views */
 #define MAD_TVS_MAX_N 262144u
 #define MAD_TVS_ALL_BYTES (2u << 20)   /* up to this much in all ... */
 #define MAD_TVS_ALL_N 4096u            /* ... and this many copies, every copy is compared at every ExecuteCommandLists */
@@ -14992,12 +14992,13 @@ static volatile LONG g_tv_eoff_pf[1024];   /* views made with a nonzero element 
 #define MAD_TVS_SWEEP_BYTES (1u << 20) /* ... or this much, whichever comes first */
 #define MAD_TVS_IDLE 600               /* a full table gives the copy of a view unused for this many presents to a new view */
 #define MAD_TVS_TOUCH 16384u           /* views looked up again (not new), for the recent pass */
+#define MAD_TVS_HOT 2048u              /* madeira-m5 0.1.721 tvs-hot: views rewritten in the sweep, checked once per present and promoted if rewritten again */
 /* seen: the present its view was last made or looked up; touched: the present it
  * last went into g_tvs_touch; k: its view's index in r->tview + 1 (0 = not yet
  * published). r NULL: its resource is gone (the record stays, never freed, so the
  * recent lists never point at freed memory; its bytes go to a new view). */
 struct mad_tvs { struct mad_resource *r; const unsigned char *src; unsigned char *dst; UINT32 len, cap, boff, k, x3; obj_handle_t buf; UINT64 gpu;
-                 volatile LONG64 seen; LONG64 touched; };   /* len: the source's bytes; x3: 12-byte elements copied at 16 (typed-view-rgb32) */
+                 volatile LONG64 seen; LONG64 touched, hot_at; };   /* len: the source's bytes; x3: 12-byte elements copied at 16 (typed-view-rgb32); hot_at: 0.1.721 tvs-hot */
 static struct mad_tvs **g_tvs; static unsigned g_tvs_n, g_tvs_cap;
 static SRWLOCK g_tvs_lock = SRWLOCK_INIT;
 static obj_handle_t g_tvs_buf; static unsigned char *g_tvs_cpu; static UINT64 g_tvs_gpu; static UINT32 g_tvs_used;
@@ -15006,11 +15007,12 @@ static volatile LONG g_tvs_views, g_tvs_copies, g_tvs_other, g_tvs_full, g_tvs_r
 static unsigned g_tvs_mark[32];   /* g_tvs_n when each of the last 32 presents began (by present & 31): the copies made since */
 static LONG64 g_tvs_mark_at[32];
 static struct mad_tvs *g_tvs_touch[MAD_TVS_TOUCH]; static UINT64 g_tvs_touch_n, g_tvs_touch_mark[32];
+static struct mad_tvs *g_tvs_hot[MAD_TVS_HOT]; static unsigned g_tvs_hot_n; static LONG64 g_tvs_hot_promoted;   /* madeira-m5 0.1.721 tvs-hot */
 static unsigned g_tvs_hand, g_tvs_rr;
 static LONG64 g_tvs_cmp, g_tvs_cmp_bytes;   /* compared at ExecuteCommandLists (under g_tvs_lock), for the periodic line */
 static LONG64 g_tvs_late;   /* rewritten copies the per-present pass found outside the recent window (under g_tvs_lock) */
 static LONG64 g_tvs_ticks, g_tvs_calls;   /* time in mad_tvs_refresh and its calls (under g_tvs_lock), for the periodic line */
-static int g_tvs_on = -1;
+static int g_tvs_on = -1, g_tvs_hot_on = -1;
 static int g_tv_rgb32 = -1;   /* madeira-bcd typed-view-rgb32 (see mad_tv_rgb32_on) */
 static volatile LONG g_tv_rgb32_views, g_tv_rgb32_other;
 static int mad_tv_mode(void) {
@@ -15301,6 +15303,7 @@ static struct mad_tvs *mad_tvs_victim(struct mad_device *d, UINT32 need) {
 }
 /* Into the recent pass (g_tvs_lock held). */
 static void mad_tvs_touch_locked(struct mad_tvs *t, LONG64 now) {
+    if (t->touched == now) return;
     t->touched = now;
     g_tvs_touch[g_tvs_touch_n++ % MAD_TVS_TOUCH] = t;
 }
@@ -15436,6 +15439,10 @@ static void mad_tvs_refresh(void) {
     LONG64 now = g_presents_now, t0;
     unsigned i, m, from; UINT64 j, tfrom; LONG n = 0; int all, first, win;
     if (!g_tvs_n) return;
+    if (g_tvs_hot_on < 0) {
+        g_tvs_hot_on = mad_cfg_int_pe("tvs-hot", 1) ? 1 : 0;   /* 0.1.721 (default 1; with typed-view-shadow): 1 = persistent typed views whose UPLOAD bytes change repeatedly across presents are promoted into the per-ExecuteCommandLists refresh window so they never go stale between sweeps; 0 = 0.1.720 fixed sweep */
+        if (g_tvs_hot_on) d3d12_log("[typed-view] madeira-m5 0.1.721 tvs-hot = 1: repeatedly rewritten persistent shadow views are promoted to every-ExecuteCommandLists refresh (max view %u KB)\n", MAD_TVS_MAX_VIEW >> 10);
+    }
     t0 = (LONG64)mad_tick();   /* madeira-m5 0.1.718: mad_tick units (two QPC transitions per refresh before) */
     AcquireSRWLockExclusive(&g_tvs_lock);
     first = now != last;
@@ -15453,16 +15460,43 @@ static void mad_tvs_refresh(void) {
             }
     for (i = from; i < g_tvs_n; i++) mad_tvs_cmp(g_tvs[i], &n);
     if (!all) {
-        if (g_tvs_touch_n - tfrom > MAD_TVS_TOUCH) tfrom = g_tvs_touch_n - MAD_TVS_TOUCH;
-        for (j = tfrom; j < g_tvs_touch_n; j++) mad_tvs_cmp(g_tvs_touch[j % MAD_TVS_TOUCH], &n);
+        UINT64 tend = g_tvs_touch_n;
+        if (tend - tfrom > MAD_TVS_TOUCH) tfrom = tend - MAD_TVS_TOUCH;
+        for (j = tfrom; j < tend; j++) {
+            struct mad_tvs *t = g_tvs_touch[j % MAD_TVS_TOUCH];
+            if (mad_tvs_cmp(t, &n) && g_tvs_hot_on > 0) mad_tvs_touch_locked(t, now);
+        }
         if (first) {
             UINT64 b = 0;
+            if (g_tvs_hot_on > 0) {
+                unsigned hi = 0;
+                while (hi < g_tvs_hot_n) {
+                    struct mad_tvs *t = g_tvs_hot[hi];
+                    if (!t->r || !t->len || now - (t->hot_at - 1) > 4) {
+                        t->hot_at = 0;
+                        g_tvs_hot[hi] = g_tvs_hot[--g_tvs_hot_n];
+                        continue;
+                    }
+                    if (mad_tvs_cmp(t, &n)) {
+                        t->hot_at = now + 1;
+                        mad_tvs_touch_locked(t, now);
+                        g_tvs_hot_promoted++;
+                    }
+                    hi++;
+                }
+            }
             for (m = 0; m < g_tvs_n && m < MAD_TVS_SWEEP_N && b < MAD_TVS_SWEEP_BYTES; m++) {
                 struct mad_tvs *t;
                 if (g_tvs_rr >= g_tvs_n) g_tvs_rr = 0;
                 t = g_tvs[g_tvs_rr++];
                 b += t->len;
-                if (mad_tvs_cmp(t, &n) && now - t->touched > MAD_TVS_RECENT) g_tvs_late++;
+                if (mad_tvs_cmp(t, &n) && now - t->touched > MAD_TVS_RECENT) {
+                    g_tvs_late++;
+                    if (g_tvs_hot_on > 0 && !t->hot_at && g_tvs_hot_n < MAD_TVS_HOT) {
+                        t->hot_at = now + 1;
+                        g_tvs_hot[g_tvs_hot_n++] = t;
+                    }
+                }
             }
         }
     }
@@ -15496,13 +15530,13 @@ static void mad_tvs_report(void) {
     tk = g_tvs_ticks - ticks_last; calls = g_tvs_calls - calls_last; ticks_last = g_tvs_ticks; calls_last = g_tvs_calls;
     ReleaseSRWLockExclusive(&g_tvs_lock);
     d3d12_log("[typed-view] views that start off a 16-byte boundary: %ld kept their element offset, %ld read an aligned copy (typed-view-shadow %d; "
-              "%u copies, %lld KB, %ld given to a new view, %ld views refused: no room or over 64 KB); %ld offset views not copied (UAV or not UPLOAD); "
+              "%u copies, %lld KB, %ld given to a new view, %ld views refused: no room or over %u KB); %ld offset views not copied (UAV or not UPLOAD); "
               "since the last line %lld copies compared (%lld KB) in %lld calls taking %.1f ms, %ld rewritten in all, %lld of them outside "
-              "the recent window (found by the per-present pass); typed-view-rgb32 %d: %ld R32G32B32 views read a 16-byte-element copy, %ld fell back "
+              "the recent window (found by the per-present pass; tvs-hot %d: %lld promoted, %u hot); typed-view-rgb32 %d: %ld R32G32B32 views read a 16-byte-element copy, %ld fell back "
               "(UAV, not UPLOAD memory, or no room)\n",
               (long)g_tv_eoff_views, (long)g_tvs_views, g_tvs_on > 0, g_tvs_n, (long long)(g_tvs_bytes >> 10), (long)g_tvs_recycled,
-              (long)g_tvs_full, (long)g_tvs_other, (long long)c, (long long)(b >> 10), (long long)calls,
-              tk * 1000.0 / tfq, (long)g_tvs_copies, (long long)g_tvs_late,
+              (long)g_tvs_full, MAD_TVS_MAX_VIEW >> 10, (long)g_tvs_other, (long long)c, (long long)(b >> 10), (long long)calls,
+              tk * 1000.0 / tfq, (long)g_tvs_copies, (long long)g_tvs_late, g_tvs_hot_on > 0, (long long)g_tvs_hot_promoted, g_tvs_hot_n,
               g_tv_rgb32 > 0, (long)g_tv_rgb32_views, (long)g_tv_rgb32_other);
 }
 /* madeira-bcd tv-hash. A typed-buffer view is looked up by (format, offset,
@@ -25985,7 +26019,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     s->presents++;
     mad_perf_present();   /* ml1108 */
     if (g_vt_on > 0) mad_vt_present(s->queue->device, s->presents);
-    if (g_scbv_on > 0 && s->presents % 300 == 0) mad_scbv_report(s->presents);   /* madeira-bcd static-cbv */   /* madeira-bcd vis-trace */
+    if (g_scbv_on > 0 && (s->presents == 60 || s->presents == 120 || s->presents % 300 == 0)) mad_scbv_report(s->presents);   /* madeira-bcd static-cbv */   /* madeira-bcd vis-trace */
     g_census_on = !g_quiet_log && (s->presents >= 1500 && s->presents < 3000 && (s->presents % 200) == 0);   /* ml899; madeira-bcd quiet-log: off */
     if (g_capture_on) g_census_on = 1;   /* ml1098 */
     if (mad_skin_on()) mad_skin_present(s->presents);   /* madeira-bcd skin-check */
