@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
-/* madeira-m5 0.1.717 x64-leaf: the pure x86-64 half of madeira_d3d12.dll (see madeira_x64_leaf.h).
+/* madeira-m5 0.1.717 x64-leaf (0.1.718: Phase B, 21 leaves): the pure x86-64 half of madeira_d3d12.dll (see madeira_x64_leaf.h).
  *
  * Compiled with x86_64-w64-mingw32-clang -c -O2 -Wall -fno-builtin -ffreestanding and linked into
  * the ARM64EC DLL by tools/build-madeira-d3d12-dll.sh. Every function here lives in the ".x64leaf"
@@ -48,12 +48,33 @@ void STDMETHODCALLTYPE mad_ecfb_list_DrawIndexedInstanced(ID3D12GraphicsCommandL
     __asm__("#mad_ecfb_list_DrawIndexedInstanced");
 void STDMETHODCALLTYPE mad_ecfb_list_SetPipelineState(ID3D12GraphicsCommandList *This, ID3D12PipelineState *pso)
     __asm__("#mad_ecfb_list_SetPipelineState");
+/* 0.1.718 Phase B */
+void STDMETHODCALLTYPE mad_ecfb_list_SetGraphicsRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *rs)
+    __asm__("#mad_ecfb_list_SetGraphicsRootSignature");
+void STDMETHODCALLTYPE mad_ecfb_list_SetComputeRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *rs)
+    __asm__("#mad_ecfb_list_SetComputeRootSignature");
+void STDMETHODCALLTYPE mad_ecfb_list_RSSetViewports(ID3D12GraphicsCommandList *This, UINT n, const D3D12_VIEWPORT *vp)
+    __asm__("#mad_ecfb_list_RSSetViewports");
+void STDMETHODCALLTYPE mad_ecfb_list_RSSetScissorRects(ID3D12GraphicsCommandList *This, UINT n, const D3D12_RECT *r)
+    __asm__("#mad_ecfb_list_RSSetScissorRects");
+void STDMETHODCALLTYPE mad_ecfb_list_IASetPrimitiveTopology(ID3D12GraphicsCommandList *This, D3D12_PRIMITIVE_TOPOLOGY t)
+    __asm__("#mad_ecfb_list_IASetPrimitiveTopology");
+void STDMETHODCALLTYPE mad_ecfb_list_OMSetStencilRef(ID3D12GraphicsCommandList *This, UINT ref)
+    __asm__("#mad_ecfb_list_OMSetStencilRef");
+void STDMETHODCALLTYPE mad_ecfb_list_OMSetBlendFactor(ID3D12GraphicsCommandList *This, const FLOAT f[4])
+    __asm__("#mad_ecfb_list_OMSetBlendFactor");
+void STDMETHODCALLTYPE mad_ecfb_list_Dispatch(ID3D12GraphicsCommandList *This, UINT x, UINT y, UINT z)
+    __asm__("#mad_ecfb_list_Dispatch");
 
 _Static_assert(sizeof(D3D12_RESOURCE_DESC) % 8 == 0, "D3D12_RESOURCE_DESC is copied in 8-byte words");
 _Static_assert(sizeof(D3D12_HEAP_DESC) % 8 == 0, "D3D12_HEAP_DESC is copied in 8-byte words");
 
 /* Plain word loops: -fno-builtin keeps the compiler from turning them into memcpy/memset calls. */
 MAD_X64L_INLINE void mad_x64l_copy_words(uint64_t *to, const uint64_t *from, size_t nwords) {
+    size_t i;
+    for (i = 0; i < nwords; i++) to[i] = from[i];
+}
+MAD_X64L_INLINE void mad_x64l_copy_words32(uint32_t *to, const uint32_t *from, size_t nwords) {   /* 0.1.718: 4-byte-aligned structs (viewport, rect, blend) */
     size_t i;
     for (i = 0; i < nwords; i++) to[i] = from[i];
 }
@@ -162,4 +183,65 @@ MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_SetPipelineState(ID3D12Graphi
     struct mad_x64l_cmd *c;
     if (!mad_x64l_push(l, MAD_X64L_MC_PSO, &c)) { MAD_X64L_TAIL return mad_ecfb_list_SetPipelineState(This, pso); }
     if (c) c->u.pso = pso;
+}
+
+/* ---- 0.1.718 Phase B: the trivial batch (Round 4 report, section 5.1 rank 2). Each ARM64EC body is one push and one
+ * field; the static-cbv branches of the root-signature setters and Dispatch are dead while the leaves are installed
+ * (mad_x64_leaf_init vetoes the install when static-cbv is on, and g_scbv_on never changes afterwards). ------------- */
+MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_SetGraphicsRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *rs) {
+    struct mad_x64l_list *l = (struct mad_x64l_list *)This;
+    struct mad_x64l_cmd *c;
+    if (!mad_x64l_push(l, MAD_X64L_MC_ROOTSIG, &c)) { MAD_X64L_TAIL return mad_ecfb_list_SetGraphicsRootSignature(This, rs); }
+    if (c) c->u.rootsig = rs;
+}
+MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_SetComputeRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *rs) {
+    struct mad_x64l_list *l = (struct mad_x64l_list *)This;
+    struct mad_x64l_cmd *c;
+    if (!mad_x64l_push(l, MAD_X64L_MC_CROOTSIG, &c)) { MAD_X64L_TAIL return mad_ecfb_list_SetComputeRootSignature(This, rs); }
+    if (c) c->u.rootsig = rs;
+}
+/* list_RSSetViewports / list_RSSetScissorRects record nothing for n == 0 or a NULL array (before the push, so no
+ * transition either way); only the first entry is kept. */
+MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_RSSetViewports(ID3D12GraphicsCommandList *This, UINT n, const D3D12_VIEWPORT *vp) {
+    struct mad_x64l_list *l = (struct mad_x64l_list *)This;
+    struct mad_x64l_cmd *c;
+    if (!n || !vp) return;
+    if (!mad_x64l_push(l, MAD_X64L_MC_VP, &c)) { MAD_X64L_TAIL return mad_ecfb_list_RSSetViewports(This, n, vp); }
+    if (c) mad_x64l_copy_words32((uint32_t *)&c->u.vp, (const uint32_t *)vp, sizeof(D3D12_VIEWPORT) / 4);
+}
+MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_RSSetScissorRects(ID3D12GraphicsCommandList *This, UINT n, const D3D12_RECT *r) {
+    struct mad_x64l_list *l = (struct mad_x64l_list *)This;
+    struct mad_x64l_cmd *c;
+    if (!n || !r) return;
+    if (!mad_x64l_push(l, MAD_X64L_MC_SCISSOR, &c)) { MAD_X64L_TAIL return mad_ecfb_list_RSSetScissorRects(This, n, r); }
+    if (c) mad_x64l_copy_words32((uint32_t *)&c->u.scissor, (const uint32_t *)r, sizeof(D3D12_RECT) / 4);
+}
+/* The ARM64EC body logs once for an adjacency or patch topology (t >= MAD_X64L_TOPO_FALLBACK): those take the slow path. */
+MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_IASetPrimitiveTopology(ID3D12GraphicsCommandList *This, D3D12_PRIMITIVE_TOPOLOGY t) {
+    struct mad_x64l_list *l = (struct mad_x64l_list *)This;
+    struct mad_x64l_cmd *c;
+    if ((unsigned)t >= MAD_X64L_TOPO_FALLBACK || !mad_x64l_push(l, MAD_X64L_MC_TOPO, &c)) { MAD_X64L_TAIL return mad_ecfb_list_IASetPrimitiveTopology(This, t); }
+    if (c) c->u.topo = t;
+}
+MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_OMSetStencilRef(ID3D12GraphicsCommandList *This, UINT ref) {
+    struct mad_x64l_list *l = (struct mad_x64l_list *)This;
+    struct mad_x64l_cmd *c;
+    if (!mad_x64l_push(l, MAD_X64L_MC_STENCIL_REF, &c)) { MAD_X64L_TAIL return mad_ecfb_list_OMSetStencilRef(This, ref); }
+    if (c) c->u.stencil_ref = ref;
+}
+/* list_OMSetBlendFactor: a NULL factor means 1, 1, 1, 1. */
+MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_OMSetBlendFactor(ID3D12GraphicsCommandList *This, const FLOAT f[4]) {
+    struct mad_x64l_list *l = (struct mad_x64l_list *)This;
+    struct mad_x64l_cmd *c;
+    if (!mad_x64l_push(l, MAD_X64L_MC_BLEND_FACTOR, &c)) { MAD_X64L_TAIL return mad_ecfb_list_OMSetBlendFactor(This, f); }
+    if (c) {
+        if (f) mad_x64l_copy_words32((uint32_t *)c->u.blend.rgba, (const uint32_t *)f, 4);
+        else { c->u.blend.rgba[0] = c->u.blend.rgba[1] = c->u.blend.rgba[2] = c->u.blend.rgba[3] = 1.0f; }
+    }
+}
+MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_Dispatch(ID3D12GraphicsCommandList *This, UINT x, UINT y, UINT z) {
+    struct mad_x64l_list *l = (struct mad_x64l_list *)This;
+    struct mad_x64l_cmd *c;
+    if (!mad_x64l_push(l, MAD_X64L_MC_DISPATCH, &c)) { MAD_X64L_TAIL return mad_ecfb_list_Dispatch(This, x, y, z); }
+    if (c) { c->u.dispatch.x = x; c->u.dispatch.y = y; c->u.dispatch.z = z; }
 }

@@ -639,13 +639,15 @@ OVERLAY = {
                         "whole first pass, an ordering Direct3D 12 does not promise but a game might rely on. Read "
                         "once per game start; [perf] gpu-traffic lines show what it saves."},
     "rp-discard": {"category": "Direct3D 12", "title": "Experiment: no load after, no store before DiscardResource",
-                "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c", "tools/patch-winemetal-rp-store.py"],
+                "kind": "int", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c", "tools/patch-winemetal-rp-store.py"],
                 "note": "Default off. 1: after a game discards a whole render target or depth buffer "
                         "(DiscardResource), the next render pass that draws to it does not read its old contents "
                         "from memory, and a pass whose target is discarded (or cleared whole) next, before any other "
                         "use in the same submission, does not write it back -- as tile-based GPUs do on Windows. "
                         "Opt-in: a game that still reads what it discarded (desktop GPUs ignore discards) would show "
-                        "garbage there. Read once per game start; [perf] gpu-traffic lines show the bytes."},
+                        "garbage there. 2 (0.1.718): measure only, loads and stores unchanged; the [perf] rp-discard "
+                        "fates line says what 1 would save. Textures created for simultaneous access always keep "
+                        "loading and storing. Read once per game start; [perf] gpu-traffic lines show the bytes."},
     "f6-rar": {"category": "Direct3D 12", "title": "Experiment: fence-chain 6 ignores read-to-read barriers",
                 "kind": "bool", "default": "0",
                 "note": "Default off; only with fence-chain = 6. 1: a ResourceBarrier whose every transition goes "

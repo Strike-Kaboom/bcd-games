@@ -288,7 +288,7 @@ mpace_h = r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-typedef int64_t LONG64; typedef int64_t LONGLONG; typedef int32_t LONG; typedef unsigned char BOOLEAN; typedef uint32_t DWORD;
+typedef int64_t LONG64; typedef int64_t LONGLONG; typedef int32_t LONG; typedef unsigned char BOOLEAN; typedef uint32_t DWORD; typedef uint64_t UINT64;
 typedef union { LONGLONG QuadPart; } LARGE_INTEGER; typedef void *HMODULE;
 #define WINAPI
 #define FALSE 0
@@ -297,6 +297,7 @@ static int delays, sleeps, lookups;
 static struct { volatile LONG64 fps_cap; LONG64 qpf, t_cap, n_cap; } g_xp;
 struct mad_swapchain { LONG64 cap_next; };
 static LONG64 mad_qpc( void ) { return clk; }
+static UINT64 mad_tick( void ) { return (UINT64)clk; }
 static LONG WINAPI fake_delay( BOOLEAN a, const LARGE_INTEGER *rel ) { (void)a; delays++; clk += -rel->QuadPart; return 0; }
 static HMODULE GetModuleHandleA( const char *n ) { (void)n; lookups++; return (HMODULE)1; }
 static void *GetProcAddress( HMODULE m, const char *n ) { (void)m; (void)n; return (void *)fake_delay; }
@@ -342,7 +343,7 @@ with tempfile.TemporaryDirectory(prefix="madeira-fps-pe-") as tmp:
 
 # ---- 4. wiring -------------------------------------------------------------------
 present = func_body(d3d, "static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags)")
-check("if (g_xp.fps_cap && !(flags & DXGI_PRESENT_TEST)) mad_fps_cap_pace((struct mad_swapchain *)T, t1.QuadPart);" in present
+check("if (g_xp.fps_cap && !(flags & DXGI_PRESENT_TEST)) mad_fps_cap_pace((struct mad_swapchain *)T, (LONG64)t1);" in present
       and present.index("mad_fps_cap_pace") > present.index("InterlockedExchangeAdd64(&g_perf_present_ticks"),
       "Present paces after its own timing, never for DXGI_PRESENT_TEST")
 mx = re.search(r"static struct mad_xp \{(.*?)\} g_xp;", d3d, re.S).group(1)

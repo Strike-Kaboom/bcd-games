@@ -91,7 +91,7 @@ check('draw: the hook runs only with the switch on, before the render pass begin
       'if (g_skin_check > 0) mad_skin_draw(e, c);' in draw and
       draw.index('if (g_skin_check > 0) mad_skin_draw(e, c);') < draw.index('if (!exec_begin_render(e)) { MAD_SKIP(e); return; }'))
 check('draw: the vertex-stage ranges are logged only for a logged draw, and tab_on is cleared on every path',
-      'e->sk->tab_on = e->sk->draw_gpu == 2;' in draw and '{ if (e->sk) e->sk->tab_on = 0; MAD_SKIP(e); return; }' in draw and
+      'e->sk->tab_on = e->sk->draw_gpu == 2;' in draw and '{ if (e->sk) e->sk->tab_on = 0; MAD_VAR_DROP(); MAD_SKIP(e); return; }' in draw and
       'if (e->sk && e->sk->tab_on) { e->sk->tab_on = 0; mad_skin_vs_line(e); }' in draw)
 disp = body('static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c)')
 check('dispatch: tables built with tab_on, cleared whether or not they built',

@@ -77,7 +77,7 @@ check("render-pass block found", "static void mad_tr_pass(" in block and "static
 check("clear-defer on by default (a kill switch), rp-carry and rp-discard off by default, each read once",
       'g_clear_defer = mad_cfg_int_pe("clear-defer", 1) ? 1 : 0;' in block
       and 'g_rp_carry = mad_cfg_int_pe("rp-carry", 0) ? 1 : 0;' in block
-      and 'g_rp_discard = mad_cfg_int_pe("rp-discard", 0) ? 1 : 0;' in block
+      and 'mad_cfg_int_pe("rp-discard", 0);' in block
       and block.count("if (g_clear_defer < 0)") == 1 and block.count("if (g_rp_carry < 0)") == 1
       and block.count("if (g_rp_discard < 0)") == 1)
 enum = between("enum mad_ck {", "};") + "};"
@@ -98,7 +98,9 @@ check("replay loop: pending clears / discards noted before each command is repla
       "        switch (c->kind) {" in loop and "case MC_DISCARD: break;" in loop)
 check("replay loop: the list end may hand the open pass over before ending it",
       "    exec_rp_list_end(&e);   /* madeira-bcd rp-carry: may hand the open pass to the next list */\n"
-      "    if (e.renc) InterlockedIncrement(&g_pass_end_list);\n    exec_end(&e);\n    while (e.npend) exec_flush_clear(&e, 0);" in loop)
+      "    if (e.renc) InterlockedIncrement(&g_pass_end_list);\n    exec_end(&e);\n"
+      "    if (e.npend) InterlockedExchangeAdd(&g_tr_listend_flush, (LONG)e.npend);   /* madeira-m5 0.1.718 [perf]: clears applied at the list end */\n"
+      "    while (e.npend) exec_flush_clear(&e, 0);" in loop)
 run = func("static void mad_ecl_run(")
 check("mad_ecl_run: one carry slot per call, the next list per list, closed before a 48-list commit and at the end, "
       "under the submit lock",
@@ -129,19 +131,19 @@ for name, sig in (("exec_flush_clear", "static void exec_flush_clear(struct mad_
 census = func("static void f7_store_census(")
 check("the ml1137 census sees a whole discard after a store", "case MC_DISCARD:" in census and "&g_ac_st_discarded" in census)
 check("late stores: only with rp-discard, no capture, a discarded texture attached and op 24 answering",
-      "if (mad_rp_discard_on() && !g_capture_on && exec_rp_late_want(e) && mad_rp_late_ok()) {" in begin
-      and "if (e->rp_late) exec_rp_late_store(e);   /* madeira-bcd rp-discard: the store actions the pass left open */\n"
-          "        MTLCommandEncoder_endEncoding(e->renc);" in func("static void exec_end(struct mad_exec *e) {")
+      "if (mad_rp_discard_on() == 1 && !g_capture_on && exec_rp_late_want(e) && mad_rp_late_ok()) {" in begin
+      and "if (e->rp_late) exec_rp_late_store(e);   /* madeira-bcd rp-discard: the store actions the pass left open */" in func("static void exec_end(struct mad_exec *e) {")
+      and "MTLCommandEncoder_endEncoding(e->renc);" in func("static void exec_end(struct mad_exec *e) {")
       and "if (c->u.discard.whole && mad_rp_discard_on()) mad_rp_dset_add(r);" in disc
       and "q->rp_lists = lists; q->rp_nlists = count;" in run and "rp_want = q->rp_next; q->rp_idx = i;" in run)
 rar = func("static int f6_rar_only(const struct mad_cmd *c) {")
 check("f6-rar: off by default, read once; mode 6 skips the sync only for read-to-read batches, after the census",
       'g_f6_rar = mad_cfg_int_pe("f6-rar", 0) ? 1 : 0;' in rar
-      and "                f7_census_barrier(&e, c);   /* ml1137: counts only */\n"
-          "                if (f6_rar_only(c)) { InterlockedIncrement(&g_f6_rar_passed); break; }   /* madeira-bcd f6-rar */" in loop)
+      and "                f7_census_barrier(&e, c);" in loop
+      and "                if (f6_rar_only(c)) { InterlockedIncrement(&g_f6_rar_passed); break; }   /* madeira-bcd f6-rar */" in loop)
 need = func("static void f7_need(struct mad_exec *e, UINT8 cls, const struct mad_resource *r) {")
 check("ml1137 state-aware census: a UAV barrier needs pending blits too (ClearUnorderedAccessView is a blit fill)",
-      "cls == BC_RAW_UAV) e->f7_mask |= 1ull << i;" in need and "(cls == BC_RAW_UAV && (e->cenc || e->renc || e->benc))" in need)
+      "e->f7_mask |= 1ull << i;" in need and "if (e->cenc || e->renc || e->benc) e->f7_open = 1;" in need)
 patch = root / "tools/patch-winemetal-rp-store.py"
 wm_src = root / "dxmt/src/winemetal/unix/winemetal_unix.c"
 check("the winemetal patch is applied by CI", "- name: Patch winemetal late render-pass store actions\n        run: python3 tools/patch-winemetal-rp-store.py" in
@@ -207,9 +209,9 @@ int main(void) {
 else:
     print("note: no dxmt sources; the patch's own checks are skipped")
 cat = (root / "app/Madeira/ConfigCatalog.generated.swift").read_text()
-for key, dflt in (("clear-defer", "1"), ("rp-carry", "0"), ("rp-discard", "0"), ("f6-rar", "0")):
+for key, kind, dflt in (("clear-defer", r"\.bool", "1"), ("rp-carry", r"\.bool", "0"), ("rp-discard", r"\.int", "0"), ("f6-rar", r"\.bool", "0")):
     check(f"catalog lists {key}, default {dflt}",
-          re.search(r'key: "%s".*kind: \.bool, defaultValue: "%s"' % (re.escape(key), dflt), cat) is not None)
+          re.search(r'key: "%s".*kind: %s, defaultValue: "%s"' % (re.escape(key), kind, dflt), cat) is not None)
 wf = (root / ".github/workflows/build-ipa.yml").read_text()
 check("CI runs this check", "- name: Check render-pass traffic\n        run: python3 tests/host/check-render-pass-traffic.py" in wf)
 
@@ -241,13 +243,15 @@ typedef struct { LONG left, top, right, bottom; } D3D12_RECT;
 typedef int D3D12_PRIMITIVE_TOPOLOGY;
 typedef struct { UINT NumRects; const D3D12_RECT *pRects; UINT FirstSubresource, NumSubresources; } D3D12_DISCARD_REGION;
 enum { D3D12_RESOURCE_DIMENSION_TEXTURE2D = 3, D3D12_RESOURCE_DIMENSION_TEXTURE3D = 4 };
-typedef struct { int Dimension; UINT64 Width; UINT Height; UINT16 DepthOrArraySize, MipLevels; } D3D12_RESOURCE_DESC;
+#define D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS 0x40
+#define MAD_BAR_MAX 16
+typedef struct { int Dimension; UINT64 Width; UINT Height; UINT16 DepthOrArraySize, MipLevels; UINT Flags; } D3D12_RESOURCE_DESC;
 #define D3D12_CLEAR_FLAG_DEPTH 1
 #define D3D12_CLEAR_FLAG_STENCIL 2
 #define MAD_ROOT_PARAM_MAX 32
 typedef struct ID3D12CommandList ID3D12CommandList;
 struct mad_pso { const char *vs_name, *ps_name; };
-struct mad_rootsig; struct mad_heap; struct mad_queryheap; struct mad_skinx;
+struct mad_rootsig; struct mad_heap; struct mad_memheap; struct mad_queryheap; struct mad_skinx;
 ''' + rtvp + r'''
 struct mad_resource { obj_handle_t texture, buffer; UINT32 width, height; int is_depth, has_stencil; UINT samples;
                       enum WMTTextureType tex_type; enum WMTPixelFormat tex_pf; UINT tex_mips; D3D12_RESOURCE_DESC desc; };
@@ -255,14 +259,21 @@ struct mad_vis_batch { UINT64 next; int dirty; unsigned active; };
 struct mad_device { LONG has_query_heaps; };
 struct mad_alloc { LONG generation; };
 ''' + enum + "\n" + bc_enum + cmd_struct + r'''
+enum { XC_PASS_REUSED = 0, XC_N = 64, XC64_N = 8 };
+struct mad_f8_wr { struct mad_resource *r; struct mad_memheap *heap; UINT64 off, size; };
 struct mad_list { struct mad_cmd *cmds; unsigned ncmds; int closed; struct mad_alloc *alloc; LONG recorded_generation; };
 struct mad_rp_carry;
 struct mad_queue { struct mad_device *device; struct mad_vis_batch *vis; unsigned open_lists; UINT64 batches; obj_handle_t open_cb;
                    struct mad_rp_carry *rp_carry; const struct mad_list *rp_next;
+                   struct mad_resource *rp_disc_c[16]; unsigned rp_ndisc_c;
 ''' + rp_lists + rp_last + r'''};
 ''' + exec_struct + r'''
+static void mad_exec_publish(struct mad_exec *e) { (void)e; }
+static int g_f6_rar = -1, g_barrier_render = -1;
+''' + func("static int mad_barrier_rar_only(const struct mad_cmd *c) {") + r'''
 /* ---- stand-ins ---- */
 static LONG InterlockedIncrement(volatile LONG *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
+static LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
 typedef struct { void *p; } SRWLOCK;
 #define SRWLOCK_INIT { 0 }
 static int srw_held, srw_taken;
@@ -339,9 +350,11 @@ static obj_handle_t mad_vis_chunk(struct mad_exec *e, struct mad_vis_batch *v, U
 static LONG64 f7_att_bytes(const struct mad_resource *r, UINT level) { (void)r; (void)level; return 0; }
 static void mad_label(obj_handle_t enc, const char *fmt, ...) { (void)enc; (void)fmt; }
 static void exec_rp_late_store(struct mad_exec *e);
+static void exec_rp_dead_census(struct mad_exec *e);
+static int mad_rp_discard_on(void);
 ''' + func("static void exec_end(struct mad_exec *e) {") + helpers + block + flush_add + \
     func("static void exec_attachless_area(") + func("static int exec_same_targets(struct mad_exec *e) {") + begin + \
-    "static int g_f6_rar = -1;\n" + rar + r'''
+    rar + r'''
 /* ---- a replay with the real loop's hooks (mode 1: barriers end compute and blit encoders) ---- */
 static void replay(struct mad_queue *q, struct mad_list *l) {
     struct mad_exec *ep = calloc(1, sizeof *ep), e; unsigned i;
@@ -415,7 +428,7 @@ static void clear_rt(struct mad_list *l, struct mad_resource *r, float v) {
 static void barrier(struct mad_list *l, struct mad_resource *r) {
     struct mad_cmd *c = push(l, MC_BARRIER); c->u.barrier.cls_noref = BC_NONE; c->u.barrier.res[0] = r; c->u.barrier.cls[0] = BC_ALL; c->u.barrier.n = 1; }
 static void barrier_all(struct mad_list *l, int cls) {
-    struct mad_cmd *c = push(l, MC_BARRIER); c->u.barrier.all = 1; c->u.barrier.cls_noref = (UINT8)cls; }
+    struct mad_cmd *c = push(l, MC_BARRIER); c->u.barrier.all = 1; c->u.barrier.all_tex = (UINT8)(cls != BC_RAW_UAV); c->u.barrier.cls_noref = (UINT8)cls; }
 static void copy(struct mad_list *l, struct mad_resource *dst, struct mad_resource *src_) {
     struct mad_cmd *c = push(l, MC_COPY_T2T); c->u.tt.dst = dst; c->u.tt.src = src_; }
 static void discard(struct mad_list *l, struct mad_resource *r, int whole) { struct mad_cmd *c = push(l, MC_DISCARD); c->u.discard.res = r; c->u.discard.whole = whole; }
@@ -725,13 +738,13 @@ int main(void) {
     reset(-1, 1, -1, 1);
     l1 = L(); rts(l1, 4, GB, &D); vpsc(l1); push(l1, MC_DISCARD)->u.discard.res = &X; clear_rt(l1, &X, 0); draw(l1);
     { struct mad_rtvp v[8], dv; memset(v, 0, sizeof v); memset(&dv, 0, sizeof dv); for (i = 0; i < 8; i++) v[i].layers = 1; dv.layers = 1;
-      EXPECT(mad_rp_prefix(l1, GB, v, 4, &D, &dv, 0) == 2, "prefix: state, a discard and a clear of another texture continue the pass");
-      EXPECT(mad_rp_prefix(l1, GB, v, 4, &D, &dv, 1) == 1, "prefix: blend set before, not set again");
-      EXPECT(mad_rp_prefix(l1, GB, v, 3, &D, &dv, 0) == 0, "prefix: other targets");
+      EXPECT(mad_rp_prefix(l1, GB, v, 4, &D, &dv, 0, 1) == 2, "prefix: state, a discard and a clear of another texture continue the pass");
+      EXPECT(mad_rp_prefix(l1, GB, v, 4, &D, &dv, 1, 1) == 1, "prefix: blend set before, not set again");
+      EXPECT(mad_rp_prefix(l1, GB, v, 3, &D, &dv, 0, 1) == 0, "prefix: other targets");
       l2 = L(); rts(l2, 4, GB, &D); vpsc(l2); clear_rt(l2, &G[2], 0); draw(l2);
-      EXPECT(mad_rp_prefix(l2, GB, v, 4, &D, &dv, 0) == 1, "prefix: a clear of one of the pass's textures ends it");
+      EXPECT(mad_rp_prefix(l2, GB, v, 4, &D, &dv, 0, 1) == 1, "prefix: a clear of one of the pass's textures ends it");
       l3 = L(); rts(l3, 0, NULL, NULL); rts(l3, 4, GB, &D); vpsc(l3); draw(l3);
-      EXPECT(mad_rp_prefix(l3, GB, v, 4, &D, &dv, 0) == 1, "prefix: an attachment-less binding ends it"); }
+      EXPECT(mad_rp_prefix(l3, GB, v, 4, &D, &dv, 0, 1) == 1, "prefix: an attachment-less binding ends it"); }
     if (!bad) printf("ok\n");
     return bad;
 }

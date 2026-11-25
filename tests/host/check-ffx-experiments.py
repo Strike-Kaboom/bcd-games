@@ -92,8 +92,8 @@ check('the replay asks only once whether any is on (g_ffx_exp written last)',
 check('fi-nan-clean reads 0 by default, 1 and 2 only, with a fix comment',
       'v = mad_cfg_int_pe("fi-nan-clean", 0);   /* fix: ' in load and 'g_fnc = (v == 1 || v == 2) ? (int)v : 0;' in load)
 ex = body('static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t cb)')
-before = 'if (g_ffx_exp > 0 && c->kind == MC_DISPATCH) mad_ffx_before(&e, c);'
-after = 'if (g_ffx_exp > 0 && c->kind == MC_DISPATCH) mad_ffx_after(&e, c);'
+before = 'if (g_ffx_exp > 0 && c->kind == MC_DISPATCH) { mad_ffx_before(&e, c); if (g_f7_opt_writes > 0) e.f8_wr_all = 1; }'   # 0.1.718: f7-writes marks their encoders
+after = 'if (g_ffx_exp > 0 && c->kind == MC_DISPATCH) { mad_ffx_after(&e, c); if (g_f7_opt_writes > 0) e.f8_wr_all = 1; }'
 check('the switches are read when a replay starts',
       'if (g_ffx_exp < 0) mad_ffx_load();' in ex and ex.index('if (g_ffx_exp < 0) mad_ffx_load();') < ex.index('for (i = 0; i < l->ncmds; i++) {'))
 check('the before hook runs for direct dispatches ahead of exec_rp_note, which keeps its line before the switch',

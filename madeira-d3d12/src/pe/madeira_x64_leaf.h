@@ -5,7 +5,9 @@
  * Horizon Forbidden West makes 1.3-1.5 M x64->ARM64EC transitions a second, 69 % of them into
  * four COM methods whose bodies are a handful of loads and stores (Round 3 forensic report,
  * section 4.2). Each transition costs 110-150 instructions and a full barrier (section 4.3).
- * With bcd.cfg x64-leaf = 1 the vtable slots of thirteen such methods name x86-64 code linked
+ * With bcd.cfg x64-leaf = 1 the vtable slots of twenty-one such methods (0.1.717: thirteen; 0.1.718
+ * Phase B adds the eight trivial recorders: the two root signatures, viewports, scissors, topology,
+ * stencil reference, blend factor, Dispatch) name x86-64 code linked
  * into the DLL (section ".x64leaf", classified X64 in the ARM64EC code map), which FEX runs as
  * translated x64 without leaving the JIT. Every leaf reads and writes only fields of the object
  * it was called on, at the offsets below, and tail-jumps to the ARM64EC body for anything else.
@@ -32,9 +34,19 @@
 #define MAD_X64L_CMD_U_OFF         8
 #define MAD_X64L_MC_PSO            0    /* enum mad_ck */
 #define MAD_X64L_MC_ROOT           1
+#define MAD_X64L_MC_VP             3    /* 0.1.718 Phase B */
+#define MAD_X64L_MC_SCISSOR        4
+#define MAD_X64L_MC_TOPO           5
 #define MAD_X64L_MC_DRAW           11
 #define MAD_X64L_MC_DRAW_INDEXED   12
+#define MAD_X64L_MC_BLEND_FACTOR   17
+#define MAD_X64L_MC_DISPATCH       23
+#define MAD_X64L_MC_ROOTSIG        25
+#define MAD_X64L_MC_STENCIL_REF    27
+#define MAD_X64L_MC_CROOTSIG       28
 #define MAD_X64L_MC_CROOT          29
+/* list_IASetPrimitiveTopology logs once from this value on (D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ): the leaf takes the slow path there */
+#define MAD_X64L_TOPO_FALLBACK     10
 #define MAD_X64L_ROOT_PARAM_MAX    64   /* MAD_ROOT_PARAM_MAX: a root parameter index at or past it takes the slow path */
 
 /* struct mad_descriptor (24 bytes) and struct mad_rtv (16 bytes): the two descriptor strides. */
@@ -71,6 +83,14 @@ struct mad_x64l_cmd {
         struct { unsigned index; unsigned pad_; uint64_t value; } root;
         struct { unsigned vcount, icount, vstart, istart; } draw;
         struct { unsigned icount, inst, start; int base; unsigned istart; } drawi;
+        /* 0.1.718 Phase B */
+        void *rootsig;
+        unsigned stencil_ref;
+        D3D12_VIEWPORT vp;
+        D3D12_RECT scissor;
+        D3D12_PRIMITIVE_TOPOLOGY topo;
+        struct { unsigned x, y, z; } dispatch;
+        struct { float rgba[4]; } blend;
         unsigned char raw[MAD_X64L_CMD_SIZE - MAD_X64L_CMD_U_OFF];
     } u;
 };
@@ -120,6 +140,11 @@ MAD_X64L_CHECK(sizeof(struct mad_x64l_cmd) == MAD_X64L_CMD_SIZE);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u) == MAD_X64L_CMD_U_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.root.value) == MAD_X64L_CMD_U_OFF + 8);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.drawi.base) == MAD_X64L_CMD_U_OFF + 12);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.rootsig) == MAD_X64L_CMD_U_OFF && offsetof(struct mad_x64l_cmd, u.stencil_ref) == MAD_X64L_CMD_U_OFF);   /* 0.1.718 Phase B */
+MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.vp) == MAD_X64L_CMD_U_OFF && sizeof(D3D12_VIEWPORT) == 24 && sizeof(D3D12_VIEWPORT) % 4 == 0);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.scissor) == MAD_X64L_CMD_U_OFF && sizeof(D3D12_RECT) == 16 && sizeof(D3D12_RECT) % 4 == 0);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.topo) == MAD_X64L_CMD_U_OFF && sizeof(D3D12_PRIMITIVE_TOPOLOGY) == 4);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.dispatch.z) == MAD_X64L_CMD_U_OFF + 8 && offsetof(struct mad_x64l_cmd, u.blend.rgba[3]) == MAD_X64L_CMD_U_OFF + 12);
 MAD_X64L_CHECK(sizeof(struct mad_x64l_desc) == MAD_X64L_DESC_SIZE);
 MAD_X64L_CHECK(sizeof(struct mad_x64l_rtv) == MAD_X64L_RTV_SIZE);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_device, x64_flags) == MAD_X64L_DEV_X64_FLAGS_OFF);
@@ -135,7 +160,7 @@ MAD_X64L_CHECK(offsetof(struct mad_x64l_heap, cpu) == MAD_X64L_HEAP_CPU_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_heap, gpu_address) == MAD_X64L_HEAP_GPU_ADDRESS_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_memheap, desc) == MAD_X64L_MEMHEAP_DESC_OFF);
 
-/* ---- the thirteen leaves (defined in madeira_x64_leaf.c, installed by madeira_d3d12.c) ---- */
+/* ---- the twenty-one leaves (defined in madeira_x64_leaf.c, installed by madeira_d3d12.c) ---- */
 D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE mad_x64l_res_GetGPUVirtualAddress(ID3D12Resource *This);
 D3D12_RESOURCE_DESC * STDMETHODCALLTYPE mad_x64l_res_GetDesc(ID3D12Resource *This, D3D12_RESOURCE_DESC *ret);
 D3D12_HEAP_DESC * STDMETHODCALLTYPE mad_x64l_memheap_GetDesc(ID3D12Heap *This, D3D12_HEAP_DESC *ret);
@@ -151,8 +176,17 @@ void STDMETHODCALLTYPE mad_x64l_list_SetComputeRootDescriptorTable(ID3D12Graphic
 void STDMETHODCALLTYPE mad_x64l_list_DrawInstanced(ID3D12GraphicsCommandList *This, UINT vcount, UINT icount, UINT vstart, UINT istart);
 void STDMETHODCALLTYPE mad_x64l_list_DrawIndexedInstanced(ID3D12GraphicsCommandList *This, UINT icount, UINT inst, UINT start, INT base, UINT istart);
 void STDMETHODCALLTYPE mad_x64l_list_SetPipelineState(ID3D12GraphicsCommandList *This, ID3D12PipelineState *pso);
+/* 0.1.718 Phase B: the trivial batch */
+void STDMETHODCALLTYPE mad_x64l_list_SetGraphicsRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *rs);
+void STDMETHODCALLTYPE mad_x64l_list_SetComputeRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *rs);
+void STDMETHODCALLTYPE mad_x64l_list_RSSetViewports(ID3D12GraphicsCommandList *This, UINT n, const D3D12_VIEWPORT *vp);
+void STDMETHODCALLTYPE mad_x64l_list_RSSetScissorRects(ID3D12GraphicsCommandList *This, UINT n, const D3D12_RECT *r);
+void STDMETHODCALLTYPE mad_x64l_list_IASetPrimitiveTopology(ID3D12GraphicsCommandList *This, D3D12_PRIMITIVE_TOPOLOGY t);
+void STDMETHODCALLTYPE mad_x64l_list_OMSetStencilRef(ID3D12GraphicsCommandList *This, UINT ref);
+void STDMETHODCALLTYPE mad_x64l_list_OMSetBlendFactor(ID3D12GraphicsCommandList *This, const FLOAT f[4]);
+void STDMETHODCALLTYPE mad_x64l_list_Dispatch(ID3D12GraphicsCommandList *This, UINT x, UINT y, UINT z);
 
-/* ---- the seven ARM64EC fallbacks (madeira_d3d12.c) the leaves with a slow path jump to ----
+/* ---- the fifteen ARM64EC fallbacks (madeira_d3d12.c) the leaves with a slow path jump to ----
  * External linkage, so each has an entry thunk and the word before its body that FEX reads
  * ([target - 4]). The x64 side declares them itself, naming the "#" bodies. */
 #if defined(__arm64ec__)
@@ -165,6 +199,14 @@ void STDMETHODCALLTYPE mad_ecfb_list_SetComputeRootDescriptorTable(ID3D12Graphic
 void STDMETHODCALLTYPE mad_ecfb_list_DrawInstanced(ID3D12GraphicsCommandList *This, UINT vcount, UINT icount, UINT vstart, UINT istart);
 void STDMETHODCALLTYPE mad_ecfb_list_DrawIndexedInstanced(ID3D12GraphicsCommandList *This, UINT icount, UINT inst, UINT start, INT base, UINT istart);
 void STDMETHODCALLTYPE mad_ecfb_list_SetPipelineState(ID3D12GraphicsCommandList *This, ID3D12PipelineState *pso);
+void STDMETHODCALLTYPE mad_ecfb_list_SetGraphicsRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *rs);   /* 0.1.718 Phase B */
+void STDMETHODCALLTYPE mad_ecfb_list_SetComputeRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *rs);
+void STDMETHODCALLTYPE mad_ecfb_list_RSSetViewports(ID3D12GraphicsCommandList *This, UINT n, const D3D12_VIEWPORT *vp);
+void STDMETHODCALLTYPE mad_ecfb_list_RSSetScissorRects(ID3D12GraphicsCommandList *This, UINT n, const D3D12_RECT *r);
+void STDMETHODCALLTYPE mad_ecfb_list_IASetPrimitiveTopology(ID3D12GraphicsCommandList *This, D3D12_PRIMITIVE_TOPOLOGY t);
+void STDMETHODCALLTYPE mad_ecfb_list_OMSetStencilRef(ID3D12GraphicsCommandList *This, UINT ref);
+void STDMETHODCALLTYPE mad_ecfb_list_OMSetBlendFactor(ID3D12GraphicsCommandList *This, const FLOAT f[4]);
+void STDMETHODCALLTYPE mad_ecfb_list_Dispatch(ID3D12GraphicsCommandList *This, UINT x, UINT y, UINT z);
 #endif
 
 #endif /* MADEIRA_X64_LEAF_H */

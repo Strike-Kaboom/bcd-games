@@ -80,7 +80,7 @@ check("placement heaps count while the application holds them",
 clock = src[src.index("/* ml1150: the memory census on a clock"):]
 clock = clock[:clock.index("\n    {\n        static unsigned said;")]
 check("the census line prints every part, the rest and the waiting frees, on the 5 s clock",
-      "if (now - prev > 5 * qpf.QuadPart" in clock and "[madeira-d3d12] metal-gap: Metal %lld MB = standalone textures %ld" in clock
+      "if (now - prev > 5 * (LONG64)mad_tick_freq()" in clock and "[madeira-d3d12] metal-gap: Metal %lld MB = standalone textures %ld" in clock   # 0.1.718: mad_tick, not a QPC per list
       and "(metal - sa - theaps - mheaps - bufs - rings) >> 20" in clock and "md->nmhret" in clock
       and "ml1150 Metal currentAllocatedSize %llu MB" in clock)
 

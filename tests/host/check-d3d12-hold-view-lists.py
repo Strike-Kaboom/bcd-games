@@ -80,7 +80,7 @@ check("exec_draw: the switch is evaluated only when the lists are used at all (n
       "const int ml1302_hold = !ml1060_skip_lists && mad_hold_view_lists_on();" in draw)
 check("exec_dispatch, key off: acquire and release are where they were (the release only waits for the switch)",
       "if (!ml1060_cskip) AcquireSRWLockShared(&dev->list_lock);   /* madeira-bcd */" in disp
-      and "    if (!ml1060_cskip && !ml1302_chold) ReleaseSRWLockShared(&dev->list_lock);\n    InterlockedExchangeAdd(&g_es_use_n, (LONG)nur);" in disp)
+      and "    if (!ml1060_cskip && !ml1302_chold) ReleaseSRWLockShared(&dev->list_lock);\n    e->xc[XC_ES_USE_N] += (LONG)nur;" in disp)
 
 # ---- 2. key on
 new_block = cut(draw, "    if (ml1302_hold) {", "    {   /* ml1088: count this draw into the current slot while a query is open.")
@@ -128,7 +128,8 @@ struct wmtcmd_render_useresource : wmtcmd_base { obj_handle_t resource; enum WMT
 struct wmtcmd_render_setpso : wmtcmd_base {};
 struct mad_resource { obj_handle_t texture, buffer; };
 struct mad_device { unsigned nsrv, nuav; mad_resource *srv_res[300]; mad_resource *uav_res[300]; int lock_state; int acquires; };
-struct mad_exec { obj_handle_t renc; std::set<std::pair<obj_handle_t, int>> seen; };
+enum { XC_ES_USE_N = 0 };
+struct mad_exec { obj_handle_t renc; LONG xc[64]; std::set<std::pair<obj_handle_t, int>> seen; };
 static volatile LONG g_es_use_n;
 static LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { LONG o = *p; *p += v; return o; }
 static void AcquireSRWLockShared(int *l) { (*l)++; }
@@ -161,7 +162,7 @@ int main() {
     expect(held == 1 && dev.lock_state == 1, "the lock was taken once and is held on exit");
     expect(order.size() == 5 && order[0] == 1000 && order[1] == 1001 && order[2] == 1002 && order[3] == 5000 && order[4] == 5001 && ends_at_draw,
            "the declarations follow the pipeline command, SRVs then UAVs, and the draw command comes last");
-    expect(tail == &draw && nur == 6 && g_es_use_n == 5, "the tail stays on the draw; the counter got the 5 entries");
+    expect(tail == &draw && nur == 6 && e.xc[XC_ES_USE_N] == 5, "the tail stays on the draw; the counter got the 5 entries");
     expect(ur[3].usage == WMTResourceUsageRead && ur[4].usage == (WMTResourceUsageRead | WMTResourceUsageWrite) == 0 || true, "");
     expect(((wmtcmd_render_useresource *)c_pso.next.ptr)->usage == WMTResourceUsageRead && ur[nur - 1].usage == (enum WMTResourceUsage)(WMTResourceUsageRead | WMTResourceUsageWrite),
            "SRVs are declared for read, UAVs for read and write");

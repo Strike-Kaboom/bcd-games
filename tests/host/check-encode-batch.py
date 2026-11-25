@@ -91,8 +91,9 @@ check("mad_ecl_run begins the batch before the queue lock and finishes it before
       and run.count("mad_es_finish(eb);") == 1 and re.search(r"\breturn\b", run) is None)
 draw = src[src.index("static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {"):]
 draw = draw[:draw.index("\n}\n")]
-check("exec_draw sends a pipeline-variant draw at once (another thread may evict and release the variant)",
-      "if (c_pso.type == WMTRenderCommandSetPSO && !tv && c_pso.pso != e->pso->rps) mad_eb_flush_cur(EBF_VARIANT);" in draw
+check("exec_draw sends an UNCACHED pipeline-variant draw at once and releases the variant on this thread (0.1.718: cached variants live until pso_Release, no flush)",
+      "if (var_uncached) {\n        mad_eb_flush_cur(EBF_VARIANT);\n        (NSObject_release)(c_pso.pso);" in draw
+      and "c_pso.pso = mad_pso_for_strides(e->pso, strides, &var_uncached);" in draw
       and draw.index("mad_eb_flush_cur(EBF_VARIANT)") > draw.index("MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_pso);"))
 check("a thread's arena is freed at DLL_THREAD_DETACH",
       "if (reason == DLL_THREAD_DETACH) mad_es_thread_exit();" in src)

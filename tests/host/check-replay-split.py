@@ -67,10 +67,11 @@ assert 'g_replay_split = mad_cfg_int_pe("replay-split", 0) ? 1 : 0;' in src
 el = src[src.index('static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t cb) {'):]
 el = el[:el.index('\n}\n')]
 assert 'const int rs = mad_rs_on();' in el and 'UINT64 rs_t = rs ? mad_tick() : 0;' in el
-assert el.count('mad_tick()') == 3, 'three timer reads in the replay, all behind rs'
+assert el.count('mad_tick()') == 4, 'three timer reads in the replay, all behind rs, and the 5 s memory census clock (0.1.718: mad_tick, not QPC)'
 for m in re.finditer(r'mad_tick\(\)', el):
     line = el[el.rfind('\n', 0, m.start()) + 1:el.find('\n', m.start())]
     ctx = el[max(0, m.start() - 200):m.start()]
+    if 'last_census' in line: continue   # the ml1150 census clock, once per list, not a replay-split read
     assert 'rs ?' in line or 'if (rs)' in ctx, line
 assert el.count('InterlockedExchangeAdd64(&g_rs_t[b], rs_sum[b])') == 1, 'globals once per list'
 print('PASS: mad_exec_list reads the timer only when replay-split is on and adds to the globals once per list')

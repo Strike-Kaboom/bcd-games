@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-only
-"""madeira-m5 0.1.717 x64-leaf: the pure x86-64 COM leaf methods linked into madeira_d3d12.dll.
+"""madeira-m5 0.1.717 x64-leaf (0.1.718: Phase B, 21 leaves): the pure x86-64 COM leaf methods linked into madeira_d3d12.dll.
 
 Without arguments, check the sources: madeira_x64_leaf.c keeps every leaf in the ".x64leaf"
 section, touches no global, calls nothing, and tail-jumps to its ARM64EC fallback; the header's
@@ -32,7 +32,10 @@ PURE = ['res_GetGPUVirtualAddress', 'res_GetDesc', 'memheap_GetDesc',
         'device_GetDescriptorHandleIncrementSize']
 FALLBACK = ['device_CopyDescriptorsSimple', 'device_CreateConstantBufferView',
             'list_SetGraphicsRootDescriptorTable', 'list_SetComputeRootDescriptorTable',
-            'list_DrawInstanced', 'list_DrawIndexedInstanced', 'list_SetPipelineState']
+            'list_DrawInstanced', 'list_DrawIndexedInstanced', 'list_SetPipelineState',
+            # madeira-m5 0.1.718 Phase B: the trivial batch (one appended command, one field each; Round 4 report 5.1 rank 2)
+            'list_SetGraphicsRootSignature', 'list_SetComputeRootSignature', 'list_RSSetViewports', 'list_RSSetScissorRects',
+            'list_IASetPrimitiveTopology', 'list_OMSetStencilRef', 'list_OMSetBlendFactor', 'list_Dispatch']
 LEAVES = PURE + FALLBACK
 SECTION = '.x64leaf'
 PAGE = 0x1000
@@ -100,7 +103,9 @@ def host_checks():
 
     # 3. the layout contract is asserted on both sides
     constants = re.findall(r'^#define (MAD_X64L_\w+(?:_OFF|_SIZE|_MAX))\s', header, re.M)
-    constants += ['MAD_X64L_MC_PSO', 'MAD_X64L_MC_ROOT', 'MAD_X64L_MC_DRAW', 'MAD_X64L_MC_DRAW_INDEXED', 'MAD_X64L_MC_CROOT']
+    constants += ['MAD_X64L_MC_PSO', 'MAD_X64L_MC_ROOT', 'MAD_X64L_MC_DRAW', 'MAD_X64L_MC_DRAW_INDEXED', 'MAD_X64L_MC_CROOT',
+                  'MAD_X64L_MC_VP', 'MAD_X64L_MC_SCISSOR', 'MAD_X64L_MC_TOPO', 'MAD_X64L_MC_BLEND_FACTOR', 'MAD_X64L_MC_DISPATCH',   # 0.1.718 Phase B
+                  'MAD_X64L_MC_ROOTSIG', 'MAD_X64L_MC_STENCIL_REF', 'MAD_X64L_MC_CROOTSIG', 'MAD_X64L_TOPO_FALLBACK']
     assert len(constants) >= 20, constants
     header_asserts = re.findall(r'^MAD_X64L_CHECK\((.*)\);', header, re.M)
     native_asserts = [m for m in re.findall(r'_Static_assert\(((?:[^;])*?)"x64-leaf:', native, re.S)]
@@ -110,6 +115,10 @@ def host_checks():
         if c.endswith(('_OFF', '_SIZE')) and c not in ('MAD_X64L_RTV_SIZE',):
             assert any(c in a for a in header_asserts), f'{c}: asserted against the mirror in the header'
     assert '_Static_assert(MC_PSO == MAD_X64L_MC_PSO && MC_ROOT == MAD_X64L_MC_ROOT' in native, 'enum values asserted'
+    for c in ('MC_VP == MAD_X64L_MC_VP', 'MC_SCISSOR == MAD_X64L_MC_SCISSOR', 'MC_TOPO == MAD_X64L_MC_TOPO', 'MC_BLEND_FACTOR == MAD_X64L_MC_BLEND_FACTOR',
+              'MC_DISPATCH == MAD_X64L_MC_DISPATCH', 'MC_ROOTSIG == MAD_X64L_MC_ROOTSIG', 'MC_STENCIL_REF == MAD_X64L_MC_STENCIL_REF',
+              'MC_CROOTSIG == MAD_X64L_MC_CROOTSIG', 'D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ == MAD_X64L_TOPO_FALLBACK'):   # 0.1.718 Phase B
+        assert c in native, f'{c}: asserted in madeira_d3d12.c'
 
     # 4. madeira_d3d12.c: external fallbacks that call the static methods; the install behind the switch
     for name in FALLBACK:
@@ -148,7 +157,8 @@ def host_checks():
         print('note: x86_64-w64-mingw32-clang not found; the x86_64 compile runs in the DLL build')
     print(f'PASS leaves: {len(LEAVES)} in {SECTION}, {len(FALLBACK)} with a tail jump to their ARM64EC fallback, no global, no call, no lock')
     print('PASS layout contract: every constant asserted against the real structs and the mirrors')
-    print('PASS install: x64-leaf = 0 by default, diagnostics veto it, 13 slots through the PE view, x64_flags at creation')
+    print(f'PASS install: x64-leaf = 0 by default, diagnostics veto it, {len(LEAVES)} slots through the PE view, x64_flags at creation')
+    rel32_selftest()
     print('PASS build: x86_64 object compiled with -Wall -Werror, linked, checked by this script in the script and the workflow')
 
 
@@ -186,8 +196,10 @@ def disassemble(objdump, dll, pe, section):
 
 
 def rel32_scan(data, lo, hi, base_rva):
-    """Fallback for a build without llvm-objdump: every E9 / 0F 8x rel32 and E8 rel32 encoding in [lo, hi)."""
+    """Fallback for a build without llvm-objdump: every E9 / 0F 8x rel32 and E8 rel32 encoding in [lo, hi).
+    base_rva is the RVA of data[lo] (0.1.718: the leaf's own RVA, not the section's; see rel32_selftest)."""
     found = []
+    hi = min(hi, len(data))   # 0.1.718: a VirtualSize past SizeOfRawData is zero-filled, never file bytes
     for i in range(lo, hi):
         if data[i] == 0xE9 and i + 5 <= hi:
             found.append(('jmp', base_rva + i - lo, base_rva + i - lo + 5 + struct.unpack_from('<i', data, i + 1)[0]))
@@ -196,6 +208,28 @@ def rel32_scan(data, lo, hi, base_rva):
         elif data[i] == 0x0F and i + 6 <= hi and 0x80 <= data[i + 1] <= 0x8F:
             found.append(('jcc', base_rva + i - lo, base_rva + i - lo + 6 + struct.unpack_from('<i', data, i + 2)[0]))
     return found
+
+
+def rel32_selftest():
+    """0.1.718 (Round 4 report B1): rel32_scan on a synthetic section with a second leaf at a non-zero offset. The 0.1.717
+    caller passed the SECTION's RVA as base_rva for every leaf, so every RVA of a leaf after the first was off by the
+    leaf's offset into the section; the fallback (no llvm-objdump) then failed its own assertion for 6 of 7 leaves."""
+    sec = 0x5000                        # the section's RVA; leaf A at offset 0, leaf B at offset 0x100
+    data = bytearray(b'\x90' * 0x200)
+    def put(off, opcode, target, length):
+        data[off:off + len(opcode)] = opcode
+        struct.pack_into('<i', data, off + len(opcode), target - (sec + off + length))
+    put(0x10, b'\xe9', 0x1234, 5)                  # A: jmp out of the section
+    put(0x120, b'\xe9', 0x1234, 5)                 # B: jmp, je, call out of the section
+    put(0x130, b'\x0f\x84', 0x2000, 6)
+    put(0x140, b'\xe8', 0x3000, 5)
+    assert rel32_scan(data, 0, 0x100, sec) == [('jmp', sec + 0x10, 0x1234)]
+    right = rel32_scan(data, 0x100, 0x200, sec + 0x100)
+    assert right == [('jmp', sec + 0x120, 0x1234), ('jcc', sec + 0x130, 0x2000), ('call', sec + 0x140, 0x3000)], right
+    wrong = rel32_scan(data, 0x100, 0x200, sec)   # the 0.1.717 call: every RVA off by the leaf's offset
+    assert wrong[0][1] == sec + 0x20 and wrong[0][2] == 0x1234 - 0x100, wrong
+    assert rel32_scan(data, 0x1f0, 0x300, sec + 0x1f0) == []   # hi past the data: clamped, no IndexError
+    print('PASS rel32_scan: a second leaf at a non-zero section offset reports its own RVAs (0.1.718 fallback fix)')
 
 
 def pe_checks(dll, objdump):
@@ -233,7 +267,7 @@ def pe_checks(dll, objdump):
     # 2. no word an ARM64 x18 patcher would rewrite. The patcher (virtual_ios.c) and
     # patch-wine-kernelbase-x64-tls.py read 4-byte-aligned words, as an ARM64 instruction stream is
     # laid out; the unaligned readings are reported, since x64 bytes form them by chance.
-    data = pe.data[raw:raw + max(rawsize, size)]
+    data = pe.data[raw:raw + rawsize]   # 0.1.718: the file bytes only; a VirtualSize past them is zero-filled, and reading on would reach the next section
     bad = [(off, struct.unpack_from('<I', data, off)[0]) for off in range(0, len(data) - 3) if x18_role(struct.unpack_from('<I', data, off)[0])]
     aligned = [b for b in bad if b[0] % 4 == 0]
     assert not aligned, f'{SECTION}: x18 encodings at aligned offsets {[hex(o) for o, _ in aligned[:8]]}'
@@ -267,7 +301,7 @@ def pe_checks(dll, objdump):
     else:
         for at in ordered:
             n = leaves[at]
-            for kind, where, target in rel32_scan(data, at - lo, extent[at] - lo, lo):
+            for kind, where, target in rel32_scan(data, at - lo, extent[at] - lo, at):   # 0.1.718: the leaf's RVA is the base of data[at - lo]
                 if lo <= target < hi:
                     continue
                 on_fallback = any(target == f[0] for f in fallbacks.values())
@@ -297,8 +331,9 @@ if __name__ == '__main__':
     args = argparse.ArgumentParser()
     args.add_argument('--d3d12')
     args.add_argument('--objdump', help='llvm-objdump to disassemble .x64leaf with (found in toolchains/ or PATH otherwise)')
+    args.add_argument('--no-objdump', action='store_true', help='force the rel32 scan, the path a build without llvm-objdump takes (0.1.718: exercises the fallback fix)')
     ns = args.parse_args()
     host_checks()
     if ns.d3d12:
-        pe_checks(Path(ns.d3d12), ns.objdump or find_tool('llvm-objdump'))
+        pe_checks(Path(ns.d3d12), None if ns.no_objdump else (ns.objdump or find_tool('llvm-objdump')))
     print('OK check-x64-leaf')
