@@ -357,7 +357,8 @@ static int mad_name_in_list(const char *list, const char *name) {
     }
     return 0;
 }
-static LONG g_barrier_renc_closed, g_stencil_srv, g_barrier_seen;
+static LONG g_barrier_renc_closed, g_barrier_renc_kept, g_stencil_srv, g_barrier_seen;
+static volatile LONG64 g_perf_draws_total;   /* madeira-m5 0.1.725: cumulative draws executed, for gameplay-gated Present role 'P' */
 static int g_attachless_split = -1; static LONG g_attachless_split_n;   /* ml1311 */
 struct mad_obj {
     void *vtbl;
@@ -1262,8 +1263,8 @@ static void mad_skip_report(void) {
     d3d12_log("[madeira-d3d12] ml1088 occlusion queries: %ld begun, %ld results delivered, %ld queries counted samples > 0, %ld pass restarts; "
               "ml1089 SRVs with a min-LOD clamp folded into the view: %ld (largest clamp %.1f)\n",
               g_vis_begun, g_vis_resolved, g_vis_nonzero, g_vis_restarts, g_srv_clamped, (double)g_srv_clamp_max);
-    d3d12_log("[madeira-d3d12] ml1091 encoder fence chain: %ld waits, %ld updates; %ld ResourceBarrier calls recorded (%ld closed a render pass); ml1311 attachment-less passes split %ld; ml1094 zero-instance draws elided %ld; ml1101 stencil SRVs %ld\n",
-              g_fence_waits, g_fence_updates, g_barriers, g_barrier_renc_closed, g_attachless_split_n, g_zero_inst, g_stencil_srv);
+    d3d12_log("[madeira-d3d12] ml1091 encoder fence chain: %ld waits, %ld updates; %ld ResourceBarrier calls recorded (%ld closed a render pass, %ld smart-kept); ml1311 attachment-less passes split %ld; ml1094 zero-instance draws elided %ld; ml1101 stencil SRVs %ld\n",
+              g_fence_waits, g_fence_updates, g_barriers, g_barrier_renc_closed, g_barrier_renc_kept, g_attachless_split_n, g_zero_inst, g_stencil_srv);
     mad_acct_report();
     d3d12_log("[madeira-d3d12] ml1050 residency set: %ld added, %ld removed (%ld members); tessellation: %ld pipelines (%ld built as mesh pipelines), "
               "%ld draws dropped, %ld drawn (%ld non-indexed); ml1147 DXBC geometry: %ld mesh pipelines, %ld draws; DXIL tessellation: %ld drawn (%ld indirect)\n",
@@ -4867,6 +4868,21 @@ static int mad_barrier_names_att(const struct mad_cmd *c, struct mad_resource *c
     }
     return 0;
 }
+/* madeira-m5 0.1.725 barrier-render = 2: for a synced render pass (fence-chain = 1 or synced f6/f7), every earlier
+ * encoder already finished before the pass opened, so closing it at MC_BARRIER is only needed when the barrier hits
+ * one of the pass's bound RTVs/DSV, a UAV/UAV-capable resource (0x4 = ALLOW_UNORDERED_ACCESS), or 'all'. */
+static int mad_barrier_hits_renc(const struct mad_cmd *c, struct mad_resource *const *rt, UINT nrt, const struct mad_resource *depth) {
+    unsigned k;
+    if (mad_barrier_rar_only(c)) return 0;
+    if (c->u.barrier.all || c->u.barrier.all_tex) return 1;
+    if (mad_barrier_names_att(c, rt, nrt, depth)) return 1;
+    for (k = 0; k < c->u.barrier.n && k < MAD_BAR_MAX; k++) {
+        UINT8 cl = c->u.barrier.cls[k];
+        if (cl == BC_RAW_UAV) return 1;
+        if (cl == BC_ALL && c->u.barrier.res[k] && (c->u.barrier.res[k]->desc.Flags & 0x4u)) return 1;
+    }
+    return 0;
+}
 /* The histogram bucket of the first command that keeps a pass from being carried (0.1.718 [perf]). */
 static int mad_rp_kind_bucket(const struct mad_cmd *c, struct mad_resource *const *rt, UINT nrt, const struct mad_resource *depth) {
     if (c->kind != MC_BARRIER) return (int)c->kind < RPK_BAR_RAR ? (int)c->kind : RPK_BAR_OTHER;
@@ -4891,8 +4907,9 @@ static int mad_rp_plain(const struct mad_cmd *c, struct mad_resource *const *rt,
         if (c->u.clear.nrect || !mad_clear_defer_on()) return 0;
         for (i = 0; i < nrt; i++) if (rt[i] == c->u.clear.res) return 0;
         return depth != c->u.clear.res;
-    case MC_BARRIER:   /* madeira-m5 0.1.718 rp-carry-barrier */
-        if (mad_rp_carry_barrier_on() <= 0 || g_barrier_render > 0) return 0;
+    case MC_BARRIER:   /* madeira-m5 0.1.718 rp-carry-barrier; 0.1.725: barrier-render = 2 allows synced pass carry across non-hitting barriers */
+        if (mad_rp_carry_barrier_on() <= 0 || g_barrier_render == 1) return 0;
+        if (g_barrier_render == 2) return synced && !mad_barrier_hits_renc(c, rt, nrt, depth);
         if (mad_barrier_rar_only(c)) return synced || g_f6_rar > 0;   /* an unsynced pass is closed at it in the list unless f6-rar passes it */
         if (!synced || c->u.barrier.all) return 0;
         return !mad_barrier_names_att(c, rt, nrt, depth);
@@ -4932,11 +4949,11 @@ static int mad_rp_prefix(const struct mad_list *n, struct mad_resource *const *r
  * list's draws behind this pass). */
 static int exec_rp_tail_plain(const struct mad_exec *e) {
     unsigned j = e->l->ncmds;
-    int first = -1;
+    int first = -1, synced = (g_barrier_render == 2 && e->mode == 1) || e->f6_enc_synced;
     while (j--) {
         const struct mad_cmd *c = &e->l->cmds[j];
         if (c->kind == MC_DRAW || c->kind == MC_DRAW_INDEXED || c->kind == MC_DRAW_INDIRECT || c->kind == MC_DRAW_INDEXED_INDIRECT) break;
-        if (!mad_rp_plain(c, e->enc_rt, e->enc_nrt, e->enc_depth, e->f6_enc_synced)) first = mad_rp_kind_bucket(c, e->enc_rt, e->enc_nrt, e->enc_depth);
+        if (!mad_rp_plain(c, e->enc_rt, e->enc_nrt, e->enc_depth, synced)) first = mad_rp_kind_bucket(c, e->enc_rt, e->enc_nrt, e->enc_depth);
     }
     if (first >= 0) { InterlockedIncrement(&g_rp_tail_kind[first]); return 0; }   /* 0.1.718 [perf]: the one nearest the last draw */
     return 1;
@@ -5067,7 +5084,8 @@ static void exec_rp_list_end(struct mad_exec *e) {
         }
         return;
     }
-    p = mad_rp_prefix(q->rp_next, e->enc_rt, e->enc_rtp, e->enc_nrt, e->enc_depth, &e->enc_dp, e->has_blend, e->f6_enc_synced);
+    p = mad_rp_prefix(q->rp_next, e->enc_rt, e->enc_rtp, e->enc_nrt, e->enc_depth, &e->enc_dp, e->has_blend,
+                      (g_barrier_render == 2 && e->mode == 1) || e->f6_enc_synced);
     if (!p) return;
     if (p == 1 || !exec_rp_tail_plain(e)) why = RPM_PREFIX;
     else if (!k || e->vis_prev != ~(UINT64)0 || e->nic || e->sk || g_capture_on || g_fault_diag || g_census_on || g_sd_state > 0 ||
@@ -11968,9 +11986,13 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                 memcpy(&e.consts[c->u.rconst.index][c->u.rconst.dst], &l->cdata[c->u.rconst.data], c->u.rconst.n * 4);
             break;
         case MC_STENCIL_REF: e.stencil_ref = c->u.stencil_ref; break;
-        case MC_BARRIER:   /* ml1091; ml1098: bcd.cfg barrier-render = 1 closes the render pass too (Astra's conservative experiment) */
-            if (g_barrier_render < 0) { g_barrier_render = mad_cfg_int_pe("barrier-render", 0) ? 1 : 0;
-                                        d3d12_log("[madeira-d3d12] ml1098 barrier-render = %d (render passes %s at ResourceBarrier)\n", g_barrier_render, g_barrier_render ? "CLOSED" : "left open"); }
+        case MC_BARRIER:   /* ml1091; ml1098: bcd.cfg barrier-render = 1 closes the render pass too (Astra's conservative experiment); 0.1.725: 2 = smart (close only if barrier hits pass attachments, a UAV, or all) */
+            if (g_barrier_render < 0) {
+                long long v = mad_cfg_int_pe("barrier-render", 0);   /* 0.1.725 (default 0): 1 = close open render pass on every barrier; 2 = smart-close only if barrier hits pass RTV/DSV, a UAV, or all (zero-flicker pass carry under fence-chain 1); 0 = leave open */
+                g_barrier_render = v <= 0 ? 0 : v >= 2 ? 2 : 1;
+                d3d12_log("[madeira-d3d12] ml1098 barrier-render = %d (render passes %s at ResourceBarrier)\n",
+                          g_barrier_render, g_barrier_render == 2 ? "SMART-CLOSED" : g_barrier_render ? "CLOSED" : "left open");
+            }
             InterlockedIncrement(&g_barrier_seen);   /* ml1116 */
             if (e.mode >= 6) {   /* ml1134: see f6_begin; madeira-m5: mode 7 too */
                 f7_census_barrier(&e, c);   /* ml1137: counts; in mode 7 also what the next encoder's subset wait needs */
@@ -11981,7 +12003,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                 if (e.cenc && e.f6_enc_synced && g_f6_compute_open) InterlockedIncrement(&g_f6_kept_open);
                 else if (e.benc && e.f6_enc_synced && g_f6_blit_open > 0) InterlockedIncrement(&g_f6_bkeep);   /* madeira-m5 0.1.719 f6-blit-open: the same rule for a fully synced blit encoder */
                 else if (e.cenc || e.benc) exec_end(&e);
-                if (e.renc && (!e.f6_enc_synced || g_barrier_render)) {
+                if (e.renc && (!e.f6_enc_synced || g_barrier_render == 1 || (g_barrier_render == 2 && mad_barrier_hits_renc(c, e.enc_rt, e.enc_nrt, e.enc_depth)))) {
                     /* madeira-m5 fence-chain 7, f7-subset: a pass that waited for a subset at its start stays
                      * open when this batch (and every earlier one since) needs nothing beyond that subset: not
                      * everything, not the pass itself, and (f7-frag = 2) no reader outside the fragment stage
@@ -11996,6 +12018,18 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                     InterlockedIncrement(&g_barrier_renc_closed);
                     if (!e.f6_enc_synced) { InterlockedIncrement(&g_f6_rclose); InterlockedIncrement(&g_f6_rclose_by[e.f7_unsynced_why & 3]); }   /* costs a store + reload of its attachments */
                     exec_end(&e);
+                } else if (e.renc && g_barrier_render == 2) InterlockedIncrement(&g_barrier_renc_kept);
+                break;
+            }
+            if (e.mode == 1 && g_barrier_render == 2) {   /* madeira-m5 0.1.725: fence-chain 1 always syncs before every encoder; keep render pass open unless barrier hits its attachments, a UAV, or all; always close compute/blit on non-RAR barriers */
+                if (mad_barrier_rar_only(c)) { if (e.renc) InterlockedIncrement(&g_barrier_renc_kept); break; }
+                e.fence_needed = 1;
+                if (e.cenc || e.benc) exec_end(&e);
+                else if (e.renc) {
+                    if (mad_barrier_hits_renc(c, e.enc_rt, e.enc_nrt, e.enc_depth)) {
+                        InterlockedIncrement(&g_barrier_renc_closed);
+                        exec_end(&e);
+                    } else InterlockedIncrement(&g_barrier_renc_kept);
                 }
                 break;
             }
@@ -12092,6 +12126,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         LONG n = InterlockedIncrement(&acc_lists);
         InterlockedExchangeAdd(&acc_cmds, (LONG)l->ncmds);
         InterlockedExchangeAdd(&acc_draws, (LONG)e.draws);
+        if (e.draws) InterlockedExchangeAdd64(&g_perf_draws_total, (LONG64)e.draws);   /* madeira-m5 0.1.725: total draws for gameplay-gated power governor */
         InterlockedExchangeAdd(&acc_skipped, (LONG)e.skipped);
         if ((LONG)e.draws > acc_max_draws) acc_max_draws = (LONG)e.draws;
         if ((n % 600) == 0) {
@@ -25901,7 +25936,25 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     obj_handle_t drawable, tex, cb, enc;
     struct wmtcmd_blit_copy_from_texture_to_texture t2t;
     if (idx >= s->nbuf) return;
-    mad_xp_role('P');   /* madeira-m5 0.1.724: async-submit executes Present on the queue worker while the caller spends <1 ms/window; tag the runner with 'P' so server_ios.c ios_bg_game_note activates MADEIRA_POWER_GOV_MW */
+    {   /* madeira-m5 0.1.725: gameplay-gated present role 'P' so MADEIRA_POWER_GOV_MW never throttles startup/save loading or menus, only sustained 3D gameplay */
+        static LONG64 prev_draws;
+        static int heavy_frames, p_registered;
+        if (!p_registered) {
+            LONG64 cur_draws = g_perf_draws_total;
+            LONG64 frame_draws = cur_draws - prev_draws;
+            prev_draws = cur_draws;
+            if (frame_draws >= 1500 || (frame_draws >= 300 && s->presents >= 2400)) {
+                if (++heavy_frames >= 60) {
+                    p_registered = 1;
+                    mad_xp_role('P');
+                    d3d12_log("[madeira-d3d12] 0.1.725 gameplay detected (present #%llu, %lld draws/frame) -> registering present role 'P'\n",
+                              (unsigned long long)s->presents, (long long)frame_draws);
+                }
+            } else if (frame_draws < 150) {
+                heavy_frames = 0;
+            }
+        }
+    }
     src = s->buffers[idx];
     g_perf_present_q = s->queue;   /* madeira-m5 0.1.716 P4a/P4e: for mad_perf_present below (same thread; the swapchain holds the queue) */
     mad_mheap_reclaim(s->dev, 0);   /* ml1148: once a frame, heaps whose GPU work is long done */
