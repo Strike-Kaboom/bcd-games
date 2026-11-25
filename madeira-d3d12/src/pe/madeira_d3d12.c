@@ -25901,6 +25901,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     obj_handle_t drawable, tex, cb, enc;
     struct wmtcmd_blit_copy_from_texture_to_texture t2t;
     if (idx >= s->nbuf) return;
+    mad_xp_role('P');   /* madeira-m5 0.1.724: async-submit executes Present on the queue worker while the caller spends <1 ms/window; tag the runner with 'P' so server_ios.c ios_bg_game_note activates MADEIRA_POWER_GOV_MW */
     src = s->buffers[idx];
     g_perf_present_q = s->queue;   /* madeira-m5 0.1.716 P4a/P4e: for mad_perf_present below (same thread; the swapchain holds the queue) */
     mad_mheap_reclaim(s->dev, 0);   /* ml1148: once a frame, heaps whose GPU work is long done */
