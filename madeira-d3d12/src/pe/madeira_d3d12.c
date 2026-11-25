@@ -809,6 +809,19 @@ static void mad_eco_prio_self(char role) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     if (role) mad_xp_role(role);
 }
+/* madeira-m5 0.1.723: name madeira-d3d12's own worker threads via SetThreadDescription (dynamic lookup: no new PE imports) so
+ * MADEIRA_THREAD_QOS and [xp-t] can identify and steer them independently of the game's unnamed main thread. */
+static void mad_name_thread(const wchar_t *name) {
+    typedef HRESULT (WINAPI *pfn_std)(HANDLE, PCWSTR);
+    static pfn_std fn;
+    pfn_std f = fn;
+    if (!f) {
+        HMODULE kb = GetModuleHandleA("kernelbase.dll");
+        if (!kb) kb = GetModuleHandleA("kernel32.dll");
+        if (kb) { f = (pfn_std)(void *)GetProcAddress(kb, "SetThreadDescription"); fn = f; }
+    }
+    if (f && name) f(GetCurrentThread(), name);
+}
 
 /* madeira-bcd: WHERE ExecuteCommandLists SPENDS ITS TIME. Ghost of Tsushima's
  * render thread spends 10-16 ms of a 40 ms frame inside our replay (14:04 log,
@@ -2230,8 +2243,8 @@ struct mad_cmd {
         D3D12_VIEWPORT vp;
         D3D12_RECT scissor;
         D3D12_PRIMITIVE_TOPOLOGY topo;
-        struct { struct mad_resource *res; UINT64 off; enum WMTIndexType type; } ib;
-        struct { UINT slot; struct mad_resource *res; UINT64 off; UINT stride; } vb;
+        struct { struct mad_resource *res; UINT64 off; UINT64 gpu_va; enum WMTIndexType type; } ib;   /* 0.1.723 x64-leaf Phase C: gpu_va resolved at replay when res == NULL */
+        struct { UINT slot; struct mad_resource *res; UINT64 off; UINT64 gpu_va; UINT stride; } vb;
         struct { struct mad_resource *rt[8]; UINT n; struct mad_resource *depth; struct mad_rtvp v[8], dv; } rts;   /* ml925: + sub-views */
         struct { struct mad_resource *res[MAD_BAR_MAX]; UINT8 cls[MAD_BAR_MAX]; UINT8 n, all, all_tex, cls_noref, vsread, spill; } barrier;
             /* 0.1.719: spill = a command mad_barrier_add pushed for the entries past MAD_BAR_MAX of the batch before it (16 x 8 + 16 + 6 = 150 bytes) */
@@ -11897,8 +11910,31 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_VP: e.vp = c->u.vp; e.has_vp = 1; break;
         case MC_SCISSOR: e.sc = c->u.scissor; e.has_sc = 1; break;
         case MC_TOPO: e.topo = c->u.topo; break;
-        case MC_IB: e.ib = c->u.ib.res; e.ib_off = c->u.ib.off; e.ib_type = c->u.ib.type; break;
-        case MC_VB: if (c->u.vb.slot < 16) { e.vb[c->u.vb.slot].res = c->u.vb.res; e.vb[c->u.vb.slot].off = c->u.vb.off; e.vb[c->u.vb.slot].stride = c->u.vb.stride; } break;
+        case MC_IB:
+            if (c->u.ib.res) { e.ib = c->u.ib.res; e.ib_off = c->u.ib.off; }
+            else if (c->u.ib.gpu_va) {
+                UINT64 off = 0;
+                e.ib = mad_resolve_address(e.q->device, c->u.ib.gpu_va, &off);
+                e.ib_off = off;
+                if (!e.ib) {
+                    static unsigned said;
+                    if (!said++) d3d12_log("[madeira-d3d12] index buffer address %llx matches no live resource\n",
+                                           (unsigned long long)c->u.ib.gpu_va);
+                }
+            } else { e.ib = NULL; e.ib_off = 0; }
+            e.ib_type = c->u.ib.type;
+            break;
+        case MC_VB:
+            if (c->u.vb.slot < 16) {
+                if (c->u.vb.res) { e.vb[c->u.vb.slot].res = c->u.vb.res; e.vb[c->u.vb.slot].off = c->u.vb.off; }
+                else if (c->u.vb.gpu_va) {
+                    UINT64 off = 0;
+                    e.vb[c->u.vb.slot].res = mad_resolve_address(e.q->device, c->u.vb.gpu_va, &off);
+                    e.vb[c->u.vb.slot].off = off;
+                } else { e.vb[c->u.vb.slot].res = NULL; e.vb[c->u.vb.slot].off = 0; }
+                e.vb[c->u.vb.slot].stride = c->u.vb.stride;
+            }
+            break;
         case MC_RTS:
             /* ml934d: D3D12 begins a new render pass at every OMSetRenderTargets.
              * For passes WITH attachments we reuse the encoder when the bindings
@@ -12939,6 +12975,7 @@ static int mad_vis_job_pending(struct mad_device *d, const obj_handle_t *cbs, un
  * quit it drains the ring first. */
 static DWORD WINAPI mad_retire_worker(void *arg) {
     struct mad_device *d = arg;
+    mad_name_thread(L"D3D12RetireWorker");   /* madeira-m5 0.1.723 */
     d->retire_tid = GetCurrentThreadId();   /* madeira-m5 0.1.716 P4e: mad_cb_retire attributes this thread's waits */
     for (;;) {   /* off the critical path: no eco-prio, the default priority */
         obj_handle_t cb = 0;
@@ -13011,6 +13048,7 @@ static int mad_retire_defer(struct mad_device *d, const obj_handle_t *cbs, unsig
  * advances the fence. Jobs are FIFO, so fence values stay ordered. */
 static DWORD WINAPI mad_fence_worker(void *arg) {
     struct mad_device *d = arg;
+    mad_name_thread(L"D3D12FenceWorker");   /* madeira-m5 0.1.723 */
     mad_eco_prio_self('F');   /* madeira-bcd eco-prio (opt-in) */
     d->fence_tid = GetCurrentThreadId();   /* madeira-m5 0.1.716 P4e: mad_cb_retire attributes this thread's inline waits */
     for (;;) {
@@ -13589,6 +13627,8 @@ static void mad_swd_stall(struct mad_queue *q, const char *what, unsigned slices
 static DWORD WINAPI mad_sub_worker(void *arg) {
     struct mad_queue *q = arg;
     mad_xp_role('W');   /* ml1128 */
+    mad_name_thread(q->type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? L"D3D12SubmitCompute"
+                    : q->type == D3D12_COMMAND_LIST_TYPE_COPY ? L"D3D12SubmitCopy" : L"D3D12SubmitDirect");   /* madeira-m5 0.1.723 */
     mad_eco_prio_self(0);   /* madeira-bcd eco-prio (opt-in) */
     for (;;) {
         struct mad_subjob *j;
@@ -17450,6 +17490,13 @@ _Static_assert(offsetof(struct mad_cmd, u.topo) == offsetof(struct mad_x64l_cmd,
 _Static_assert(offsetof(struct mad_cmd, u.dispatch.x) == offsetof(struct mad_x64l_cmd, u.dispatch.x) && offsetof(struct mad_cmd, u.dispatch.y) == offsetof(struct mad_x64l_cmd, u.dispatch.y) &&
                offsetof(struct mad_cmd, u.dispatch.z) == offsetof(struct mad_x64l_cmd, u.dispatch.z), "x64-leaf: mad_cmd.u.dispatch");
 _Static_assert(offsetof(struct mad_cmd, u.blend.rgba) == offsetof(struct mad_x64l_cmd, u.blend.rgba) && sizeof(((struct mad_cmd *)0)->u.blend.rgba) == 16, "x64-leaf: mad_cmd.u.blend");
+/* madeira-m5 0.1.723 Phase C */
+_Static_assert(MC_IB == MAD_X64L_MC_IB && MC_VB == MAD_X64L_MC_VB && WMTIndexTypeUInt16 == MAD_X64L_IB_U16 && WMTIndexTypeUInt32 == MAD_X64L_IB_U32 && sizeof(enum WMTIndexType) == 1, "x64-leaf: enum values (Phase C)");
+_Static_assert(offsetof(struct mad_cmd, u.ib.res) == offsetof(struct mad_x64l_cmd, u.ib.res) && offsetof(struct mad_cmd, u.ib.off) == offsetof(struct mad_x64l_cmd, u.ib.off) &&
+               offsetof(struct mad_cmd, u.ib.gpu_va) == offsetof(struct mad_x64l_cmd, u.ib.gpu_va) && offsetof(struct mad_cmd, u.ib.type) == offsetof(struct mad_x64l_cmd, u.ib.type), "x64-leaf: mad_cmd.u.ib");
+_Static_assert(offsetof(struct mad_cmd, u.vb.slot) == offsetof(struct mad_x64l_cmd, u.vb.slot) && offsetof(struct mad_cmd, u.vb.res) == offsetof(struct mad_x64l_cmd, u.vb.res) &&
+               offsetof(struct mad_cmd, u.vb.off) == offsetof(struct mad_x64l_cmd, u.vb.off) && offsetof(struct mad_cmd, u.vb.gpu_va) == offsetof(struct mad_x64l_cmd, u.vb.gpu_va) &&
+               offsetof(struct mad_cmd, u.vb.stride) == offsetof(struct mad_x64l_cmd, u.vb.stride), "x64-leaf: mad_cmd.u.vb");
 _Static_assert(MAD_ROOT_PARAM_MAX == MAD_X64L_ROOT_PARAM_MAX, "x64-leaf: MAD_ROOT_PARAM_MAX");
 _Static_assert(sizeof(struct mad_descriptor) == MAD_X64L_DESC_SIZE && offsetof(struct mad_descriptor, gpu_va) == 0 &&
                offsetof(struct mad_descriptor, texture_view_id) == 8 && offsetof(struct mad_descriptor, metadata) == 16, "x64-leaf: struct mad_descriptor");
@@ -24745,6 +24792,13 @@ void STDMETHODCALLTYPE mad_ecfb_list_OMSetBlendFactor(ID3D12GraphicsCommandList 
 void STDMETHODCALLTYPE mad_ecfb_list_Dispatch(ID3D12GraphicsCommandList *This, UINT x, UINT y, UINT z) {
     list_Dispatch(This, x, y, z);
 }
+/* madeira-m5 0.1.723 Phase C: deferred-VA index/vertex buffer setters */
+void STDMETHODCALLTYPE mad_ecfb_list_IASetIndexBuffer(ID3D12GraphicsCommandList *This, const D3D12_INDEX_BUFFER_VIEW *view) {
+    list_IASetIndexBuffer(This, view);
+}
+void STDMETHODCALLTYPE mad_ecfb_list_IASetVertexBuffers(ID3D12GraphicsCommandList *This, UINT start, UINT n, const D3D12_VERTEX_BUFFER_VIEW *views) {
+    list_IASetVertexBuffers(This, start, n, views);
+}
 static void mad_x64_leaf_init(void) {   /* once, at the end of build_vtables: the ARM64EC slots are what it replaces */
     long long want = mad_cfg_int_pe("x64-leaf", 0);   /* 1: twenty-one hot COM methods (GetGPUVirtualAddress, CopyDescriptorsSimple, CreateConstantBufferView, the root descriptor-table setters, the two draws, SetPipelineState, the descriptor-heap handle getters, resource and heap GetDesc, GetDescriptorHandleIncrementSize; 0.1.718: the two root signatures, viewports, scissors, topology, stencil reference, blend factor, Dispatch) run as x86-64 code inside the DLL, so the game's calls to them never leave the x86 JIT; 0 (default): the ARM64EC methods, as before. Not taken while a sync diagnostic, static-cbv or view-census is on */
     if (!want) { g_x64_leaf = 0; return; }
@@ -24778,10 +24832,13 @@ static void mad_x64_leaf_init(void) {   /* once, at the end of build_vtables: th
     MAD_X64L_INSTALL(g_list_vtbl.OMSetStencilRef, mad_x64l_list_OMSetStencilRef);
     MAD_X64L_INSTALL(g_list_vtbl.OMSetBlendFactor, mad_x64l_list_OMSetBlendFactor);
     MAD_X64L_INSTALL(g_list_vtbl.Dispatch, mad_x64l_list_Dispatch);
+    /* madeira-m5 0.1.723 Phase C: deferred-VA index/vertex buffer setters */
+    MAD_X64L_INSTALL(g_list_vtbl.IASetIndexBuffer, mad_x64l_list_IASetIndexBuffer);
+    MAD_X64L_INSTALL(g_list_vtbl.IASetVertexBuffers, mad_x64l_list_IASetVertexBuffers);
 #undef MAD_X64L_INSTALL
     g_x64_leaf = 1;
-    d3d12_log("[madeira-d3d12] x64-leaf = 1: 21 COM methods run as x86-64 code inside the DLL (section .x64leaf; GetGPUVirtualAddress at %p in the PE view; "
-              "0.1.718 Phase B: root signatures, viewports, scissors, topology, stencil ref, blend factor, Dispatch); "
+    d3d12_log("[madeira-d3d12] x64-leaf = 1: 23 COM methods run as x86-64 code inside the DLL (section .x64leaf; GetGPUVirtualAddress at %p in the PE view; "
+              "0.1.718 Phase B + 0.1.723 Phase C: IASetIndexBuffer, IASetVertexBuffers); "
               "every device and command list created from now on carries x64_flags\n", (void *)g_res_vtbl.GetGPUVirtualAddress);
 }
 

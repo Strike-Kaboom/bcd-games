@@ -37,6 +37,8 @@
 #define MAD_X64L_MC_VP             3    /* 0.1.718 Phase B */
 #define MAD_X64L_MC_SCISSOR        4
 #define MAD_X64L_MC_TOPO           5
+#define MAD_X64L_MC_IB             6    /* 0.1.723 Phase C */
+#define MAD_X64L_MC_VB             7
 #define MAD_X64L_MC_DRAW           11
 #define MAD_X64L_MC_DRAW_INDEXED   12
 #define MAD_X64L_MC_BLEND_FACTOR   17
@@ -45,6 +47,8 @@
 #define MAD_X64L_MC_STENCIL_REF    27
 #define MAD_X64L_MC_CROOTSIG       28
 #define MAD_X64L_MC_CROOT          29
+#define MAD_X64L_IB_U16            0    /* WMTIndexTypeUInt16 */
+#define MAD_X64L_IB_U32            1    /* WMTIndexTypeUInt32 */
 /* list_IASetPrimitiveTopology logs once from this value on (D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ): the leaf takes the slow path there */
 #define MAD_X64L_TOPO_FALLBACK     10
 #define MAD_X64L_ROOT_PARAM_MAX    64   /* MAD_ROOT_PARAM_MAX: a root parameter index at or past it takes the slow path */
@@ -91,6 +95,9 @@ struct mad_x64l_cmd {
         D3D12_PRIMITIVE_TOPOLOGY topo;
         struct { unsigned x, y, z; } dispatch;
         struct { float rgba[4]; } blend;
+        /* 0.1.723 Phase C */
+        struct { void *res; uint64_t off; uint64_t gpu_va; uint8_t type; } ib;
+        struct { unsigned slot; unsigned pad_; void *res; uint64_t off; uint64_t gpu_va; unsigned stride; } vb;
         unsigned char raw[MAD_X64L_CMD_SIZE - MAD_X64L_CMD_U_OFF];
     } u;
 };
@@ -145,6 +152,8 @@ MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.vp) == MAD_X64L_CMD_U_OFF && size
 MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.scissor) == MAD_X64L_CMD_U_OFF && sizeof(D3D12_RECT) == 16 && sizeof(D3D12_RECT) % 4 == 0);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.topo) == MAD_X64L_CMD_U_OFF && sizeof(D3D12_PRIMITIVE_TOPOLOGY) == 4);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.dispatch.z) == MAD_X64L_CMD_U_OFF + 8 && offsetof(struct mad_x64l_cmd, u.blend.rgba[3]) == MAD_X64L_CMD_U_OFF + 12);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.ib.gpu_va) == MAD_X64L_CMD_U_OFF + 16 && offsetof(struct mad_x64l_cmd, u.ib.type) == MAD_X64L_CMD_U_OFF + 24);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.vb.slot) == MAD_X64L_CMD_U_OFF && offsetof(struct mad_x64l_cmd, u.vb.gpu_va) == MAD_X64L_CMD_U_OFF + 24 && offsetof(struct mad_x64l_cmd, u.vb.stride) == MAD_X64L_CMD_U_OFF + 32);
 MAD_X64L_CHECK(sizeof(struct mad_x64l_desc) == MAD_X64L_DESC_SIZE);
 MAD_X64L_CHECK(sizeof(struct mad_x64l_rtv) == MAD_X64L_RTV_SIZE);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_device, x64_flags) == MAD_X64L_DEV_X64_FLAGS_OFF);
@@ -185,8 +194,11 @@ void STDMETHODCALLTYPE mad_x64l_list_IASetPrimitiveTopology(ID3D12GraphicsComman
 void STDMETHODCALLTYPE mad_x64l_list_OMSetStencilRef(ID3D12GraphicsCommandList *This, UINT ref);
 void STDMETHODCALLTYPE mad_x64l_list_OMSetBlendFactor(ID3D12GraphicsCommandList *This, const FLOAT f[4]);
 void STDMETHODCALLTYPE mad_x64l_list_Dispatch(ID3D12GraphicsCommandList *This, UINT x, UINT y, UINT z);
+/* 0.1.723 Phase C: deferred-VA index/vertex buffer setters */
+void STDMETHODCALLTYPE mad_x64l_list_IASetIndexBuffer(ID3D12GraphicsCommandList *This, const D3D12_INDEX_BUFFER_VIEW *view);
+void STDMETHODCALLTYPE mad_x64l_list_IASetVertexBuffers(ID3D12GraphicsCommandList *This, UINT start, UINT n, const D3D12_VERTEX_BUFFER_VIEW *views);
 
-/* ---- the fifteen ARM64EC fallbacks (madeira_d3d12.c) the leaves with a slow path jump to ----
+/* ---- the seventeen ARM64EC fallbacks (madeira_d3d12.c) the leaves with a slow path jump to ----
  * External linkage, so each has an entry thunk and the word before its body that FEX reads
  * ([target - 4]). The x64 side declares them itself, naming the "#" bodies. */
 #if defined(__arm64ec__)
@@ -207,6 +219,8 @@ void STDMETHODCALLTYPE mad_ecfb_list_IASetPrimitiveTopology(ID3D12GraphicsComman
 void STDMETHODCALLTYPE mad_ecfb_list_OMSetStencilRef(ID3D12GraphicsCommandList *This, UINT ref);
 void STDMETHODCALLTYPE mad_ecfb_list_OMSetBlendFactor(ID3D12GraphicsCommandList *This, const FLOAT f[4]);
 void STDMETHODCALLTYPE mad_ecfb_list_Dispatch(ID3D12GraphicsCommandList *This, UINT x, UINT y, UINT z);
+void STDMETHODCALLTYPE mad_ecfb_list_IASetIndexBuffer(ID3D12GraphicsCommandList *This, const D3D12_INDEX_BUFFER_VIEW *view);   /* 0.1.723 Phase C */
+void STDMETHODCALLTYPE mad_ecfb_list_IASetVertexBuffers(ID3D12GraphicsCommandList *This, UINT start, UINT n, const D3D12_VERTEX_BUFFER_VIEW *views);
 #endif
 
 #endif /* MADEIRA_X64_LEAF_H */

@@ -65,6 +65,11 @@ void STDMETHODCALLTYPE mad_ecfb_list_OMSetBlendFactor(ID3D12GraphicsCommandList 
     __asm__("#mad_ecfb_list_OMSetBlendFactor");
 void STDMETHODCALLTYPE mad_ecfb_list_Dispatch(ID3D12GraphicsCommandList *This, UINT x, UINT y, UINT z)
     __asm__("#mad_ecfb_list_Dispatch");
+/* 0.1.723 Phase C */
+void STDMETHODCALLTYPE mad_ecfb_list_IASetIndexBuffer(ID3D12GraphicsCommandList *This, const D3D12_INDEX_BUFFER_VIEW *view)
+    __asm__("#mad_ecfb_list_IASetIndexBuffer");
+void STDMETHODCALLTYPE mad_ecfb_list_IASetVertexBuffers(ID3D12GraphicsCommandList *This, UINT start, UINT n, const D3D12_VERTEX_BUFFER_VIEW *views)
+    __asm__("#mad_ecfb_list_IASetVertexBuffers");
 
 _Static_assert(sizeof(D3D12_RESOURCE_DESC) % 8 == 0, "D3D12_RESOURCE_DESC is copied in 8-byte words");
 _Static_assert(sizeof(D3D12_HEAP_DESC) % 8 == 0, "D3D12_HEAP_DESC is copied in 8-byte words");
@@ -244,4 +249,35 @@ MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_Dispatch(ID3D12GraphicsComman
     struct mad_x64l_cmd *c;
     if (!mad_x64l_push(l, MAD_X64L_MC_DISPATCH, &c)) { MAD_X64L_TAIL return mad_ecfb_list_Dispatch(This, x, y, z); }
     if (c) { c->u.dispatch.x = x; c->u.dispatch.y = y; c->u.dispatch.z = z; }
+}
+
+/* ---- 0.1.723 Phase C: deferred-VA index/vertex buffer setters (42.8k x64->EC calls/s in HFW).
+ * Store the GPU VA in the command and resolve it on the ARM64EC replay worker (as MC_ROOT already
+ * does), so record-time calls never leave FEX. ------------------------------------------------- */
+MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_IASetIndexBuffer(ID3D12GraphicsCommandList *This, const D3D12_INDEX_BUFFER_VIEW *view) {
+    struct mad_x64l_list *l = (struct mad_x64l_list *)This;
+    struct mad_x64l_cmd *c;
+    if (!mad_x64l_push(l, MAD_X64L_MC_IB, &c)) { MAD_X64L_TAIL return mad_ecfb_list_IASetIndexBuffer(This, view); }
+    if (c && view) {
+        c->u.ib.gpu_va = view->BufferLocation;
+        c->u.ib.type = view->Format == DXGI_FORMAT_R32_UINT ? MAD_X64L_IB_U32 : MAD_X64L_IB_U16;
+    }
+}
+MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_IASetVertexBuffers(ID3D12GraphicsCommandList *This, UINT start, UINT n,
+                                                                      const D3D12_VERTEX_BUFFER_VIEW *views) {
+    struct mad_x64l_list *l = (struct mad_x64l_list *)This;
+    UINT i;
+    if (!n) return;
+    if (!(l->x64_flags & MAD_X64L_OK) || n > 16 || l->ncmds > l->ccap || n > l->ccap - l->ncmds) { MAD_X64L_TAIL return mad_ecfb_list_IASetVertexBuffers(This, start, n, views); }
+    if (l->closed) return;
+    for (i = 0; i < n; i++) {
+        struct mad_x64l_cmd *c = &l->cmds[l->ncmds++];
+        mad_x64l_zero_cmd(c);
+        c->kind = MAD_X64L_MC_VB;
+        c->u.vb.slot = start + i;
+        if (views && views[i].BufferLocation) {
+            c->u.vb.gpu_va = views[i].BufferLocation;
+            c->u.vb.stride = views[i].StrideInBytes;
+        }
+    }
 }

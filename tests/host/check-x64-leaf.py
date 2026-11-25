@@ -35,7 +35,9 @@ FALLBACK = ['device_CopyDescriptorsSimple', 'device_CreateConstantBufferView',
             'list_DrawInstanced', 'list_DrawIndexedInstanced', 'list_SetPipelineState',
             # madeira-m5 0.1.718 Phase B: the trivial batch (one appended command, one field each; Round 4 report 5.1 rank 2)
             'list_SetGraphicsRootSignature', 'list_SetComputeRootSignature', 'list_RSSetViewports', 'list_RSSetScissorRects',
-            'list_IASetPrimitiveTopology', 'list_OMSetStencilRef', 'list_OMSetBlendFactor', 'list_Dispatch']
+            'list_IASetPrimitiveTopology', 'list_OMSetStencilRef', 'list_OMSetBlendFactor', 'list_Dispatch',
+            # madeira-m5 0.1.723 Phase C: deferred-VA index/vertex buffer setters
+            'list_IASetIndexBuffer', 'list_IASetVertexBuffers']
 LEAVES = PURE + FALLBACK
 SECTION = '.x64leaf'
 PAGE = 0x1000
@@ -105,7 +107,8 @@ def host_checks():
     constants = re.findall(r'^#define (MAD_X64L_\w+(?:_OFF|_SIZE|_MAX))\s', header, re.M)
     constants += ['MAD_X64L_MC_PSO', 'MAD_X64L_MC_ROOT', 'MAD_X64L_MC_DRAW', 'MAD_X64L_MC_DRAW_INDEXED', 'MAD_X64L_MC_CROOT',
                   'MAD_X64L_MC_VP', 'MAD_X64L_MC_SCISSOR', 'MAD_X64L_MC_TOPO', 'MAD_X64L_MC_BLEND_FACTOR', 'MAD_X64L_MC_DISPATCH',   # 0.1.718 Phase B
-                  'MAD_X64L_MC_ROOTSIG', 'MAD_X64L_MC_STENCIL_REF', 'MAD_X64L_MC_CROOTSIG', 'MAD_X64L_TOPO_FALLBACK']
+                  'MAD_X64L_MC_ROOTSIG', 'MAD_X64L_MC_STENCIL_REF', 'MAD_X64L_MC_CROOTSIG', 'MAD_X64L_TOPO_FALLBACK',
+                  'MAD_X64L_MC_IB', 'MAD_X64L_MC_VB', 'MAD_X64L_IB_U16', 'MAD_X64L_IB_U32']   # 0.1.723 Phase C
     assert len(constants) >= 20, constants
     header_asserts = re.findall(r'^MAD_X64L_CHECK\((.*)\);', header, re.M)
     native_asserts = [m for m in re.findall(r'_Static_assert\(((?:[^;])*?)"x64-leaf:', native, re.S)]
@@ -117,7 +120,8 @@ def host_checks():
     assert '_Static_assert(MC_PSO == MAD_X64L_MC_PSO && MC_ROOT == MAD_X64L_MC_ROOT' in native, 'enum values asserted'
     for c in ('MC_VP == MAD_X64L_MC_VP', 'MC_SCISSOR == MAD_X64L_MC_SCISSOR', 'MC_TOPO == MAD_X64L_MC_TOPO', 'MC_BLEND_FACTOR == MAD_X64L_MC_BLEND_FACTOR',
               'MC_DISPATCH == MAD_X64L_MC_DISPATCH', 'MC_ROOTSIG == MAD_X64L_MC_ROOTSIG', 'MC_STENCIL_REF == MAD_X64L_MC_STENCIL_REF',
-              'MC_CROOTSIG == MAD_X64L_MC_CROOTSIG', 'D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ == MAD_X64L_TOPO_FALLBACK'):   # 0.1.718 Phase B
+              'MC_CROOTSIG == MAD_X64L_MC_CROOTSIG', 'D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ == MAD_X64L_TOPO_FALLBACK',   # 0.1.718 Phase B
+              'MC_IB == MAD_X64L_MC_IB', 'MC_VB == MAD_X64L_MC_VB', 'WMTIndexTypeUInt16 == MAD_X64L_IB_U16', 'WMTIndexTypeUInt32 == MAD_X64L_IB_U32'):   # 0.1.723 Phase C
         assert c in native, f'{c}: asserted in madeira_d3d12.c'
 
     # 4. madeira_d3d12.c: external fallbacks that call the static methods; the install behind the switch
