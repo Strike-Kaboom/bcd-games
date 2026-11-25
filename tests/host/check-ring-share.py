@@ -85,6 +85,7 @@ static LONG InterlockedDecrement(volatile LONG *p) { return --*p; }
 #define MAD_ARG_RING_BYTES (64u * 1024u)
 ''' + slot_bytes + r'''
 enum { WMTResourceStorageModeShared = 0 };
+static unsigned mad_cpu_buf_opts(void) { return WMTResourceStorageModeShared; }
 struct WMTBufferInfo { UINT64 length; unsigned options; struct { void *ptr; } memory; UINT64 gpu_address; };
 static volatile LONG g_ring_chunks;
 static long g_cfg_ring_share;

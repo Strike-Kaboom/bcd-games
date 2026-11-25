@@ -98,14 +98,20 @@ check("replay loop: pending clears / discards noted before each command is repla
       "        switch (c->kind) {" in loop and "case MC_DISCARD: break;" in loop)
 check("replay loop: the list end may hand the open pass over before ending it",
       "    exec_rp_list_end(&e);   /* madeira-bcd rp-carry: may hand the open pass to the next list */\n"
-      "    if (e.renc) InterlockedIncrement(&g_pass_end_list);\n    exec_end(&e);\n"
-      "    if (e.npend) InterlockedExchangeAdd(&g_tr_listend_flush, (LONG)e.npend);   /* madeira-m5 0.1.718 [perf]: clears applied at the list end */\n"
-      "    while (e.npend) exec_flush_clear(&e, 0);" in loop)
+      "    if (e.renc) InterlockedIncrement(&g_pass_end_list);\n    exec_end(&e);\n" in loop
+      and "    if (e.npend) InterlockedExchangeAdd(&g_tr_listend_flush, (LONG)e.npend);   /* madeira-m5 0.1.718 [perf]: clears applied at the list end */\n"
+      "    e.cc_flush_end = 1;   /* 0.1.719: a carried clear applied here is counted at the call end */\n"
+      "    while (e.npend) exec_flush_clear(&e, 0);" in loop
+      and loop.index("exec_end(&e);\n") < loop.index("while (e.npend) exec_flush_clear(&e, 0);"))
+check("replay loop: clear-defer-carry hands pending clears to the next list only into a free carry slot, with the mode, before the list-end flush (0.1.719)",
+      "    if (e.npend && q->rp_next && q->rp_carry && !q->rp_carry->renc && !q->rp_carry->npend && mad_clear_carry_on() > 0) {" in loop
+      and "memcpy(k->pend, e.pend, e.npend * sizeof e.pend[0]); k->npend = e.npend; k->mode = e.mode;" in loop
+      and loop.index("mad_clear_carry_on() > 0) {") < loop.index("InterlockedExchangeAdd(&g_tr_listend_flush, (LONG)e.npend);"))
 run = func("static void mad_ecl_run(")
 check("mad_ecl_run: one carry slot per call, the next list per list, closed before a 48-list commit and at the end, "
       "under the submit lock",
       "memset(&rp_k, 0, sizeof rp_k); q->rp_carry = &rp_k; q->rp_next = NULL;" in run
-      and "if (rp_k.renc && l != rp_want) mad_rp_close(q);" in run
+      and "if ((rp_k.renc || rp_k.npend) && l != rp_want) mad_rp_close(q);" in run
       and "q->rp_next = mad_rp_next(q, count, lists, i); rp_want = q->rp_next;" in run
       and run.index("q->rp_next = mad_rp_next(q, count, lists, i);") < run.index("if (l) mad_exec_list(q, l, q->open_cb);")
       and run.index("mad_rp_close(q);      /* madeira-bcd rp-carry: nothing is carried into a full batch") < run.index("mad_queue_flush(q);   /* bound the batch */")
