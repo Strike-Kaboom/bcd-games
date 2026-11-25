@@ -15440,7 +15440,7 @@ static void mad_tvs_refresh(void) {
     unsigned i, m, from; UINT64 j, tfrom; LONG n = 0; int all, first, win;
     if (!g_tvs_n) return;
     if (g_tvs_hot_on < 0) {
-        g_tvs_hot_on = mad_cfg_int_pe("tvs-hot", 1) ? 1 : 0;   /* 0.1.721 (default 1; with typed-view-shadow): 1 = persistent typed views whose UPLOAD bytes change repeatedly across presents are promoted into the per-ExecuteCommandLists refresh window so they never go stale between sweeps; 0 = 0.1.720 fixed sweep */
+        g_tvs_hot_on = mad_cfg_int_pe("tvs-hot", 0) ? 1 : 0;   /* 0.1.721/0.1.722 (default 0, opt-in; with typed-view-shadow): 1 = persistent typed views whose UPLOAD bytes change repeatedly across presents are promoted into the per-ExecuteCommandLists refresh window so they never go stale between sweeps (can regress CPU on games with wrapping UPLOAD rings such as HFW); 0 = fixed sweep */
         if (g_tvs_hot_on) d3d12_log("[typed-view] madeira-m5 0.1.721 tvs-hot = 1: repeatedly rewritten persistent shadow views are promoted to every-ExecuteCommandLists refresh (max view %u KB)\n", MAD_TVS_MAX_VIEW >> 10);
     }
     t0 = (LONG64)mad_tick();   /* madeira-m5 0.1.718: mad_tick units (two QPC transitions per refresh before) */
@@ -16584,7 +16584,7 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
                     if ((desc->Texture3D.FirstWSlice || (desc->Texture3D.WSize && desc->Texture3D.WSize != ~0u))
                         && said++ < 16)
                         d3d12_log("[uav3d] %s %ux%ux%u: FirstWSlice=%u WSize=%u mip=%u <- DEPTH WINDOW IGNORED\n",
-                                  r->name ? r->name : "?", r->width, r->height, r->tex_layers,
+                                  r->name ? r->name : "?", r->width, r->height, r->tex_depth,
                                   desc->Texture3D.FirstWSlice, desc->Texture3D.WSize, lvl0);
                 }
                 break;
