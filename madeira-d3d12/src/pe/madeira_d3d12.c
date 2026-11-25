@@ -2247,8 +2247,10 @@ struct mad_cmd {
         struct { struct mad_resource *res; UINT64 off; UINT64 gpu_va; enum WMTIndexType type; } ib;   /* 0.1.723 x64-leaf Phase C: gpu_va resolved at replay when res == NULL */
         struct { UINT slot; struct mad_resource *res; UINT64 off; UINT64 gpu_va; UINT stride; } vb;
         struct { struct mad_resource *rt[8]; UINT n; struct mad_resource *depth; struct mad_rtvp v[8], dv; } rts;   /* ml925: + sub-views */
-        struct { struct mad_resource *res[MAD_BAR_MAX]; UINT8 cls[MAD_BAR_MAX]; UINT8 n, all, all_tex, cls_noref, vsread, spill; } barrier;
-            /* 0.1.719: spill = a command mad_barrier_add pushed for the entries past MAD_BAR_MAX of the batch before it (16 x 8 + 16 + 6 = 150 bytes) */
+        struct { struct mad_resource *res[MAD_BAR_MAX]; UINT8 cls[MAD_BAR_MAX]; UINT16 uav_mask; UINT8 n, all, all_tex, cls_noref, vsread, spill; } barrier;
+            /* 0.1.719: spill = a command mad_barrier_add pushed for the entries past MAD_BAR_MAX of the batch before it (16 x 8 + 16 + 2 + 6 = 152 bytes -> sizeof(mad_cmd) == 160)
+             * 0.1.727: uav_mask = bit k set when entry k (BC_ALL) could involve UAV access inside an open render pass (COMMON/UAV on either side or aliasing);
+             *          vsread bit 0 (0x1) = f7-frag=2 attachment->non-pixel read; bit 1 (0x2) = fence-chain=5 transition into any vertex/indirect-readable state */
             /* ml1116: transitioned resources; all = an unrecorded entry (NULL resource, overflow): the SYNC waits for everything; ml1137: state classes
              * (BC_*); madeira-m5: vsread = an attachment goes to a state read outside the fragment stage (f7-frag = 2); 0.1.718: all_tex = an
              * unrecorded entry may be a TEXTURE (NULL transition, NULL aliasing pair, an overflowed texture), the only case in which mad_cmd_names
@@ -3290,7 +3292,7 @@ static void f7_census_barrier(struct mad_exec *e, const struct mad_cmd *c) {
         if (c->u.barrier.cls_noref < 5) { InterlockedIncrement(&g_bc_ent[c->u.barrier.cls_noref]); if (g_f7_verify > 0) e->f7_verify_cls |= 1u << c->u.barrier.cls_noref; }
         f7_need(e, c->u.barrier.cls_noref, NULL);
     }
-    if (c->u.barrier.vsread) e->f7_vsread = 1;   /* madeira-m5 f7-frag = 2 */
+    if (c->u.barrier.vsread & 1) e->f7_vsread = 1;   /* madeira-m5 f7-frag = 2 */
     e->f7_reason |= 1;
     e->f7_rearmed = 0;   /* madeira-m5 0.1.718 (Round 4 report B2): a new barrier state; the census counts its first subset wait as new, not as a repeat */
 }
@@ -3322,7 +3324,7 @@ static void f7_presync_merge(struct mad_exec *e) {
         for (b = b0; b < end && (b == b0 || (b->kind == MC_BARRIER && b->u.barrier.spill)); b++) {
             for (k = 0; k < b->u.barrier.n && k < MAD_BAR_MAX; k++) f7_need(e, b->u.barrier.cls[k], b->u.barrier.res[k]);
             if (b->u.barrier.cls_noref != BC_NONE) f7_need(e, b->u.barrier.cls_noref, NULL);
-            if (b->u.barrier.vsread) vs = 1;
+            if (b->u.barrier.vsread & 1) vs = 1;
         }
         e->f7_presync_spec = 0;
         e->f8_mask = m8; e->f8_all = a8; e->f8_open = o8;   /* the census is not part of the merge */
@@ -4875,9 +4877,9 @@ static int mad_barrier_names_att(const struct mad_cmd *c, struct mad_resource *c
     }
     return 0;
 }
-/* madeira-m5 0.1.725 barrier-render = 2: for a synced render pass (fence-chain = 1 or synced f6/f7), every earlier
+/* madeira-m5 0.1.725/0.1.727 barrier-render = 2: for a synced render pass (fence-chain = 1 or synced f6/f7), every earlier
  * encoder already finished before the pass opened, so closing it at MC_BARRIER is only needed when the barrier hits
- * one of the pass's bound RTVs/DSV, a UAV/UAV-capable resource (0x4 = ALLOW_UNORDERED_ACCESS), or 'all'. */
+ * one of the pass's bound RTVs/DSV, a UAV barrier/UAV-state transition (uav_mask on ALLOW_UNORDERED_ACCESS), or 'all'. */
 static int mad_barrier_hits_renc(const struct mad_cmd *c, struct mad_resource *const *rt, UINT nrt, const struct mad_resource *depth) {
     unsigned k;
     if (mad_barrier_rar_only(c)) return 0;
@@ -4886,7 +4888,8 @@ static int mad_barrier_hits_renc(const struct mad_cmd *c, struct mad_resource *c
     for (k = 0; k < c->u.barrier.n && k < MAD_BAR_MAX; k++) {
         UINT8 cl = c->u.barrier.cls[k];
         if (cl == BC_RAW_UAV) return 3;
-        if (cl == BC_ALL && c->u.barrier.res[k] && (c->u.barrier.res[k]->desc.Flags & 0x4u)) return 4;
+        if (cl == BC_ALL && (c->u.barrier.uav_mask & (1u << k)) &&
+            c->u.barrier.res[k] && (c->u.barrier.res[k]->desc.Flags & 0x4u)) return 4;
     }
     return 0;
 }
@@ -12019,7 +12022,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                     /* madeira-m5 0.1.718 f7-none: a pass whose barriers since its start need nothing (an empty mask, nothing unrecorded,
                      * not the pass itself) stays open too, whether or not it ever subset-waited */
                     if (e.mode == 7 && g_barrier_render != 1 && !br_hit && !e.f6_enc_synced && (e.f7_waited_mask || (g_f7_opt_none > 0 && !e.f7_mask)) && !e.f7_all && !e.f7_open &&
-                        !(e.f7_mask & ~e.f7_waited_mask) && !(e.f7_waited_frag && g_f7_opt_frag == 2 && c->u.barrier.vsread)) {
+                        !(e.f7_mask & ~e.f7_waited_mask) && !(e.f7_waited_frag && g_f7_opt_frag == 2 && (c->u.barrier.vsread & 1))) {
                         InterlockedIncrement(&g_f7_kept_open);
                         break;
                     }
@@ -12030,6 +12033,8 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                 } else if (e.renc && g_barrier_render == 2) InterlockedIncrement(&g_barrier_renc_kept);
                 break;
             }
+            if (e.mode == 5 && ((c->u.barrier.vsread & 2) || c->u.barrier.all || c->u.barrier.all_tex))   /* madeira-m5 0.1.727: close vertex-reads-RT hazard for fence-chain = 5 */
+                InterlockedExchange(&e.q->device->f5_nonrender, 1);
             if ((e.mode == 1 || e.mode == 5) && g_barrier_render == 2) {   /* madeira-m5 0.1.725/0.1.726: fence-chain 1/5 always sync before every encoder; keep render pass open unless barrier hits its attachments, a UAV, or all; always close compute/blit on non-RAR barriers */
                 if (mad_barrier_rar_only(c)) { if (e.renc) InterlockedIncrement(&g_barrier_renc_kept); break; }
                 e.fence_needed = 1;
@@ -23524,13 +23529,14 @@ static void STDMETHODCALLTYPE list_Dispatch(ID3D12GraphicsCommandList *This, UIN
  * discard rules, the carry tests), so the two commands are the batch -- and the caller's pointer follows it, so the next ResourceBarrier
  * call folds into the last spill command. Only when the list cannot take a command (closed, no memory) does the batch wait for everything
  * (all), naming every texture if the entry that did not fit is one (all_tex), as 0.1.718 did for every entry past 16. */
-static void mad_barrier_add(struct mad_list *l, struct mad_cmd **pc, struct mad_resource *r, UINT8 cls) {
+static void mad_barrier_add(struct mad_list *l, struct mad_cmd **pc, struct mad_resource *r, UINT8 cls, int uav_haz) {
     struct mad_cmd *c = *pc;
     if (c->u.barrier.n == MAD_BAR_MAX) {
         struct mad_cmd *n = mad_list_push(l, MC_BARRIER);   /* the array may move: on success the old command is not touched again */
         if (n) { n->u.barrier.cls_noref = BC_NONE; n->u.barrier.spill = 1; *pc = c = n; InterlockedIncrement(&g_bar_spill_cmds); }
     }
     if (c->u.barrier.n < MAD_BAR_MAX) {
+        if (uav_haz) c->u.barrier.uav_mask |= (UINT16)(1u << c->u.barrier.n);
         c->u.barrier.cls[c->u.barrier.n] = cls; c->u.barrier.res[c->u.barrier.n++] = r;
         if (c->u.barrier.spill) InterlockedIncrement(&g_bar_spill_entries);
         return;
@@ -23556,33 +23562,44 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
     for (i = 0; i < n; i++) {   /* ml1116: fence-chain = 3 waits only for resources an encoder in flight wrote */
         struct mad_resource *r = NULL, *r2 = NULL;   /* madeira-m5 0.1.718: r2 = the second resource of an aliasing barrier */
         UINT8 cls = BC_ALL;
-        int vs = 0;   /* 0.1.719: vsread, set on the command that takes the entry (mad_barrier_add may push a spill command) */
+        int vs = 0, f5_vs = 0, uav_haz = 0;   /* 0.1.719: vsread; 0.1.727: f5_vsread & uav_mask */
         const UINT W = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_DEPTH_WRITE |
                        D3D12_RESOURCE_STATE_STREAM_OUT | D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        const UINT F5_VS = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
+                           D3D12_RESOURCE_STATE_INDEX_BUFFER | D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
         if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
             UINT bs = (UINT)b[i].Transition.StateBefore, as = (UINT)b[i].Transition.StateAfter;
             r = (struct mad_resource *)b[i].Transition.pResource;
             /* ml1137: COMMON on either side and any write after are "wait for everything" */
             if (b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) cls = BC_RAR;
-            else if (!as || (as & W) || !bs) cls = BC_ALL;
-            else if (!(bs & W)) cls = BC_RAR;
+            else if (!as || (as & W) || !bs) {
+                cls = BC_ALL;
+                if (!bs || !as || (bs & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) || (as & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) uav_haz = 1;
+                if (as & F5_VS) f5_vs = 1;
+            }
+            else if (!(bs & W)) {
+                cls = BC_RAR;
+                if (as & F5_VS) f5_vs = 1;
+            }
             else if (!(bs & ~(UINT)(D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE))) {
                 cls = BC_RAW_ATT;
                 /* madeira-m5 f7-frag = 2: the attachment becomes readable outside the fragment stage (a vertex or
                  * compute SRV, a copy or resolve source, indirect arguments...): its wait must stay at the vertex stage */
-                if (as & ~(UINT)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_READ)) vs = 1;
+                if (as & ~(UINT)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_READ)) { vs = 1; f5_vs = 1; }
             }
-            else if (bs == D3D12_RESOURCE_STATE_COPY_DEST) cls = BC_RAW_COPY;
-            else if (bs == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) cls = BC_RAW_UAV;
+            else if (bs == D3D12_RESOURCE_STATE_COPY_DEST) { cls = BC_RAW_COPY; if (as & F5_VS) f5_vs = 1; }
+            else if (bs == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) { cls = BC_RAW_UAV; uav_haz = 1; if (as & F5_VS) f5_vs = 1; }
+            else { uav_haz = 1; if (as & F5_VS) f5_vs = 1; }
         } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
             r = (struct mad_resource *)b[i].UAV.pResource;
-            cls = BC_RAW_UAV;   /* UAV accesses happen only in compute and render encoders */
+            cls = BC_RAW_UAV; uav_haz = 1;   /* UAV accesses happen only in compute and render encoders */
         } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
             /* madeira-m5 0.1.718 (Round 4 report 3.5): the two resources are recorded BY NAME as "wait for everything" entries
              * (the sync is unchanged: BC_ALL); only a NULL pair ("all aliases of this heap") still names every texture. Before,
              * every aliasing barrier applied every pending clear early and forgot every tracked discard. */
             r = (struct mad_resource *)b[i].Aliasing.pResourceBefore; r2 = (struct mad_resource *)b[i].Aliasing.pResourceAfter;
             if (!r) { r = r2; r2 = NULL; }
+            uav_haz = 1;
             InterlockedIncrement(&g_bar_all[r ? MAD_BAR_ALIAS_NAMED : MAD_BAR_ALIAS_NULL]);
         }
         if (!r) {
@@ -23592,9 +23609,10 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
             if (c->u.barrier.cls_noref == BC_NONE || cls > c->u.barrier.cls_noref) c->u.barrier.cls_noref = cls;
             continue;
         }
-        mad_barrier_add(l, &c, r, cls);
-        if (vs) c->u.barrier.vsread = 1;
-        if (r2) mad_barrier_add(l, &c, r2, cls);
+        mad_barrier_add(l, &c, r, cls, uav_haz);
+        if (vs) c->u.barrier.vsread |= 1;
+        if (f5_vs) c->u.barrier.vsread |= 2;
+        if (r2) mad_barrier_add(l, &c, r2, cls, uav_haz);
     }
 }
 /* madeira-bcd indirect-expand (2026-11-21; Teardown through BCD Dock, build 686, a tester's six sessions on an
