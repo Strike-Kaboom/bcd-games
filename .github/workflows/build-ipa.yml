@@ -3867,6 +3867,9 @@ jobs:
       - name: Patch winemetal to count the frames frame generation made apart
         run: python3 tools/patch-winemetal-frames-made.py
 
+      - name: Patch winemetal M5 turbo (FP16 tiled fg_flow + async present-fx)
+        run: python3 tools/patch-winemetal-m5-turbo.py
+
       # madeira-bcd: env.MADEIRA_X64_MACHINE = 1 (off by default): a 32-bit program that asks which machine is native
       # (IsWow64Process2, PROCESSOR_ARCHITEW6432) hears AMD64 instead of ARM64 (BeamNG.drive's launcher starts its
       # native ARM64 build, which cannot load, otherwise). Applied to kernelbase/process.c and ntdll/env.c ONLY for

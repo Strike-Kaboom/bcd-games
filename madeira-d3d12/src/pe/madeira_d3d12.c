@@ -2874,14 +2874,14 @@ static int mad_fence_mode(struct mad_device *d) { (void)mad_enc_fence(d); return
 static int g_res_untracked = -1;
 static int mad_res_untracked_on(struct mad_device *d) {
     if (g_res_untracked < 0) {
-        int want = mad_cfg_int_pe("res-untracked", 0) ? 1 : 0;   /* 0.1.728/0.1.731 (default 0; requires fence-chain = 1 or 5): 1 = standalone committed textures and buffers (except swapchain backbuffers) use MTLHazardTrackingModeUntracked so IOGPU skips per-CB hazard DAG construction; 0 = Metal default (tracked) */
+        int want = mad_cfg_int_pe("res-untracked", 0) ? 1 : 0;   /* 0.1.728/0.1.732 (default 0; requires fence-chain = 1, 5 or 7): 1 = standalone committed textures and buffers (except swapchain backbuffers) use MTLHazardTrackingModeUntracked so IOGPU skips per-CB hazard DAG construction; 0 = Metal default (tracked) */
         int fc = mad_fence_mode(d);
-        g_res_untracked = (want && (fc == 1 || fc == 5)) ? 1 : 0;
+        g_res_untracked = (want && (fc == 1 || fc == 5 || fc == 7)) ? 1 : 0;
         if (want)
             d3d12_log("[madeira-d3d12] 0.1.728 res-untracked = %d (requested %d, fence-chain = %d): %s\n",
                       g_res_untracked, want, fc, g_res_untracked
                       ? "standalone committed resources (except swapchain backbuffers) created with MTLHazardTrackingModeUntracked"
-                      : "NOT active (requires fence-chain = 1 or 5); resources stay tracked");
+                      : "NOT active (requires fence-chain = 1, 5 or 7); resources stay tracked");
     }
     return g_res_untracked;
 }
@@ -3012,7 +3012,7 @@ static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
      * end, keeps its sync and begins synced, as today (the unsynced-pass costs of section 2.4). */
     if (f7 && g_f7_opt_tracked > 0 && !cap && (att || bab) && !e->f6_sync_needed) {
         if (att && kind == F6_RENDER && enc == e->renc && f7_ts_lookahead_keeps(e)) e->xc[XC_F7_TS_LOOK]++;
-        else if (g_heap_untracked > 0) ts_tier = 1;
+        else if (g_heap_untracked > 0 || g_res_untracked > 0) ts_tier = 1;
         else { e->xc[att ? XC_F7_TS_ATT : XC_F7_TS_BAB]++; att = 0; bab = 0; }
     }
     other = cap || bab || att;
@@ -12708,7 +12708,14 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                 if (f6_rar_only(c)) { InterlockedIncrement(&g_f6_rar_passed); break; }   /* madeira-bcd f6-rar */
                 if (g_f6_blit_open < 0) g_f6_blit_open = mad_cfg_int_pe("f6-blit-open", 0) ? 1 : 0;   /* 0.1.719 (default 0; fence-chain 6 and 7): 1 = a blit encoder that waited for every pending encoder at its start stays open across a ResourceBarrier, as a synced compute encoder does (blit commands run in order within one encoder, and the next encoder still syncs); 0 = every barrier ends an open blit encoder */
                 e.f6_sync_needed = 1;
-                if (e.cenc && e.f6_enc_synced && mad_f6_compute_open_on()) InterlockedIncrement(&g_f6_kept_open);
+                if (e.cenc && e.f6_enc_synced && mad_f6_compute_open_on()) {
+                    int csbk = mad_cs_barrier_keep_on();
+                    if (csbk >= 2 && !g_fault_diag && !g_capture_on && !g_census_on && g_sd_state <= 0 && mad_barrier_hits_cenc(c)) {
+                        e.cenc_bar_scope |= 3ull;
+                        InterlockedIncrement(&g_cenc_bar_kept);
+                    }
+                    InterlockedIncrement(&g_f6_kept_open);
+                }
                 else if (e.benc && e.f6_enc_synced && g_f6_blit_open > 0) InterlockedIncrement(&g_f6_bkeep);   /* madeira-m5 0.1.719 f6-blit-open: the same rule for a fully synced blit encoder */
                 else if (e.cenc || e.benc) exec_end(&e);
                 if (e.renc && g_barrier_render >= 2) br_hit = mad_barrier_hits_renc(c, e.enc_rt, e.enc_nrt, e.enc_depth);
@@ -13026,10 +13033,11 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
         !q->device->ncap && !g_sk_n && !g_capture_on && g_sd_state <= 0 && !g_fence_strict && !g_gpu_sync) {
         UINT64 committed = (UINT64)InterlockedCompareExchange64(&q->device->gpu_serial_committed, 0, 0);
         UINT64 done = mad_gpu_completed(q->device);
-        /* madeira-m5 0.1.729: kick immediately when GPU is idle (depth == 0); when depth == 1..N-1,
-         * require >= 3 open lists so we keep substantial CBs pipelined without 1-list micro-CBs */
+        /* madeira-m5 0.1.729/0.1.732: kick immediately when GPU is idle (depth == 0); when depth == 1..N-1,
+         * require >= 3 open lists for N<=2, >= 2 for N==3, >= 1 for N>=4 so high eager-kick prevents dryouts */
+        UINT min_lists = g_cb_eager_kick >= 4 ? 1u : (g_cb_eager_kick == 3 ? 2u : 3u);
         int want_kick = (done >= committed) ||
-                        (done + (UINT64)(g_cb_eager_kick == 1 ? 1 : g_cb_eager_kick - 1) >= committed && q->open_lists >= 3);
+                        (done + (UINT64)(g_cb_eager_kick == 1 ? 1 : g_cb_eager_kick - 1) >= committed && q->open_lists >= min_lists);
         if (want_kick) {
             InterlockedIncrement(&g_cb_eager_kicks);
             mad_queue_flush_why(q, MAD_FLUSH_EAGER_KICK);

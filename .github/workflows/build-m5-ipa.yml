@@ -1454,6 +1454,9 @@ jobs:
       - name: Patch winemetal to count the frames frame generation made apart
         run: python3 tools/patch-winemetal-frames-made.py
 
+      - name: Patch winemetal M5 turbo (FP16 tiled fg_flow + async present-fx)
+        run: python3 tools/patch-winemetal-m5-turbo.py
+
       - name: Patch wine for the opt-in x64 machine answer (i386 farm only)
         run: |
           python3 tests/host/check-x64-machine.py
