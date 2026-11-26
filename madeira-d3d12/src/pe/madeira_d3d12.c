@@ -2874,14 +2874,14 @@ static int mad_fence_mode(struct mad_device *d) { (void)mad_enc_fence(d); return
 static int g_res_untracked = -1;
 static int mad_res_untracked_on(struct mad_device *d) {
     if (g_res_untracked < 0) {
-        int want = mad_cfg_int_pe("res-untracked", 0) ? 1 : 0;   /* 0.1.728 (default 0; requires fence-chain = 1): 1 = standalone committed textures and buffers (except swapchain backbuffers) use MTLHazardTrackingModeUntracked so IOGPU skips per-CB hazard DAG construction; 0 = Metal default (tracked) */
+        int want = mad_cfg_int_pe("res-untracked", 0) ? 1 : 0;   /* 0.1.728/0.1.731 (default 0; requires fence-chain = 1 or 5): 1 = standalone committed textures and buffers (except swapchain backbuffers) use MTLHazardTrackingModeUntracked so IOGPU skips per-CB hazard DAG construction; 0 = Metal default (tracked) */
         int fc = mad_fence_mode(d);
-        g_res_untracked = (want && fc == 1) ? 1 : 0;
+        g_res_untracked = (want && (fc == 1 || fc == 5)) ? 1 : 0;
         if (want)
             d3d12_log("[madeira-d3d12] 0.1.728 res-untracked = %d (requested %d, fence-chain = %d): %s\n",
                       g_res_untracked, want, fc, g_res_untracked
                       ? "standalone committed resources (except swapchain backbuffers) created with MTLHazardTrackingModeUntracked"
-                      : "NOT active (requires fence-chain = 1); resources stay tracked");
+                      : "NOT active (requires fence-chain = 1 or 5); resources stay tracked");
     }
     return g_res_untracked;
 }
