@@ -2545,6 +2545,7 @@ struct mad_queue {
      * with no barrier recorded, so with f7-list-start = 0 that first list still syncs at its start; only
      * lists after it in the SAME call skip the sync (Round 3 report, section 2 rank 1). */
     int ecl_first_list;
+    UINT64 ecl_boundary_mask;   /* madeira-m5 0.1.730: bit i set = list i starts a coalesced ExecuteCommandLists job */
     /* madeira-m5 0.1.717 f7-subset (under submit_lock): bit i set = some encoder of this command buffer
      * has already waited for f6_pend[i] in a subset wait since the pending set was last emptied; a full
      * sync skips those fences and waits for the rest. Cleared with f6_npend. */
@@ -5660,10 +5661,11 @@ static int mad_cs_barrier_keep_on(void) {
             struct madeira_ctl_args a;
             memset(&a, 0, sizeof a); a.op = 26;
             MadeiraCtl(&a);
-            g_cs_barrier_keep = (a.ret == 1) ? 1 : 0;
+            g_cs_barrier_keep = (a.ret == 1) ? 2 : 1;
             d3d12_log("[madeira-d3d12] 0.1.730 cs-barrier-keep = %d (%s)\n", g_cs_barrier_keep,
-                      g_cs_barrier_keep ? "compute encoders stay open across barriers with inline memoryBarrierWithScope (op 26)"
-                                        : "winemetal does not answer op 26; barriers still close compute encoders");
+                      g_cs_barrier_keep >= 2
+                          ? "full: compute encoders stay open across barriers with inline memoryBarrierWithScope (op 26)"
+                          : "PE-only: non-UAV RT/DS transitions keep compute encoders open (winemetal op 26 absent; UAV barriers still close)");
         } else {
             g_cs_barrier_keep = 0;
         }
@@ -12439,14 +12441,19 @@ static void exec_cs_list_end(struct mad_exec *e) {
     if (mad_cs_carry_on() <= 0 || !(e->mode == 1 || e->mode == 5)) return;
     if (e->nic || e->sk || g_capture_on || g_fault_diag || g_census_on || g_sd_state > 0) return;
     if (e->cenc) {
-        if (mad_cs_barrier_keep_on() <= 0) return;
+        int csbk = mad_cs_barrier_keep_on();
+        int cross_ecl = (q->rp_idx + 1 < 64) && ((q->ecl_boundary_mask & (1ull << (q->rp_idx + 1))) != 0);
+        if (csbk < 2 && cross_ecl) return;   /* merged ECL implicit-decay boundary requires op 26 memoryBarrier */
         for (j = 0; j < nx->ncmds; j++) {
             const struct mad_cmd *c = &nx->cmds[j];
             if (mad_cs_is_pure_state(c->kind)) continue;
-            if (c->kind == MC_BARRIER) continue;
+            if (c->kind == MC_BARRIER) {
+                if (csbk >= 2 || mad_barrier_rar_only(c) || (csbk >= 1 && !mad_barrier_hits_cenc(c))) continue;
+                return;
+            }
             if (c->kind == MC_DISPATCH) {
                 k->cenc = e->cenc; k->cenc_pso = e->cenc_pso; k->cenc_seq = e->cenc_seq;
-                k->cenc_bar_scope = e->cenc_bar_scope | 3ull;   /* safe even across merged ECL implicit-decay boundaries */
+                k->cenc_bar_scope = (csbk >= 2) ? (e->cenc_bar_scope | 3ull) : 0ull;   /* op 26 guards merged ECL implicit-decay boundaries */
                 k->cenc_dispatches = e->cenc_dispatches; k->cs_mode = e->mode;
                 e->cenc = 0; e->cenc_pso = NULL; e->cenc_seq = 0; e->cenc_bar_scope = 0; e->cenc_dispatches = 0;
                 InterlockedIncrement(&g_cs_carried);
@@ -12734,9 +12741,11 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                 }
                 e.fence_needed = 1;
                 if (e.cenc) {
-                    if (mad_cs_barrier_keep_on() > 0 && !g_fault_diag && !g_capture_on && !g_census_on && g_sd_state <= 0) {
+                    int csbk = mad_cs_barrier_keep_on();
+                    if (csbk > 0 && !g_fault_diag && !g_capture_on && !g_census_on && g_sd_state <= 0) {
                         if (!mad_barrier_hits_cenc(c)) InterlockedIncrement(&g_cenc_bar_skip);
-                        else { e.cenc_bar_scope |= 3ull; InterlockedIncrement(&g_cenc_bar_kept); }
+                        else if (csbk >= 2) { e.cenc_bar_scope |= 3ull; InterlockedIncrement(&g_cenc_bar_kept); }
+                        else exec_end(&e);
                     } else exec_end(&e);
                 } else if (e.benc) {
                     if (g_barrier_render == 3 && !mad_barrier_hits_benc(c, &e)) InterlockedIncrement(&g_benc_bar_kept);
@@ -13340,7 +13349,7 @@ static void mad_perf_present(void) {
                 d3d12_log("[perf] 0.1.730 m5-fast per frame: cb-unretained %d (%.1f CBs, %u uret live); cs-barrier-keep %d (kept %.1f, membar %.1f, non-uav-skip %.1f, rar %.1f); "
                           "cs-carry %d (cenc %.1f, benc %.1f); f5-vs-syncs %.1f\n",
                           g_cb_unretained > 0, InterlockedExchange(&g_cb_unretained_made, 0) / np, pd ? pd->nuret : 0u,
-                          g_cs_barrier_keep > 0, InterlockedExchange(&g_cenc_bar_kept, 0) / np, InterlockedExchange(&g_cenc_membar_emitted, 0) / np,
+                          g_cs_barrier_keep > 0 ? g_cs_barrier_keep : 0, InterlockedExchange(&g_cenc_bar_kept, 0) / np, InterlockedExchange(&g_cenc_membar_emitted, 0) / np,
                           InterlockedExchange(&g_cenc_bar_skip, 0) / np, InterlockedExchange(&g_cenc_bar_rar, 0) / np,
                           g_cs_carry > 0, InterlockedExchange(&g_cs_carried, 0) / np, InterlockedExchange(&g_blit_carried, 0) / np,
                           InterlockedExchange(&g_f5_vs_syncs, 0) / np);
@@ -14492,6 +14501,7 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
              * one has resolved (the FIFO), right before the replay. 0.1.728: COPY queues never bind shader views. */
             if (q->type != D3D12_COMMAND_LIST_TYPE_COPY) mad_tvs_refresh();
             if (!j->next) {
+                q->ecl_boundary_mask = 0;
                 mad_ecl_run((ID3D12CommandQueue *)q, j->count, (ID3D12CommandList *const *)j->lists);
                 for (i = 0; i < j->count; i++) {
                     InterlockedDecrement(&j->lists[i]->inflight);
@@ -14501,9 +14511,14 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
                 struct mad_list *merged[64];
                 struct mad_subjob *cur;
                 UINT m = 0;
-                for (cur = j; cur; cur = cur->next)
+                UINT64 bmask = 0;
+                for (cur = j; cur; cur = cur->next) {
+                    if (cur != j && m < 64) bmask |= (1ull << m);
                     for (i = 0; i < cur->count && m < 64; i++) merged[m++] = cur->lists[i];
+                }
+                q->ecl_boundary_mask = bmask;
                 mad_ecl_run((ID3D12CommandQueue *)q, m, (ID3D12CommandList *const *)merged);
+                q->ecl_boundary_mask = 0;
                 for (i = 0; i < m; i++) {
                     InterlockedDecrement(&merged[i]->inflight);
                     list_Release((ID3D12GraphicsCommandList *)merged[i]);
