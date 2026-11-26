@@ -529,6 +529,13 @@ struct mad_device {
     unsigned nuret, uret_cap;
     volatile LONG64 flush_all_gen;
     UINT64 flush_all_serial[16];
+    /* madeira-m5 0.1.733 mtlfxt-upscale: cached native Apple MTLFXTemporalScaler + optional Depth32F blit scratch */
+    CRITICAL_SECTION mtlfxt_lock;
+    obj_handle_t mtlfxt_scaler, mtlfxt_depth32, mtlfxt_dbuf;
+    UINT32 mtlfxt_in_w, mtlfxt_in_h, mtlfxt_out_w, mtlfxt_out_h;
+    UINT32 mtlfxt_cfmt, mtlfxt_ofmt, mtlfxt_dfmt, mtlfxt_mfmt;
+    UINT32 mtlfxt_auto_exp, mtlfxt_depth_copy, mtlfxt_d32_w, mtlfxt_d32_h;
+    UINT64 mtlfxt_dbuf_sz;
 };
 static LONG g_tview_live, g_tview_made, g_xview_live;   /* ml1126 */
 static LONG g_resolve_locked, g_resolve_miss;   /* ml1132: address lookups that took live_lock */
@@ -2260,6 +2267,7 @@ enum mad_ck {
     MC_CBV_LATCH,   /* madeira-bcd static-cbv: a table's constant-buffer descriptors as they were when a draw was recorded */
     MC_DISCARD,     /* madeira-bcd rp-discard: a DiscardResource (u.discard); the replay only notes it */
     MC_WBI,         /* madeira-bcd: one WriteBufferImmediate value (u.wbi), written by a 4-byte blit copy */
+    MC_MTLFX_TEMPORAL_SCALE, /* madeira-m5 0.1.733: native Apple MTLFXTemporalScaler dispatch (u.mtlfxt) */
 };
 /* madeira-m5 0.1.718 (Round 4 report 3.5): a ResourceBarrier batch records up to this many resources by name. It was 8; the 9th
  * resource of a folded batch, and every aliasing barrier, made the batch "names everything" (u.barrier.all), which applied pending
@@ -2306,6 +2314,12 @@ struct mad_cmd {
         struct { UINT bp, index, data, n; UINT64 va; } latch;   /* madeira-bcd static-cbv: bind point (0 graphics, 1 compute), parameter, descriptors in cdata */
         struct { struct mad_resource *res; UINT whole; } discard;   /* madeira-bcd rp-discard: whole = every subresource, no rectangles */
         struct { struct mad_resource *res; UINT64 off; UINT32 value; UINT32 mode; } wbi;   /* madeira-bcd: WriteBufferImmediate */
+        struct {
+            struct mad_resource *color, *depth, *motion, *exposure, *output;
+            UINT32 in_w, in_h, out_w, out_h, flags;
+            float jitter_x, jitter_y, mv_scale_x, mv_scale_y, pre_exposure;
+            UINT8 reset, depth_reversed, auto_exposure, depth_copy;
+        } mtlfxt;   /* madeira-m5 0.1.733: 84 B <= 152 B union (sizeof(struct mad_cmd) stays 160) */
     } u;
 };
 
@@ -8650,7 +8664,7 @@ static int mad_rs_bucket(enum mad_ck k) {
     switch (k) {
     case MC_DRAW: case MC_DRAW_INDEXED: return RS_DRAW;
     case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: case MC_DISPATCH_INDIRECT: return RS_INDIRECT;
-    case MC_DISPATCH: return RS_DISPATCH;
+    case MC_DISPATCH: case MC_MTLFX_TEMPORAL_SCALE: return RS_DISPATCH;
     case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_RESOLVE: case MC_WBI: return RS_COPY;
     case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_FILL_BB: case MC_FILL_TEX: return RS_CLEAR;
     case MC_BARRIER: return RS_BARRIER;
@@ -11946,6 +11960,130 @@ static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
     }
 }
 
+/* madeira-m5 0.1.733: native Apple MTLFXTemporalScaler bridge (replaces emulated DXIL FSR 2/3 compute chain). */
+static int g_mtlfxt_on = -1, g_mtlfxt_jit_sign = 0, g_mtlfxt_mv_sign = 0;
+static volatile LONG g_mtlfxt_dispatches;
+static obj_handle_t mad_res_tex2d(struct mad_device *d, struct mad_resource *r);
+static obj_handle_t mad_batch_cb(obj_handle_t mtl_queue);
+static int mad_mtlfxt_on(void) {
+    if (g_mtlfxt_on < 0) {
+        g_mtlfxt_on = mad_cfg_int_pe("mtlfxt-upscale", 1) ? 1 : 0;   /* 0.1.733 (default 1): allow FidelityFX proxy to route temporal upscaling to Apple MTLFXTemporalScaler; 0 = disabled */
+        g_mtlfxt_jit_sign = mad_cfg_int_pe("mtlfxt-jitter-sign", -1) >= 0 ? 1 : -1;   /* 0.1.733: sign multiplier for FSR -> MetalFX jitterOffsetX/Y (default -1) */
+        g_mtlfxt_mv_sign  = mad_cfg_int_pe("mtlfxt-mv-sign", 1) >= 0 ? 1 : -1;        /* 0.1.733: sign multiplier for FSR -> MetalFX motionVectorScaleX/Y (default +1) */
+        d3d12_log("[madeira-d3d12] 0.1.733 mtlfxt-upscale = %d (jitter-sign %+d, mv-sign %+d)\n",
+                  g_mtlfxt_on, g_mtlfxt_jit_sign, g_mtlfxt_mv_sign);
+    }
+    return g_mtlfxt_on;
+}
+static void exec_mtlfxt(struct mad_exec *e, const struct mad_cmd *c) {
+    struct mad_device *dev = e->q->device;
+    struct mad_resource *rc = c->u.mtlfxt.color, *rd = c->u.mtlfxt.depth, *rm = c->u.mtlfxt.motion;
+    struct mad_resource *re = c->u.mtlfxt.exposure, *ro = c->u.mtlfxt.output;
+    obj_handle_t tc, td, tm, te, to, scaler = 0;
+    struct WMTFXTemporalScalerProps props;
+    static LONG said_run;
+    if (!rc || !rd || !rm || !ro || !rc->texture || !rd->texture || !rm->texture || !ro->texture) { MAD_SKIP(e); return; }
+    tc = mad_res_tex2d(dev, rc);
+    tm = mad_res_tex2d(dev, rm);
+    to = mad_res_tex2d(dev, ro);
+    te = (re && re->texture) ? mad_res_tex2d(dev, re) : 0;
+    td = c->u.mtlfxt.depth_copy ? 0 : mad_res_tex2d(dev, rd);
+    if (!tc || !tm || !to || (!c->u.mtlfxt.depth_copy && !td)) { MAD_SKIP(e); return; }
+
+    exec_end(e);
+    if (e->npend) exec_flush_clears_batch(e, (1u << e->npend) - 1u);
+
+    if (c->u.mtlfxt.depth_copy) {
+        UINT w = rd->width, h = rd->height;
+        UINT64 row = (UINT64)w * 4u, img = row * h;
+        obj_handle_t d32 = 0, dbuf = 0;
+        EnterCriticalSection(&dev->mtlfxt_lock);
+        if (dev->mtlfxt_depth32 && dev->mtlfxt_d32_w == w && dev->mtlfxt_d32_h == h && dev->mtlfxt_dbuf && dev->mtlfxt_dbuf_sz >= img) {
+            d32 = dev->mtlfxt_depth32; dbuf = dev->mtlfxt_dbuf;
+        }
+        LeaveCriticalSection(&dev->mtlfxt_lock);
+        if (!d32 || !dbuf) { MAD_SKIP(e); return; }
+        if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
+        {
+            struct wmtcmd_blit_copy_from_texture_to_buffer k1;
+            memset(&k1, 0, sizeof k1);
+            k1.type = WMTBlitCommandCopyFromTextureToBuffer;
+            k1.src = rd->texture; k1.slice = 0; k1.level = 0;
+            k1.size.width = w; k1.size.height = h; k1.size.depth = 1;
+            k1.dst = dbuf; k1.offset = 0; k1.bytes_per_row = (UINT32)row; k1.bytes_per_image = (UINT32)img;
+            k1.options = mad_aspect_opt(rd, 0);
+            MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k1);
+        }
+        exec_end(e);
+        if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
+        {
+            struct wmtcmd_blit_copy_from_buffer_to_texture k2;
+            memset(&k2, 0, sizeof k2);
+            k2.type = WMTBlitCommandCopyFromBufferToTexture;
+            k2.src = dbuf; k2.src_offset = 0; k2.bytes_per_row = (UINT32)row; k2.bytes_per_image = (UINT32)img;
+            k2.size.width = w; k2.size.height = h; k2.size.depth = 1;
+            k2.dst = d32; k2.slice = 0; k2.level = 0;
+            MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k2);
+        }
+        exec_end(e);
+        td = d32;
+    }
+
+    EnterCriticalSection(&dev->mtlfxt_lock);
+    scaler = dev->mtlfxt_scaler;
+    if (scaler) NSObject_retain(scaler);
+    LeaveCriticalSection(&dev->mtlfxt_lock);
+    if (!scaler) { MAD_SKIP(e); return; }
+
+    /* madeira-m5 0.1.734: flush prior work BEFORE MTLFXTemporalScaler so Metal guarantees full
+     * completion/visibility of untracked color/depth/motion textures, then run encodeTemporalScale
+     * in its own command buffer with fence = 0 (matching DXMT; never risks waiting on an un-updated
+     * MTLFence), then commit immediately so subsequent post-FX/UI encoders see the upscaled output. */
+    mad_queue_flush_why(e->q, MAD_FLUSH_OTHER);
+    if (dev->resset && InterlockedExchange(&dev->resset_dirty, 0)) MTLResidencySet_commit(dev->resset);
+    e->q->open_cb = mad_batch_cb(dev->mtl_queue);
+    if (!e->q->open_cb) {
+        if (g_cb_unretained > 0) mad_uret_push(dev, scaler, 0, NULL, 0);
+        else NSObject_release(scaler);
+        e->cb = 0; MAD_SKIP(e); return;
+    }
+    NSObject_retain(e->q->open_cb);
+    e->cb = e->q->open_cb;
+
+    memset(&props, 0, sizeof props);
+    props.input_content_width = c->u.mtlfxt.in_w;
+    props.input_content_height = c->u.mtlfxt.in_h;
+    props.reset = c->u.mtlfxt.reset != 0;
+    props.depth_reversed = c->u.mtlfxt.depth_reversed != 0;
+    props.motion_vector_scale_x = c->u.mtlfxt.mv_scale_x * (float)g_mtlfxt_mv_sign;
+    props.motion_vector_scale_y = c->u.mtlfxt.mv_scale_y * (float)g_mtlfxt_mv_sign;
+    props.jitter_offset_x = c->u.mtlfxt.jitter_x * (float)g_mtlfxt_jit_sign;
+    props.jitter_offset_y = c->u.mtlfxt.jitter_y * (float)g_mtlfxt_jit_sign;
+    props.pre_exposure = c->u.mtlfxt.pre_exposure > 0.0f ? c->u.mtlfxt.pre_exposure : 1.0f;
+
+    MTLCommandBuffer_encodeTemporalScale(e->cb, scaler, tc, to, td, tm, te, 0, &props);
+    if (g_cb_unretained > 0) mad_uret_push(dev, scaler, 0, NULL, 0);
+    else NSObject_release(scaler);
+
+    InterlockedExchange(&dev->f5_nonrender, 1);
+    mad_queue_flush_why(e->q, MAD_FLUSH_OTHER);
+    if (dev->resset && InterlockedExchange(&dev->resset_dirty, 0)) MTLResidencySet_commit(dev->resset);
+    e->q->open_cb = mad_batch_cb(dev->mtl_queue);
+    if (e->q->open_cb) NSObject_retain(e->q->open_cb);
+    e->cb = e->q->open_cb;
+    if (e->l) e->l->ring_batch = e->q->batches + 1;   /* 0.1.734: keep post-upscale ring allocations alive until the new CB retires */
+    e->wr_all = 1;
+    e->fence_needed = 1;
+    e->f6_sync_needed = 1;
+
+    InterlockedIncrement(&g_mtlfxt_dispatches);
+    if (InterlockedIncrement(&said_run) <= 4)
+        d3d12_log("[mtlfxt] 0.1.734 encoded Apple MTLFXTemporalScaler #%ld: %ux%u -> %ux%u (pf c=%u d=%u m=%u o=%u, revZ=%u, autoExp=%u, dcopy=%u)\n",
+                  (long)said_run, c->u.mtlfxt.in_w, c->u.mtlfxt.in_h, c->u.mtlfxt.out_w, c->u.mtlfxt.out_h,
+                  (unsigned)rc->tex_pf, (unsigned)rd->tex_pf, (unsigned)rm->tex_pf, (unsigned)ro->tex_pf,
+                  (unsigned)c->u.mtlfxt.depth_reversed, (unsigned)c->u.mtlfxt.auto_exposure, (unsigned)c->u.mtlfxt.depth_copy);
+}
+
 static volatile LONG g_cs_concurrent = -1;   /* madeira-duo cs-concurrent, see exec_dispatch */
 static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     struct mad_wmtcmd_compute_mem_barrier c_bar;
@@ -12819,6 +12957,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_BLEND_FACTOR: memcpy(e.blend, c->u.blend.rgba, sizeof e.blend); e.has_blend = 1; break;
         case MC_DISPATCH: exec_dispatch(&e, c); if (g_vt_on > 0) { InterlockedIncrement(&g_vt_disp); InterlockedIncrement(&g_vt_disp_q[q->type & 3]); } break;   /* madeira-bcd vis-trace */
         case MC_RESOLVE: exec_resolve(&e, c); break;
+        case MC_MTLFX_TEMPORAL_SCALE: exec_mtlfxt(&e, c); break;
         case MC_DISCARD: break;   /* madeira-bcd rp-discard: exec_rp_note above */
         }
         if (g_ffx_exp > 0 && c->kind == MC_DISPATCH) { mad_ffx_after(&e, c); if (g_f7_opt_writes > 0) e.f8_wr_all = 1; }   /* madeira-bcd cs-split, fi-field-check; 0.1.718: their own encoders write game textures too */
@@ -13361,6 +13500,10 @@ static void mad_perf_present(void) {
                           InterlockedExchange(&g_cenc_bar_skip, 0) / np, InterlockedExchange(&g_cenc_bar_rar, 0) / np,
                           g_cs_carry > 0, InterlockedExchange(&g_cs_carried, 0) / np, InterlockedExchange(&g_blit_carried, 0) / np,
                           InterlockedExchange(&g_f5_vs_syncs, 0) / np);
+            }
+            if (g_perf_presents) {
+                LONG mfx = InterlockedExchange(&g_mtlfxt_dispatches, 0);
+                if (mfx) d3d12_log("[perf] 0.1.733 mtlfxt per frame: %.2f native Apple MTLFXTemporalScaler dispatches\n", (double)mfx / g_perf_presents);
             }
             lw = cw; lu = cu; lb = cb;
             if (g_f6_used && g_perf_presents) {   /* ml1134 */
@@ -15259,6 +15402,10 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
         free(d->fence_jobs); free(d->retire_q); free(d->ring_pool); free(d->ring_retired);   /* 0.1.716 P5: the retire ring, drained by its thread above */
         /* These were retained on creation and were previously leaked. */
         if (d->dsso) NSObject_release(d->dsso);
+        if (d->mtlfxt_scaler) NSObject_release(d->mtlfxt_scaler);
+        if (d->mtlfxt_depth32) NSObject_release(d->mtlfxt_depth32);
+        if (d->mtlfxt_dbuf) NSObject_release(d->mtlfxt_dbuf);
+        DeleteCriticalSection(&d->mtlfxt_lock);
         if (d->mtl_queue) NSObject_release(d->mtl_queue);
         if (d->mtl_device) NSObject_release(d->mtl_device);
         free(d->smp_cache);   /* sampler-cache: the table only (the samplers stay, as before); NULL with sampler-cache = 0 */
@@ -16907,6 +17054,39 @@ static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, 
         d3d12_log("[madeira-d3d12] texture view: type %u -> %u, fmt %u -> %u, swz %08x, levels %u+%u, slices %u+%u of %ux%u x%u (%s)\n",
                   (unsigned)r->tex_type, (unsigned)want, (unsigned)r->tex_pf, (unsigned)pf, swz, lvl0, nlvl, sl0, nsl, r->width, r->height, r->tex_layers, r->name);
     return id;
+}
+
+/* madeira-m5 0.1.733: zero-copy cached MTLTextureType2D view (mip 0, slice 0) for Apple MTLFXTemporalScaler,
+ * since madeira-d3d12 allocates every 2D D3D12 texture as MTLTextureType2DArray. */
+static obj_handle_t mad_res_tex2d(struct mad_device *d, struct mad_resource *r) {
+    unsigned k; obj_handle_t tex = 0; UINT64 id = 0;
+    struct WMTTextureSwizzleChannels sw;
+    if (!d || !r || !r->texture) return 0;
+    if (r->tex_type == WMTTextureType2D && r->tex_mips == 1 && r->tex_layers == 1) return r->texture;
+    EnterCriticalSection(&d->view_lock);
+    for (k = 0; k < r->nxview; k++) {
+        if (r->xview[k].type == (UINT)WMTTextureType2D && r->xview[k].lvl0 == 0 && r->xview[k].nlvl == 1 &&
+            r->xview[k].sl0 == 0 && r->xview[k].nsl == 1 && r->xview[k].pf == (UINT)r->tex_pf && r->xview[k].swz == MAD_SWZ_IDENTITY) {
+            tex = r->xview[k].tex;
+            LeaveCriticalSection(&d->view_lock);
+            return tex;
+        }
+    }
+    sw.r = WMTTextureSwizzleRed; sw.g = WMTTextureSwizzleGreen; sw.b = WMTTextureSwizzleBlue; sw.a = WMTTextureSwizzleAlpha;
+    tex = MTLTexture_newTextureView(r->texture, r->tex_pf, WMTTextureType2D, 0, 1, 0, 1, sw, &id);
+    if (!tex) { LeaveCriticalSection(&d->view_lock); return 0; }
+    if (!mad_view_grow(r, (void **)&r->xview, &r->xview_cap, r->nxview + 1, sizeof *r->xview)) {
+        NSObject_release(tex); LeaveCriticalSection(&d->view_lock); return 0;
+    }
+    mad_resident(d, tex);
+    InterlockedIncrement(&g_xview_live);
+    k = r->nxview;
+    r->xview[k].type = (UINT)WMTTextureType2D; r->xview[k].lvl0 = 0; r->xview[k].nlvl = 1;
+    r->xview[k].sl0 = 0; r->xview[k].nsl = 1; r->xview[k].pf = (UINT)r->tex_pf; r->xview[k].swz = MAD_SWZ_IDENTITY;
+    r->xview[k].tex = tex; r->xview[k].id = id;
+    r->nxview = k + 1;
+    LeaveCriticalSection(&d->view_lock);
+    return tex;
 }
 
 /* Texture UAV clears. A texture UAV descriptor holds only the Metal view's
@@ -18638,6 +18818,14 @@ static int mad_texinfo_from_desc(struct mad_device *d, const D3D12_RESOURCE_DESC
         ti->usage = (enum WMTTextureUsage)(ti->usage | WMTTextureUsageRenderTarget);
     if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
         ti->usage = (enum WMTTextureUsage)(ti->usage | WMTTextureUsageShaderWrite);
+        /* madeira-m5 0.1.733 mtlfxt-upscale: MTLFXTemporalScaler requires RenderTarget usage on its output texture;
+         * color-renderable 2D UAV targets (like FSR output buffers) gain RenderTarget at zero cost on Apple TBDR. */
+        if (mad_mtlfxt_on() && desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && !*is_depth && ti->sample_count == 1 &&
+            (ti->pixel_format == WMTPixelFormatRGBA16Float || ti->pixel_format == WMTPixelFormatRG11B10Float ||
+             ti->pixel_format == WMTPixelFormatRGBA8Unorm || ti->pixel_format == WMTPixelFormatRGBA8Unorm_sRGB ||
+             ti->pixel_format == WMTPixelFormatBGRA8Unorm || ti->pixel_format == WMTPixelFormatBGRA8Unorm_sRGB ||
+             ti->pixel_format == WMTPixelFormatRGB10A2Unorm || ti->pixel_format == WMTPixelFormatRGBA32Float))
+            ti->usage = (enum WMTTextureUsage)(ti->usage | WMTTextureUsageRenderTarget);
         /* ml1149: texture atomics (InterlockedMax on R32 UAVs, 64-bit max on
          * RG32Uint visibility buffers) are defined only with ShaderAtomic usage,
          * which Metal allows on exactly these three formats (with PixelFormatView).
@@ -19246,8 +19434,8 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
         } }
         free(p->var);   /* madeira-m5 0.1.718: the growable variant cache */
         if (p->has_vd) DeleteCriticalSection(&p->var_lock);
-        if (p->vs_fn) NSObject_release(p->vs_fn);
-        if (p->ps_fn) NSObject_release(p->ps_fn);
+        if (p->vs_fn && p->vs_fn != (obj_handle_t)1) NSObject_release(p->vs_fn);
+        if (p->ps_fn && p->ps_fn != (obj_handle_t)1) NSObject_release(p->ps_fn);
         if (p->vs_lib) NSObject_release(p->vs_lib);
         if (p->ps_lib) NSObject_release(p->ps_lib);
         if (p->si_lib) NSObject_release(p->si_lib);   /* ml927 */
@@ -20688,6 +20876,9 @@ struct mad_convert_opts {
      * library is not entered in the shared-library table, so the pipeline can
      * drop it (mad_lzlib_drop). */
     struct mad_lzkey { UINT64 key[2]; int ok; } *lz;
+    /* madeira-m5 0.1.733 pso-lazy-libs = 2: metadata-only mode for lazy pipelines (skip MTLDevice_newLibrary/newFunction
+     * during startup creation and serve repeat stage keys from an in-memory metadata table). */
+    int lz_skip_mtl;
     /* madeira-m5 0.1.719 pso-drawn-set: set, the conversion's shader-cache key (16 bytes) comes back here and nothing else changes
      * (unlike lz, the library still enters the shared-library table); zeros when the shader cache is off */
     UINT64 *sckey_out;
@@ -21851,12 +22042,113 @@ static int mad_pso_drawn_on(void) {
  * first draw is skipped and counted, like any lazy pipeline Metal refuses. */
 static int mad_lzlib_on(void) {
     if (g_lzlib < 0) {
-        g_lzlib = mad_cfg_int_pe("pso-lazy-libs", 0) ? 1 : 0;   /* bcd.cfg pso-lazy-libs = 1 */
+        long long v = mad_cfg_int_pe("pso-lazy-libs", 0);   /* bcd.cfg pso-lazy-libs: 0 = off; 1 = drop libraries after creation; 2 (0.1.733) = skip Metal library creation at startup + in-memory metadata cache for lazy pipelines */
+        g_lzlib = v <= 0 ? 0 : v >= 2 ? 2 : 1;
         if (g_lzlib)
-            d3d12_log("[madeira-d3d12] pso-lazy-libs = 1: a lazy pipeline's shader libraries are let go once it is created "
-                      "and read back from the shader cache at its first draw\n");
+            d3d12_log("[madeira-d3d12] pso-lazy-libs = %d: %s\n", g_lzlib,
+                      g_lzlib >= 2 ? "lazy pipelines skip Metal library creation at startup and use in-memory shader-cache metadata (0.1.733)"
+                                   : "a lazy pipeline's shader libraries are let go once it is created and read back from the shader cache at its first draw");
     }
     return g_lzlib;
+}
+/* madeira-m5 0.1.733 pso-lazy-libs = 2: compact in-memory metadata cache keyed by the 128-bit shader-cache key.
+ * Avoids ~65,000 repeat flash disk reads + ~75,000 MTLDevice_newLibrary calls during HFW startup PSO creation. */
+#define MAD_SCMETA_CAP 16384u
+struct mad_scmeta_ent {
+    UINT64 k0, k1;
+    char entry[MADEIRA_IR_ENTRY_MAX];
+    UINT32 backend, tg[3], cb_bind, arg_bind, arg_qwords, slot_mask;
+    UINT16 nvsin, nloc, nair, pad;
+    struct madeira_ir_vs_input *vsin;
+    struct madeira_ir_loc *locs;
+    struct madeira_ir_air_range *air;
+};
+static struct mad_scmeta_ent *g_scmeta;
+static SRWLOCK g_scmeta_lock = SRWLOCK_INIT;
+static volatile LONG g_scmeta_hits, g_scmeta_stores, g_lzlib_mtls_skipped;
+static int mad_scmeta_find(const UINT64 key[2], char *name_out, size_t name_cap,
+                           struct madeira_ir_vs_input *vsin, unsigned vsin_cap, unsigned *vsin_n,
+                           UINT *tg_out, struct madeira_ir_loc *locs, unsigned *nlocs,
+                           struct mad_air_out *air) {
+    unsigned h, i;
+    int hit = 0;
+    if (!key[0] && !key[1]) return 0;
+    AcquireSRWLockShared(&g_scmeta_lock);
+    if (g_scmeta) {
+        h = (unsigned)(key[0] & (MAD_SCMETA_CAP - 1));
+        for (i = 0; i < 16; i++) {
+            const struct mad_scmeta_ent *e = &g_scmeta[(h + i) & (MAD_SCMETA_CAP - 1)];
+            if (!e->k0 && !e->k1) break;
+            if (e->k0 == key[0] && e->k1 == key[1]) {
+                if (name_out && name_cap) snprintf(name_out, name_cap, "%s", e->entry);
+                if (vsin_n) *vsin_n = e->nvsin < vsin_cap ? e->nvsin : vsin_cap;
+                if (vsin && e->vsin && e->nvsin) memcpy(vsin, e->vsin, (e->nvsin < vsin_cap ? e->nvsin : vsin_cap) * sizeof(*vsin));
+                if (nlocs) *nlocs = e->nloc < MAD_LOC_MAX ? e->nloc : MAD_LOC_MAX;
+                if (locs && e->locs && e->nloc) memcpy(locs, e->locs, (e->nloc < MAD_LOC_MAX ? e->nloc : MAD_LOC_MAX) * sizeof(*locs));
+                if (tg_out) { tg_out[0] = e->tg[0]; tg_out[1] = e->tg[1]; tg_out[2] = e->tg[2]; }
+                if (air) {
+                    air->backend = e->backend; air->cb_bind = e->cb_bind; air->arg_bind = e->arg_bind;
+                    air->arg_qwords = e->arg_qwords; air->slot_mask = e->slot_mask;
+                    air->nranges = e->nair < MADEIRA_IR_AIR_RANGE_MAX ? e->nair : MADEIRA_IR_AIR_RANGE_MAX;
+                    if (e->air && air->nranges) memcpy(air->ranges, e->air, air->nranges * sizeof(*e->air));
+                }
+                hit = 1;
+                break;
+            }
+        }
+    }
+    ReleaseSRWLockShared(&g_scmeta_lock);
+    if (hit) {
+        LONG n = InterlockedIncrement(&g_scmeta_hits);
+        if (n == 1 || !(n % 10000))
+            d3d12_log("[madeira-d3d12] 0.1.733 pso-lazy-libs=2 meta-cache: %ld RAM hits (%ld stored, %ld Metal libraries skipped)\n",
+                      (long)n, (long)g_scmeta_stores, (long)g_lzlib_mtls_skipped);
+    }
+    return hit;
+}
+static void mad_scmeta_put(const UINT64 key[2], const char *entry, const struct madeira_ir_convert_args *a,
+                           const struct madeira_ir_vs_input *vsin, unsigned nvsin,
+                           const struct madeira_ir_loc *locs, unsigned nloc,
+                           const struct mad_air_out *air) {
+    unsigned h, i;
+    if (!key[0] && !key[1]) return;
+    if (nvsin > 32) nvsin = 32;
+    if (nloc > MAD_LOC_MAX) nloc = MAD_LOC_MAX;
+    AcquireSRWLockExclusive(&g_scmeta_lock);
+    if (!g_scmeta) g_scmeta = calloc(MAD_SCMETA_CAP, sizeof(*g_scmeta));
+    if (g_scmeta) {
+        h = (unsigned)(key[0] & (MAD_SCMETA_CAP - 1));
+        for (i = 0; i < 16; i++) {
+            struct mad_scmeta_ent *e = &g_scmeta[(h + i) & (MAD_SCMETA_CAP - 1)];
+            if (e->k0 == key[0] && e->k1 == key[1]) break;
+            if (!e->k0 && !e->k1) {
+                e->k0 = key[0]; e->k1 = key[1];
+                snprintf(e->entry, sizeof e->entry, "%s", entry ? entry : "");
+                e->backend = a->ret_backend;
+                e->tg[0] = a->ret_tg_size[0]; e->tg[1] = a->ret_tg_size[1]; e->tg[2] = a->ret_tg_size[2];
+                if (air) {
+                    e->cb_bind = air->cb_bind; e->arg_bind = air->arg_bind;
+                    e->arg_qwords = air->arg_qwords; e->slot_mask = air->slot_mask;
+                    e->nair = (UINT16)(air->nranges < MADEIRA_IR_AIR_RANGE_MAX ? air->nranges : MADEIRA_IR_AIR_RANGE_MAX);
+                    if (e->nair) {
+                        e->air = malloc(e->nair * sizeof(*e->air));
+                        if (e->air) memcpy(e->air, air->ranges, e->nair * sizeof(*e->air)); else e->nair = 0;
+                    }
+                }
+                if (vsin && nvsin) {
+                    e->vsin = malloc(nvsin * sizeof(*e->vsin));
+                    if (e->vsin) { memcpy(e->vsin, vsin, nvsin * sizeof(*e->vsin)); e->nvsin = (UINT16)nvsin; }
+                }
+                if (locs && nloc) {
+                    e->locs = malloc(nloc * sizeof(*e->locs));
+                    if (e->locs) { memcpy(e->locs, locs, nloc * sizeof(*e->locs)); e->nloc = (UINT16)nloc; }
+                }
+                InterlockedIncrement(&g_scmeta_stores);
+                break;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_scmeta_lock);
 }
 /* The pipeline's stages may be dropped: each has a cache file and a name the
  * pipeline holds whole. */
@@ -22374,6 +22666,24 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     if (o && o->air) memset(o->air, 0, sizeof *o->air);   /* ml1008 */
     if (o && o->tess_stage && o->air2) memset(o->air2, 0, sizeof *o->air2);   /* ml1083 */
     name[0] = 0;
+    /* madeira-m5 0.1.733 pso-lazy-libs = 2: RAM metadata cache hit skips flash read, scratch alloc, and MTLDevice_newLibrary completely. */
+    if (o && o->lz && o->lz_skip_mtl && !(o->lib_only) && !(o->lib2_out) && !(o->gs_emulation) && !(o->tess_stage) && mad_sc_init()) {
+        UINT64 mkey[2];
+        mad_fill_convert_inputs(&a, rs, dxil, dxil_len, entry, o);
+        if (mad_unb_sized_first(rs) && (sized_ranges = mad_unb_sized_copy(rs))) { a.ranges = (uint64_t)(uintptr_t)sized_ranges; sized = 1; }
+        mad_sc_key(&a, mkey);
+        if (mad_scmeta_find(mkey, name, sizeof name, vsin, vsin_cap, vsin_n, tg_out, locs, nlocs, o->air)) {
+            o->lz->key[0] = mkey[0]; o->lz->key[1] = mkey[1]; o->lz->ok = 1;
+            if (o->sckey_out) { o->sckey_out[0] = mkey[0]; o->sckey_out[1] = mkey[1]; }
+            if (o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);
+            snprintf(g_last_entry, sizeof g_last_entry, "%s", name);
+            free(sized_ranges);
+            InterlockedIncrement(&g_lzlib_mtls_skipped);
+            *lib_out = 0;
+            return (obj_handle_t)1;
+        }
+        free(sized_ranges); sized_ranges = NULL; sized = 0;
+    }
     if (onepass) {
         need = dxil_len * 4 + 64u * 1024u;
         buf = malloc(need);
@@ -22521,6 +22831,17 @@ again:
     if (vsin_n) *vsin_n = a.ret_vs_input_count < vsin_cap ? a.ret_vs_input_count : vsin_cap;
     if (nlocs) *nlocs = a.ret_loc_count < MAD_LOC_MAX ? a.ret_loc_count : MAD_LOC_MAX;
     if (tg_out) { tg_out[0] = a.ret_tg_size[0]; tg_out[1] = a.ret_tg_size[1]; tg_out[2] = a.ret_tg_size[2]; }
+    /* madeira-m5 0.1.733 pso-lazy-libs = 2: store metadata in RAM cache and skip creating an MTLLibrary that
+     * CreateGraphicsPipelineState / CreateComputePipelineState would immediately drop. */
+    if (o && o->lz && o->lz_skip_mtl && o->lz->ok && !o->lib_only && !o->lib2_out && !o->gs_emulation && !o->tess_stage) {
+        mad_scmeta_put(o->lz->key, name, &a, vsin, vsin_n ? *vsin_n : 0, locs, nlocs ? *nlocs : 0, o->air);
+        snprintf(g_last_entry, sizeof g_last_entry, "%s", name);
+        if (o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);
+        InterlockedIncrement(&g_lzlib_mtls_skipped);
+        *lib_out = 0;
+        free(buf);
+        return (obj_handle_t)1;
+    }
     if (o && o->dtess) {   /* DXIL tessellation */
         struct mad_dtess_refl *t = o->dtess;
         if (a.ret_hs_patches_per_tg) {
@@ -23289,7 +23610,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         ov2.layout = LV->n ? LV : NULL;
         ov2.air = &air_vs;
         ov2.name_out = vsentry; ov2.name_cap = sizeof vsentry; vsentry[0] = 0;
-        if (lz_on) ov2.lz = &lzv;   /* madeira-bcd pso-lazy-libs */
+        if (lz_on) { ov2.lz = &lzv; if (g_lzlib >= 2 && !mad_cfg_int_pe("pso-warm", 0)) ov2.lz_skip_mtl = 1; }   /* madeira-bcd pso-lazy-libs */
         if (ds_on) ov2.sckey_out = dk_vs;   /* madeira-m5 0.1.719 pso-drawn-set */
         p->vs_fn = mad_convert_stage_opts(d, rs, desc->VS.pShaderBytecode, desc->VS.BytecodeLength, NULL, &p->vs_lib, "VS",
                                      vsin, 32, &nvsin, NULL, locs, &nl, &ov2);
@@ -23324,7 +23645,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
             memset(&op, 0, sizeof op); op.name_out = p->ps_name; op.name_cap = sizeof p->ps_name;   /* ml927b: per-call name */
             memset(&air_ps, 0, sizeof air_ps);
             op.air = &air_ps;   /* ml1011 */
-            if (lz_on) op.lz = &lzp;   /* madeira-bcd pso-lazy-libs */
+            if (lz_on) { op.lz = &lzp; if (g_lzlib >= 2 && !mad_cfg_int_pe("pso-warm", 0)) op.lz_skip_mtl = 1; }   /* madeira-bcd pso-lazy-libs */
             if (ds_on) op.sckey_out = dk_ps;   /* madeira-m5 0.1.719 pso-drawn-set */
             {   /* ml1023: what the pixel stage must be compiled against. */
                 UINT k, flags = 0, unorm = 0;
@@ -23605,16 +23926,50 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
             /* madeira-bcd: descriptors kept, built by mad_pso_realize */
             p->lazy = 1; p->rp = rp; p->has_vd = has_vd; if (has_vd) p->vd = vd;
             p->device_handle = d->mtl_device;
+            /* madeira-m5 0.1.733/0.1.734 pso-lazy-libs = 2: clear deferred sentinel handles before any Metal call
+             * AND keep local `rp` in sync so the has_vd path below can never overwrite p->rp with sentinel (1). */
+            if (p->vs_fn == (obj_handle_t)1 || p->ps_fn == (obj_handle_t)1) {
+                if (lzv.ok && (!desc->PS.pShaderBytecode || lzp.ok)) {
+                    p->lz_vs_key[0] = lzv.key[0]; p->lz_vs_key[1] = lzv.key[1];
+                    p->lz_has_ps = (p->ps_fn != 0);
+                    if (p->lz_has_ps) { p->lz_ps_key[0] = lzp.key[0]; p->lz_ps_key[1] = lzp.key[1]; }
+                    if (p->vs_fn && p->vs_fn != (obj_handle_t)1) NSObject_release(p->vs_fn);
+                    if (p->vs_lib) NSObject_release(p->vs_lib);
+                    if (p->ps_fn && p->ps_fn != (obj_handle_t)1) NSObject_release(p->ps_fn);
+                    if (p->ps_lib) NSObject_release(p->ps_lib);
+                    p->vs_fn = p->vs_lib = p->ps_fn = p->ps_lib = 0;
+                    p->rp.vertex_function = p->rp.fragment_function = 0;
+                    rp.vertex_function = rp.fragment_function = 0;
+                    p->lz = 1;
+                    InterlockedIncrement(&g_lzlib_dropped);
+                } else {
+                    if (p->vs_fn == (obj_handle_t)1) {
+                        p->vs_fn = 0;
+                        mad_lzlib_stage(p, lzv.key, p->vs_name, &p->vs_lib, &p->vs_fn);
+                    }
+                    if (p->ps_fn == (obj_handle_t)1) {
+                        p->ps_fn = 0;
+                        mad_lzlib_stage(p, lzp.key, p->ps_name, &p->ps_lib, &p->ps_fn);
+                    }
+                    p->rp.vertex_function = rp.vertex_function = p->vs_fn;
+                    p->rp.fragment_function = rp.fragment_function = p->ps_fn;
+                }
+            }
             if (ds_on) {   /* madeira-m5 0.1.719 pso-drawn-set: a pipeline an earlier session drew is built now, on the creating (AsyncPsoQueue) thread */
                 mad_pso_drawn_key(p, dk_vs, dk_ps, &rp, has_vd ? &vd : NULL);
                 if (mad_pds_has(p->drawn_key)) {
-                    obj_handle_t err = 0, built = mad_new_render_pipeline(d->mtl_device, &p->rp, p->has_vd ? &p->vd : NULL, &err, p->vs_name);
+                    obj_handle_t err = 0, built = 0;
+                    if (!p->lz || mad_lzlib_restore(p)) {
+                        rp.vertex_function = p->rp.vertex_function;
+                        rp.fragment_function = p->rp.fragment_function;
+                        built = mad_new_render_pipeline(d->mtl_device, &p->rp, p->has_vd ? &p->vd : NULL, &err, p->vs_name);
+                    }
                     if (err) mad_log_nserror(p->vs_name, err);
                     if (built) { p->rps = built; p->lazy = 0; p->drawn_noted = 1; InterlockedIncrement(&g_pds_eager); }   /* the libraries stay (lz drops only a lazy pipeline's) */
                     else InterlockedIncrement(&g_pds_eager_failed);   /* stays lazy: its first draw tries again and counts it, as for any lazy pipeline */
                 }
             }
-            if (p->lazy) mad_pso_warm(p->device_handle, &p->rp, p->has_vd ? &p->vd : NULL, p->has_vd ? 1 : 0);   /* pso-warm */
+            if (p->lazy && !p->lz) mad_pso_warm(p->device_handle, &p->rp, p->has_vd ? &p->vd : NULL, p->has_vd ? 1 : 0);   /* pso-warm */
         } else {
             obj_handle_t err = 0;
             p->rps = mad_new_render_pipeline(d->mtl_device, &rp, has_vd ? &vd : NULL, &err, p->vs_name);   /* M010 */
@@ -23664,7 +24019,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         pso_Release((ID3D12PipelineState *)p);
         return E_FAIL;
     }
-    if (has_vd && (p->rps || p->lazy)) { p->rp = rp; p->vd = vd; p->has_vd = 1; p->device_handle = d->mtl_device; InitializeCriticalSection(&p->var_lock); }
+    if (has_vd && (p->rps || p->lazy)) { if (!p->lazy && !p->lz) p->rp = rp; p->vd = vd; p->has_vd = 1; p->device_handle = d->mtl_device; InitializeCriticalSection(&p->var_lock); }
 
     /* Depth-stencil state is encoder state in Metal; one object per pipeline. */
     memset(&dsi, 0, sizeof dsi);
@@ -23706,7 +24061,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
     }
     /* madeira-bcd pso-lazy-libs: built at its first draw, so its libraries can go
      * until then (pso-warm, above, holds its own references to the functions) */
-    if (lz_on && p->lazy && !p->rps && mad_lzlib_can_drop(p, &lzv, &lzp)) mad_lzlib_drop(p, &lzv, &lzp);
+    if (lz_on && p->lazy && !p->rps && !p->lz && mad_lzlib_can_drop(p, &lzv, &lzp)) mad_lzlib_drop(p, &lzv, &lzp);
     hr = pso_QI((ID3D12PipelineState *)p, riid, out);
     pso_Release((ID3D12PipelineState *)p);
     return hr;
@@ -23793,7 +24148,7 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
         memset(&o, 0, sizeof o);
         o.air = &air;
         o.name_out = entry; o.name_cap = sizeof entry; entry[0] = 0;   /* madeira-bcd: read by dxil-dump below */
-        if (lz_on) o.lz = &lzc;   /* madeira-bcd pso-lazy-libs */
+        if (lz_on) { o.lz = &lzc; if (g_lzlib >= 2 && !mad_cfg_int_pe("pso-warm", 0)) o.lz_skip_mtl = 1; }   /* madeira-bcd pso-lazy-libs */
         p->vs_fn = mad_convert_stage_opts(d, (struct mad_rootsig *)desc->pRootSignature, desc->CS.pShaderBytecode,
                                      desc->CS.BytecodeLength, NULL, &p->vs_lib, "CS", NULL, 0, NULL, p->tg, locs, &nl, &o);
         if (g_dxil_dump_state && mad_dxil_dump_wanted(entry))   /* madeira-bcd: diagnostic, off unless dxil-dump is set */
@@ -23865,10 +24220,18 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
     if (!p->tg[2]) { p->tg[2] = 1; }
     if (mad_pso_lazy_on()) {   /* built at its first dispatch (mad_cpso_realize) */
         p->lazy_cs = 1; p->device_handle = d->mtl_device;
-        memset(&ci, 0, sizeof ci);   /* the descriptor mad_cpso_realize builds */
-        ci.compute_function = p->vs_fn;
-        mad_pso_warm(p->device_handle, &ci, NULL, 2);   /* pso-warm */
-        if (lz_on && mad_lzlib_can_drop(p, &lzc, NULL)) mad_lzlib_drop(p, &lzc, NULL);   /* madeira-bcd pso-lazy-libs */
+        if (p->vs_fn == (obj_handle_t)1) {
+            p->lz_vs_key[0] = lzc.key[0]; p->lz_vs_key[1] = lzc.key[1];
+            p->lz_has_ps = 0;
+            p->vs_fn = p->vs_lib = 0;
+            p->lz = 1;
+            InterlockedIncrement(&g_lzlib_dropped);
+        } else {
+            memset(&ci, 0, sizeof ci);   /* the descriptor mad_cpso_realize builds */
+            ci.compute_function = p->vs_fn;
+            mad_pso_warm(p->device_handle, &ci, NULL, 2);   /* pso-warm */
+            if (lz_on && mad_lzlib_can_drop(p, &lzc, NULL)) mad_lzlib_drop(p, &lzc, NULL);   /* madeira-bcd pso-lazy-libs */
+        }
         hr = pso_QI((ID3D12PipelineState *)p, riid, out);
         pso_Release((ID3D12PipelineState *)p);
         return hr;
@@ -26314,6 +26677,193 @@ __declspec(dllexport) void MadeiraD3D12GetQueueStats(ID3D12CommandQueue *queue,
     if (rejected) *rejected = q->rejected;
 }
 
+/* madeira-m5 0.1.733: native Apple MTLFXTemporalScaler exports called by x86-64 amd_fidelityfx_dx12.dll proxy. */
+struct mad_mtlfxt_dispatch_abi {
+    UINT32 size;
+    UINT32 flags;
+    void *device;
+    void *command_list;
+    void *color;
+    void *depth;
+    void *motion;
+    void *exposure;
+    void *output;
+    UINT32 in_w, in_h, out_w, out_h;
+    float jitter_x, jitter_y, mv_scale_x, mv_scale_y, pre_exposure;
+    UINT8 reset, depth_reversed, auto_exposure, pad;
+};
+__declspec(dllexport) int WINAPI MadeiraD3D12_MTLFXTemporalSupported(ID3D12Device *device) {
+    struct mad_device *d = (struct mad_device *)device;
+    if (!d || !d->mtl_device || !mad_mtlfxt_on()) return 0;
+    return MTLDevice_supportsFXTemporalScaler(d->mtl_device) ? 1 : 0;
+}
+__declspec(dllexport) void WINAPI MadeiraD3D12_MTLFXTemporalReset(ID3D12Device *device) {
+    struct mad_device *d = (struct mad_device *)device;
+    obj_handle_t old_sc = 0;
+    if (!d) return;
+    EnterCriticalSection(&d->mtlfxt_lock);
+    old_sc = d->mtlfxt_scaler; d->mtlfxt_scaler = 0;
+    d->mtlfxt_in_w = d->mtlfxt_in_h = d->mtlfxt_out_w = d->mtlfxt_out_h = 0;
+    LeaveCriticalSection(&d->mtlfxt_lock);
+    if (old_sc) {
+        if (g_cb_unretained > 0) mad_uret_push(d, old_sc, 0, NULL, 0);
+        else NSObject_release(old_sc);
+    }
+}
+__declspec(dllexport) int WINAPI MadeiraD3D12_MTLFXTemporalDispatch(const struct mad_mtlfxt_dispatch_abi *a) {
+    struct mad_device *d;
+    struct mad_list *l;
+    struct mad_resource *rc, *rd, *rm, *re, *ro;
+    struct mad_cmd *c;
+    UINT32 cfmt, ofmt, dfmt, mfmt, in_w, in_h, out_w, out_h, aexp, dcopy = 0;
+    obj_handle_t old_sc = 0, old_d32 = 0, old_dbuf = 0;
+    int ok = 0;
+    if (!a || a->size < sizeof(*a) || !mad_mtlfxt_on()) return 0;
+    d  = (struct mad_device *)a->device;
+    l  = (struct mad_list *)a->command_list;
+    rc = (struct mad_resource *)a->color;
+    rd = (struct mad_resource *)a->depth;
+    rm = (struct mad_resource *)a->motion;
+    re = (struct mad_resource *)a->exposure;
+    ro = (struct mad_resource *)a->output;
+    if (!d || !d->mtl_device || !l || l->closed || !rc || !rd || !rm || !ro) return 0;
+    if (!rc->texture || !rd->texture || !rm->texture || !ro->texture) return 0;
+    in_w  = a->in_w  ? a->in_w  : rc->width;
+    in_h  = a->in_h  ? a->in_h  : rc->height;
+    out_w = a->out_w ? a->out_w : ro->width;
+    out_h = a->out_h ? a->out_h : ro->height;
+    if (!in_w || !in_h || !out_w || !out_h || in_w > rc->width || in_h > rc->height || out_w > ro->width || out_h > ro->height) return 0;
+    if (rd->width != rc->width || rd->height != rc->height || rm->width != rc->width || rm->height != rc->height ||
+        out_w > in_w * 3u || out_h > in_h * 3u) {
+        static LONG said_dim;
+        if (InterlockedIncrement(&said_dim) <= 4)
+            d3d12_log("[mtlfxt] 0.1.734 dim/scale guard fallback: c=%ux%u (in %ux%u) d=%ux%u m=%ux%u o=%ux%u (out %ux%u) flags=%#x\n",
+                      rc->width, rc->height, in_w, in_h, rd->width, rd->height, rm->width, rm->height, ro->width, ro->height, out_w, out_h, a->flags);
+        return 0;
+    }
+    cfmt = (UINT32)rc->tex_pf; ofmt = (UINT32)ro->tex_pf; dfmt = (UINT32)rd->tex_pf; mfmt = (UINT32)rm->tex_pf;
+    aexp = a->auto_exposure ? 1u : 0u;
+
+    /* Ensure 2D views can be created cleanly before committing to MetalFX path */
+    if (!mad_res_tex2d(d, rc) || !mad_res_tex2d(d, rm) || !mad_res_tex2d(d, ro)) return 0;
+    if (re && re->texture && !mad_res_tex2d(d, re)) return 0;
+
+    EnterCriticalSection(&d->mtlfxt_lock);
+    if (d->mtlfxt_scaler &&
+        d->mtlfxt_in_w == rc->width && d->mtlfxt_in_h == rc->height &&
+        d->mtlfxt_out_w == ro->width && d->mtlfxt_out_h == ro->height &&
+        d->mtlfxt_cfmt == cfmt && d->mtlfxt_ofmt == ofmt && d->mtlfxt_dfmt == dfmt &&
+        d->mtlfxt_mfmt == mfmt && d->mtlfxt_auto_exp == aexp) {
+        dcopy = d->mtlfxt_depth_copy;
+        ok = 1;
+    } else {
+        struct WMTFXTemporalScalerInfo info;
+        obj_handle_t sc = 0;
+        memset(&info, 0, sizeof info);
+        info.color_format = (enum WMTPixelFormat)cfmt;
+        info.output_format = (enum WMTPixelFormat)ofmt;
+        info.depth_format = (enum WMTPixelFormat)dfmt;
+        info.motion_format = (enum WMTPixelFormat)mfmt;
+        info.input_width = rc->width;
+        info.input_height = rc->height;
+        info.output_width = ro->width;
+        info.output_height = ro->height;
+        info.input_content_min_scale = 1.0f;
+        info.input_content_max_scale = 3.0f;
+        info.auto_exposure = aexp != 0;
+        info.input_content_properties_enabled = true;
+        info.requires_synchronous_initialization = true;
+        sc = MTLDevice_newTemporalScaler(d->mtl_device, &info);
+        if (!sc && dfmt == (UINT32)WMTPixelFormatDepth32Float_Stencil8) {
+            /* Retry with single-plane Depth32Float + hardware blit copy of depth plane */
+            info.depth_format = WMTPixelFormatDepth32Float;
+            sc = MTLDevice_newTemporalScaler(d->mtl_device, &info);
+            if (sc) dcopy = 1;
+        }
+        if (sc && dcopy) {
+            UINT64 need = (UINT64)rd->width * rd->height * 4u;
+            if (!d->mtlfxt_depth32 || d->mtlfxt_d32_w != rd->width || d->mtlfxt_d32_h != rd->height) {
+                struct WMTTextureInfo ti;
+                memset(&ti, 0, sizeof ti);
+                ti.type = WMTTextureType2D;
+                ti.pixel_format = WMTPixelFormatDepth32Float;
+                ti.width = rd->width; ti.height = rd->height;
+                ti.depth = 1; ti.array_length = 1; ti.mipmap_level_count = 1; ti.sample_count = 1;
+                ti.usage = (enum WMTTextureUsage)(WMTTextureUsageShaderRead | WMTTextureUsageRenderTarget);
+                ti.options = WMTResourceStorageModePrivate | (mad_res_untracked_on(d) ? WMTResourceHazardTrackingModeUntracked : 0);
+                old_d32 = d->mtlfxt_depth32;
+                d->mtlfxt_depth32 = MTLDevice_newTexture(d->mtl_device, &ti);
+                d->mtlfxt_d32_w = d->mtlfxt_depth32 ? rd->width : 0;
+                d->mtlfxt_d32_h = d->mtlfxt_depth32 ? rd->height : 0;
+                if (d->mtlfxt_depth32) mad_resident(d, d->mtlfxt_depth32);
+            }
+            if (!d->mtlfxt_dbuf || d->mtlfxt_dbuf_sz < need) {
+                struct WMTBufferInfo bi;
+                UINT64 sz = need < (4u << 20) ? (4u << 20) : (need + 0xffffu) & ~(UINT64)0xffffu;
+                memset(&bi, 0, sizeof bi);
+                bi.length = sz;
+                bi.options = WMTResourceStorageModePrivate | (mad_res_untracked_on(d) ? WMTResourceHazardTrackingModeUntracked : 0);
+                old_dbuf = d->mtlfxt_dbuf;
+                d->mtlfxt_dbuf = MTLDevice_newBuffer(d->mtl_device, &bi);
+                d->mtlfxt_dbuf_sz = d->mtlfxt_dbuf ? sz : 0;
+                if (d->mtlfxt_dbuf) mad_resident(d, d->mtlfxt_dbuf);
+            }
+            if (!d->mtlfxt_depth32 || !d->mtlfxt_dbuf) {
+                NSObject_release(sc); sc = 0;
+            }
+        }
+        if (sc) {
+            old_sc = d->mtlfxt_scaler;
+            d->mtlfxt_scaler = sc;
+            d->mtlfxt_in_w = rc->width; d->mtlfxt_in_h = rc->height;
+            d->mtlfxt_out_w = ro->width; d->mtlfxt_out_h = ro->height;
+            d->mtlfxt_cfmt = cfmt; d->mtlfxt_ofmt = ofmt; d->mtlfxt_dfmt = dfmt; d->mtlfxt_mfmt = mfmt;
+            d->mtlfxt_auto_exp = aexp; d->mtlfxt_depth_copy = dcopy;
+            ok = 1;
+            d3d12_log("[mtlfxt] 0.1.733 created Apple MTLFXTemporalScaler: %ux%u (content %ux%u) -> %ux%u (pf c=%u d=%u m=%u o=%u, autoExp=%u, dcopy=%u)\n",
+                      rc->width, rc->height, in_w, in_h, ro->width, ro->height, cfmt, dfmt, mfmt, ofmt, aexp, dcopy);
+        } else {
+            d3d12_log("[mtlfxt] 0.1.733 MTLDevice_newTemporalScaler refused %ux%u -> %ux%u (pf c=%u d=%u m=%u o=%u); falling back to FSR\n",
+                      rc->width, rc->height, ro->width, ro->height, cfmt, dfmt, mfmt, ofmt);
+        }
+    }
+    LeaveCriticalSection(&d->mtlfxt_lock);
+
+    if (old_sc)   { if (g_cb_unretained > 0) mad_uret_push(d, old_sc, 0, NULL, 0);   else NSObject_release(old_sc); }
+    if (old_d32)  { if (g_cb_unretained > 0) mad_uret_push(d, old_d32, 0, NULL, 0);  else NSObject_release(old_d32); }
+    if (old_dbuf) { if (g_cb_unretained > 0) mad_uret_push(d, old_dbuf, 0, NULL, 0); else NSObject_release(old_dbuf); }
+    if (!ok) return 0;
+    if (!dcopy && !mad_res_tex2d(d, rd)) return 0;
+
+    c = mad_list_push(l, MC_MTLFX_TEMPORAL_SCALE);
+    if (!c) return 0;
+    c->u.mtlfxt.color = rc;
+    c->u.mtlfxt.depth = rd;
+    c->u.mtlfxt.motion = rm;
+    c->u.mtlfxt.exposure = (re && re->texture) ? re : NULL;
+    c->u.mtlfxt.output = ro;
+    c->u.mtlfxt.in_w = in_w;
+    c->u.mtlfxt.in_h = in_h;
+    c->u.mtlfxt.out_w = out_w;
+    c->u.mtlfxt.out_h = out_h;
+    c->u.mtlfxt.flags = a->flags;
+    c->u.mtlfxt.jitter_x = a->jitter_x;
+    c->u.mtlfxt.jitter_y = a->jitter_y;
+    c->u.mtlfxt.mv_scale_x = a->mv_scale_x;
+    c->u.mtlfxt.mv_scale_y = a->mv_scale_y;
+    c->u.mtlfxt.pre_exposure = a->pre_exposure;
+    c->u.mtlfxt.reset = a->reset;
+    c->u.mtlfxt.depth_reversed = a->depth_reversed;
+    c->u.mtlfxt.auto_exposure = (UINT8)aexp;
+    c->u.mtlfxt.depth_copy = (UINT8)dcopy;
+    mad_list_note_used(l, rc);
+    mad_list_note_used(l, rd);
+    mad_list_note_used(l, rm);
+    mad_list_note_used(l, ro);
+    if (re && re->texture) mad_list_note_used(l, re);
+    return 1;
+}
+
 __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
         D3D_FEATURE_LEVEL min_feature_level, REFIID riid, void **device) {
     (void)adapter;
@@ -26393,6 +26943,7 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
     InitializeCriticalSection(&d->view_lock);   /* ml1049 */
     InitializeCriticalSection(&d->ring_lock);   /* ml1061 */
     InitializeCriticalSection(&d->vis_lock);    /* ml1088 */
+    InitializeCriticalSection(&d->mtlfxt_lock); /* madeira-m5 0.1.733 */
     InitializeCriticalSection(&d->vis_pub_lock); /* ml1092 */
     InitializeCriticalSection(&d->heap_lock);   /* ml1072 */
     g_hp_dev = d;
