@@ -262,6 +262,7 @@ static volatile LONG g_tr_passes, g_tr_clear_only, g_tr_deferred, g_tr_def_flush
 enum { RPM_OFF, RPM_PREFIX, RPM_STATE, RPM_CALL, RPM_COMMIT, RPM_N };   /* why a pass the next list goes on with was not carried */
 static volatile LONG g_rp_carried, g_rp_miss[RPM_N]; static volatile LONG64 g_rp_carried_b, g_rp_miss_b[RPM_N];
 static volatile LONG64 g_rp_disc_load_b; static volatile LONG g_rp_disc_whole;
+static volatile LONG g_rpd_clr_prom, g_tr_clear_batched;   /* madeira-m5 0.1.729: clear-rects promotions & batched clear-only passes saved */
 static int g_census_on;   /* ml899: one frame at presents 1500,1700,...,2800 */
 static int g_skin_check = -1;      /* madeira-bcd skin-check: frames per window, 0 = off (mad_skin_load) */
 static volatile LONG g_skin_now;   /* madeira-bcd skin-check: the frame being replayed is a check frame */
@@ -392,6 +393,8 @@ struct mad_device {
     LONG device_lost;
     LONG x64_flags;             /* madeira-m5 0.1.717 x64-leaf: MAD_X64L_OK when the x64 leaves may take their fast path on this device
                                  * (written once at creation; in the padding after device_lost, so no other member moves) */
+    struct mad_x64l_smp_ent *smp_x64;   /* madeira-m5 0.1.729 x64-leaf Phase E: append-only lock-free sampler cache */
+    volatile LONG smp_x64_n;            /* published with __ATOMIC_RELEASE after filling smp_x64[n] */
     /* GPU addresses are resolved back to the resource that owns them rather
      * than dereferenced. The design is explicit that a D3D GPU address, a
      * descriptor handle and a backend object id are separate namespaces. */
@@ -538,7 +541,8 @@ static LONG g_f6_rar_passed; static int g_f6_rar = -1;   /* madeira-bcd f6-rar *
  * between, and what a state-aware wait rule would have needed at each
  * barrier-caused sync of mode 6; attachment bytes loaded / cleared / stored in
  * 1 of 16 frames, with what happens NEXT to each stored attachment in its list. */
-enum { BC_RAR, BC_RAW_ATT, BC_RAW_COPY, BC_RAW_UAV, BC_ALL, BC_NONE = 255 };
+enum { BC_RAR, BC_RAW_ATT, BC_RAW_COPY, BC_RAW_UAV, BC_ALL, BC_NONE = 255, BCF_CLS_MASK = 0x07, BCF_ALIAS_AFTER = 0x08, BCF_BEGIN_ONLY = 0x10, BCF_TO_RT_DSW = 0x20, BCF_TO_COMMON = 0x40, BCF_ALIASING = 0x80 };
+static volatile LONG64 g_pt_var_realize;
 static LONG g_bc_ent[5], g_f7_bsync, g_f7_none, g_f7_subset, g_f7_all;
 static LONG g_f7_subset_full;   /* madeira-m5 0.1.716 P4d: "subset" masks that name every pending encoder (m == pm): not exploitable */
 static LONG64 g_f7_fw6, g_f7_fwr;
@@ -1412,6 +1416,7 @@ struct mad_resource {
     D3D12_HEAP_TYPE heap;
     UINT64 gpu_address;        /* reported by the backend at creation */
     LONG mapped;
+    volatile LONG x64_flags;   /* madeira-m5 0.1.729 x64-leaf Phase E (in 4B padding after mapped): SRV_LISTED, IN_DSET, tex shape */
     obj_handle_t texture;      /* set instead of `buffer` for TEXTURE2D */
     UINT64 gpu_resource_id;    /* what a descriptor entry stores for a texture */
     UINT32 width, height;
@@ -1420,6 +1425,7 @@ struct mad_resource {
     UINT samples;
     struct mad_device *owner;
     int borrowed;              /* texture belongs to a drawable; do not release */
+    UINT16 x64_mips, x64_layers;   /* madeira-m5 0.1.729 x64-leaf Phase E (in 4B padding after borrowed): cached tex_mips/tex_layers */
     obj_handle_t resolve_tmp;  /* exec_resolve: render-target stand-in when this is a resolve destination without that usage */
     UINT resolve_tmp_w, resolve_tmp_h, resolve_tmp_pf;   /* the stand-in's size and pixel format, to replace it when they change */
     D3D12_RESOURCE_DESC desc;  /* as created; answered by GetDesc */
@@ -1461,6 +1467,7 @@ static void mad_view_list_add(struct mad_device *d, int uav, struct mad_resource
     AcquireSRWLockExclusive(&d->list_lock);
     if (!*slot && mad_grow((void **)arr, cap, *n + 1, sizeof **arr)) {
         (*arr)[*n] = r; *slot = ++*n;
+        if (!uav) __atomic_fetch_or(&r->x64_flags, MAD_X64L_RES_SRV_LISTED, __ATOMIC_RELEASE);   /* 0.1.729 Phase E */
     }
     ReleaseSRWLockExclusive(&d->list_lock);
 }
@@ -1474,6 +1481,7 @@ static void mad_view_list_del(struct mad_device *d, int uav, struct mad_resource
     arr[i] = last;
     if (uav) last->uav_slot = i + 1; else last->srv_slot = i + 1;
     *slot = 0;
+    if (!uav) __atomic_fetch_and(&r->x64_flags, ~MAD_X64L_RES_SRV_LISTED, __ATOMIC_RELEASE);   /* 0.1.729 Phase E */
 }
 
 DEFINE_GUID(IID_IMTLDXGIDevice, 0x6bfa1657, 0x9cb1, 0x471a, 0xa4, 0xfb, 0x7c, 0xac, 0xf8, 0xa8, 0x12, 0x07);
@@ -1549,6 +1557,7 @@ struct mad_pso {
      * draw's chain reached Metal (mad_pso_for_strides: uncached). Before, every cache HIT flushed the encode batch (77-134 times a
      * frame in HFW, 20-30 % of its Metal bridge calls) because an eviction on another thread could have freed the pipeline. */
     struct mad_pso_var { UINT strides[16]; obj_handle_t rps; } *var; unsigned nvar, var_cap;
+    UINT var_q[16][16]; unsigned nvar_q;   /* madeira-m5 0.1.729: stride tuples currently queued on D3D12PsoAsync (under var_lock) */
     LONG var_said;   /* the one "reached pso-variant-cap" line this pipeline gets */
     CRITICAL_SECTION var_lock;
     obj_handle_t device_handle;
@@ -1891,6 +1900,7 @@ struct mad_fence {
     UINT64 fpb_seen, fpb_t;
     LONG fpb_run, fpb_polls;
     D3D12_FENCE_FLAGS flags;   /* night round 2026-11-11 (G8 S12): the flags CreateFence was given (0 unless d3d12-fence-flags = 1) */
+    UINT64 qw_vals[8], blk_vals[8];   /* madeira-m5 0.1.729: value-aware active targets for nqwaiters / nblocked (under lock) */
 };
 
 /* madeira-m5 0.1.719 (Round 6 report 1.6, T1-a): WHICH THREADS the game blocks in SetEventOnCompletion waits. A waiter takes a slot for
@@ -2123,9 +2133,10 @@ static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, U
          * can make progress. Re-checked in a loop because a condition variable
          * may wake spuriously and because an intervening signal may not have
          * reached our value yet. */
-        /* madeira-m5 cb-coalesce: nblocked is raised under the lock, so mad_cc_defer
-         * (which reads it under the same lock) defers nothing past this wait; a Signal
-         * deferred between the observe above and the lock is caught by the recheck. */
+        /* madeira-m5 cb-coalesce / 0.1.729: value-aware nblocked (blk_vals[8], 0 = empty; value >= 1 here since value > f->value) */
+        int bslot = -1;
+        unsigned bi;
+        for (bi = 0; bi < 8; bi++) if (!f->blk_vals[bi]) { f->blk_vals[bi] = value; bslot = (int)bi; break; }
         f->nblocked++;
         while (f->value < value) {
             if (g_cb_coalesce > 0 && f->ndeferred > 0) {
@@ -2136,6 +2147,7 @@ static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, U
             }
             SleepConditionVariableCS(&f->cv, &f->lock, g_cb_coalesce > 0 ? 10 : INFINITE);
         }
+        if (bslot >= 0) f->blk_vals[bslot] = 0;
         f->nblocked--;
     } else if (f->nwaiters < MAD_FENCE_WAITERS) {
         { LARGE_INTEGER t; QueryPerformanceCounter(&t); f->waiters[f->nwaiters].t_reg = t.QuadPart; f->waiters[f->nwaiters].pwt = mad_pwt_slot(); }   /* ml1109; 0.1.719: and whose thread */
@@ -3298,20 +3310,20 @@ static int f6_rar_only(const struct mad_cmd *c) {
         if (g_f6_rar) d3d12_log("[madeira-d3d12] f6-rar = 1: with fence-chain 6, read-to-read ResourceBarriers are not sync points\n");
     }
     if (!g_f6_rar || c->u.barrier.all || !c->u.barrier.n) return 0;
-    for (k = 0; k < c->u.barrier.n && k < MAD_BAR_MAX; k++) if (c->u.barrier.cls[k] != BC_RAR) return 0;
+    for (k = 0; k < c->u.barrier.n && k < MAD_BAR_MAX; k++) if ((c->u.barrier.cls[k] & BCF_CLS_MASK) != BC_RAR) return 0;
     return 1;
 }
 /* madeira-m5 0.1.718 rp-carry-barrier: the same test without the f6-rar switch (D3D12 orders nothing at such a batch). */
 static int mad_barrier_rar_only(const struct mad_cmd *c) {
     unsigned k;
     if (c->u.barrier.all || !c->u.barrier.n) return 0;
-    for (k = 0; k < c->u.barrier.n && k < MAD_BAR_MAX; k++) if (c->u.barrier.cls[k] != BC_RAR) return 0;
+    for (k = 0; k < c->u.barrier.n && k < MAD_BAR_MAX; k++) if ((c->u.barrier.cls[k] & BCF_CLS_MASK) != BC_RAR) return 0;
     return 1;
 }
 static void f7_census_barrier(struct mad_exec *e, const struct mad_cmd *c) {
     unsigned k;
     for (k = 0; k < c->u.barrier.n; k++) {
-        UINT8 cls = c->u.barrier.cls[k];
+        UINT8 cls = (UINT8)(c->u.barrier.cls[k] & BCF_CLS_MASK);
         if (cls < 5) { InterlockedIncrement(&g_bc_ent[cls]); if (g_f7_verify > 0) e->f7_verify_cls |= 1u << cls; }
         f7_need(e, cls, c->u.barrier.res[k]);
     }
@@ -3349,7 +3361,7 @@ static void f7_presync_merge(struct mad_exec *e) {
         m0 = e->f7_mask; m8 = e->f8_mask; all0 = e->f7_all; open0 = e->f7_open; uav0 = e->f7_uav; vs0 = e->f7_vsread; a8 = e->f8_all; o8 = e->f8_open;
         e->f7_presync_spec = 1;
         for (b = b0; b < end && (b == b0 || (b->kind == MC_BARRIER && b->u.barrier.spill)); b++) {
-            for (k = 0; k < b->u.barrier.n && k < MAD_BAR_MAX; k++) f7_need(e, b->u.barrier.cls[k], b->u.barrier.res[k]);
+            for (k = 0; k < b->u.barrier.n && k < MAD_BAR_MAX; k++) f7_need(e, (UINT8)(b->u.barrier.cls[k] & BCF_CLS_MASK), b->u.barrier.res[k]);
             if (b->u.barrier.cls_noref != BC_NONE) f7_need(e, b->u.barrier.cls_noref, NULL);
             if (b->u.barrier.vsread & 1) vs = 1;
         }
@@ -3470,7 +3482,7 @@ static void f7_store_census(struct mad_exec *e, const struct mad_resource *r, UI
             break;
         case MC_BARRIER:
             for (k = 0; k < c->u.barrier.n; k++)
-                if (c->u.barrier.res[k] == r) { cls = rebound ? &g_ac_st_rebound : c->u.barrier.cls[k] == BC_ALL ? &g_ac_st_write : &g_ac_st_read; goto done; }
+                if (c->u.barrier.res[k] == r) { cls = rebound ? &g_ac_st_rebound : (c->u.barrier.cls[k] & BCF_CLS_MASK) == BC_ALL ? &g_ac_st_write : &g_ac_st_read; goto done; }
             break;
         case MC_COPY_T2T: case MC_RESOLVE:
             if (c->u.tt.src == r) { cls = &g_ac_st_read; goto done; }
@@ -3512,7 +3524,7 @@ static void exec_end(struct mad_exec *e) {
     if (e->renc) {
         if (g_capture_on) { cn = e->enc_nrt; memcpy(crt, e->enc_rt, sizeof crt); memcpy(crtp, e->enc_rtp, sizeof crtp); cdepth = e->enc_depth; cdp = e->enc_dp; cseq = e->renc_seq; cdraws = e->pass_draws; }
         if (e->rp_late) exec_rp_late_store(e);   /* madeira-bcd rp-discard: the store actions the pass left open */
-        else if (e->l && mad_rp_discard_on() == 2) exec_rp_dead_census(e);   /* madeira-m5 0.1.718 rp-discard = 2: what the store side WOULD drop, counted */
+        else if (e->l && (mad_rp_discard_on() == 2 || mad_rp_discard_on() == 4)) exec_rp_dead_census(e);   /* madeira-m5 0.1.718/0.1.729: what the store side WOULD drop, counted */
         MTLCommandEncoder_endEncoding(e->renc); e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
         e->enc_wrote_uav = 0; e->enc_uav_bar_pending = 0;
         if (e->q->vis && e->q->vis->dirty) { e->q->vis->next++; e->q->vis->dirty = 0; }   /* ml1088: DXMT's endEncoder */
@@ -4429,12 +4441,17 @@ static void mad_dsw_census(void) {
 static int mad_rtvp_eq(const struct mad_rtvp *a, const struct mad_rtvp *b) {
     return a->level == b->level && a->slice == b->slice && a->layers == b->layers && a->plane == b->plane;
 }
+/* madeira-m5 0.1.729: for depth textures, v->plane carries D3D12_DSV_FLAGS bits 0..1 (RO depth/stencil), not a 3D W-slice */
+static int mad_rtvp_eq_r(const struct mad_resource *r, const struct mad_rtvp *a, const struct mad_rtvp *b) {
+    return a->level == b->level && a->slice == b->slice && a->layers == b->layers && ((r && r->is_depth) || a->plane == b->plane);
+}
 /* madeira-m5 0.1.718 clear-defer-views: do two views of one texture share texels? The same mip, intersecting array-slice ranges and
  * intersecting W-slice ranges (a 2D view has plane 0 and its slices in slice/layers, a 3D view slice 0 and its planes in plane/layers;
  * layers 0 counts as 1). Conservative: anything not provably disjoint overlaps. */
-static int mad_rtvp_overlap(const struct mad_rtvp *a, const struct mad_rtvp *b) {
+static int mad_rtvp_overlap_r(const struct mad_resource *r, const struct mad_rtvp *a, const struct mad_rtvp *b) {
     UINT al = a->layers ? a->layers : 1, bl = b->layers ? b->layers : 1;
-    return a->level == b->level && a->slice < b->slice + bl && b->slice < a->slice + al && a->plane < b->plane + bl && b->plane < a->plane + al;
+    return a->level == b->level && a->slice < b->slice + bl && b->slice < a->slice + al &&
+           ((r && r->is_depth) || (a->plane < b->plane + bl && b->plane < a->plane + al));
 }
 static int g_clear_defer_views = -1;
 static int mad_clear_defer_views_on(void) {
@@ -4446,7 +4463,7 @@ static int mad_clear_defer_views_on(void) {
 }
 static int exec_pending_index(struct mad_exec *e, struct mad_resource *r, const struct mad_rtvp *v) {
     unsigned i;
-    for (i = 0; i < e->npend; i++) if (e->pend[i].res == r && mad_rtvp_eq(&e->pend[i].v, v)) return (int)i;
+    for (i = 0; i < e->npend; i++) if (e->pend[i].res == r && mad_rtvp_eq_r(r, &e->pend[i].v, v)) return (int)i;
     return -1;
 }
 /* ml925: one attachment of a pass: mip level, array slice or 3D plane. */
@@ -4610,13 +4627,32 @@ static int mad_clear_carry_on(void) {
     return g_clear_carry;
 }
 static void exec_flush_clear(struct mad_exec *e, int i);
+static void exec_flush_clears_batch(struct mad_exec *e, unsigned mask);
+/* madeira-m5 0.1.729: 1 when a barrier command ONLY mentions r through BEGIN_ONLY or pure ->RT/DSW transitions (does not read or define texels). */
+static int mad_barrier_soft_for(const struct mad_cmd *c, const struct mad_resource *r) {
+    unsigned j;
+    int seen = 0;
+    if (c->kind != MC_BARRIER || c->u.barrier.all_tex) return 0;
+    for (j = 0; j < c->u.barrier.n && j < MAD_BAR_MAX; j++) {
+        if (c->u.barrier.res[j] == r) {
+            seen = 1;
+            if (!(c->u.barrier.cls[j] & (BCF_BEGIN_ONLY | BCF_TO_RT_DSW))) return 0;
+        }
+    }
+    return seen;
+}
 /* The pending clears of resources c names go first (a barrier, copy or fill). */
 static void exec_flush_named(struct mad_exec *e, const struct mad_cmd *c) {
-    unsigned k;
+    unsigned k, mask = 0;
     const int why = c->kind != MC_BARRIER ? TRF_NAMED_COPY : c->u.barrier.all_tex ? TRF_NAMED_BARRIER_ALL : TRF_NAMED_BARRIER;   /* 0.1.718 [perf] */
-    for (k = 0; k < e->npend; )
-        if (mad_cmd_names(c, e->pend[k].res)) { InterlockedIncrement(&g_tr_def_flushed); InterlockedIncrement(&g_tr_def_why[why]); exec_flush_clear(e, (int)k); }
-        else k++;
+    for (k = 0; k < e->npend && k < 16; k++) {
+        if (!mad_cmd_names(c, e->pend[k].res)) continue;
+        if (mad_barrier_soft_for(c, e->pend[k].res)) continue;   /* 0.1.729: BEGIN_ONLY / ->RT/DSW leaves clear pending for the upcoming pass */
+        InterlockedIncrement(&g_tr_def_flushed);
+        InterlockedIncrement(&g_tr_def_why[why]);
+        mask |= (1u << k);
+    }
+    if (mask) exec_flush_clears_batch(e, mask);
 }
 /* A clear of r through view v comes: a pending clear of r through another view
  * goes first (two views of one texture may overlap, and the later clear must
@@ -4625,7 +4661,7 @@ static void exec_flush_other_views(struct mad_exec *e, const struct mad_resource
     unsigned k;
     const int views = mad_clear_defer_views_on();   /* madeira-m5 0.1.718: only an OVERLAPPING other view goes first; disjoint views may both stay pending */
     for (k = 0; k < e->npend; )
-        if (e->pend[k].res == r && !mad_rtvp_eq(&e->pend[k].v, v) && (!views || mad_rtvp_overlap(&e->pend[k].v, v))) {
+        if (e->pend[k].res == r && !mad_rtvp_eq_r(r, &e->pend[k].v, v) && (!views || mad_rtvp_overlap_r(r, &e->pend[k].v, v))) {
             InterlockedIncrement(&g_tr_def_flushed); InterlockedIncrement(&g_tr_def_why[TRF_OTHER_VIEW_CLEAR]); exec_flush_clear(e, (int)k);
         } else k++;
 }
@@ -4649,12 +4685,16 @@ static void exec_flush_other_views(struct mad_exec *e, const struct mad_resource
  * contents again). */
 static int mad_rp_discard_on(void) {
     if (g_rp_discard < 0) {
-        long long v = mad_cfg_int_pe("rp-discard", 0);   /* 0 (default): off; 1: no render-pass load after, and no store before, a whole DiscardResource; 2 (0.1.718): measure only, the load and store lookahead and the discard-fate counters run and Metal's load and store actions stay as they are; 3 (0.1.728): load elision only (DontCare load after whole DiscardResource, skipping WMTStoreActionUnknown and op 24 flushes) */
-        g_rp_discard = v <= 0 ? 0 : v >= 3 ? 3 : (int)v;
+        long long v = mad_cfg_int_pe("rp-discard", 0);   /* 0 (default): off; 1: no render-pass load after, and no store before, a whole DiscardResource; 2 (0.1.718): measure only; 3 (0.1.728): load elision only (zero op 24 flushes); 4 (0.1.729): load elision + upgraded dead-store census (aliasing/COMMON/BEGIN_ONLY/DSV RO); 5 (0.1.729): load elision + active upgraded store elision via zero-flush op 24 */
+        g_rp_discard = v <= 0 ? 0 : v >= 5 ? 5 : (int)v;
         if (g_rp_discard) d3d12_log("[madeira-d3d12] rp-discard = %d: %s\n", g_rp_discard, g_rp_discard == 2
                                     ? "measure only: the discard-fate and moot-store counters run, loads and stores are unchanged ([perf] rp-discard fates)"
                                     : g_rp_discard == 3
                                     ? "load elision only: no render-pass load after a whole DiscardResource (stores stay Store, zero op 24 flushes)"
+                                    : g_rp_discard == 4
+                                    ? "load elision + upgraded dead-store census (stores stay Store, upgraded aliasing/COMMON/DSV-RO lookahead measured)"
+                                    : g_rp_discard == 5
+                                    ? "load elision + active upgraded store elision (aliasing/COMMON/DSV-RO lookahead, zero extra op 24 flushes)"
                                     : "no render-pass load after, and no store before, a whole DiscardResource");
     }
     return g_rp_discard;
@@ -4674,8 +4714,9 @@ static void exec_disc_touch(struct mad_exec *e, const struct mad_cmd *c) {
      * copy or fill naming the texture */
     const int why = c->kind == MC_CLEAR_RT || c->kind == MC_CLEAR_DS ? RPD_CLEARED : c->kind == MC_BARRIER && c->u.barrier.all_tex ? RPD_ALL_BARRIER : RPD_NAMED;
     for (k = 0; k < e->rp_ndisc; )
-        if (mad_cmd_names(c, e->rp_disc[k])) { InterlockedIncrement(&g_rpd_fate[why]); e->rp_disc[k] = e->rp_disc[--e->rp_ndisc]; }
-        else k++;
+        if (mad_cmd_names(c, e->rp_disc[k]) && !mad_barrier_soft_for(c, e->rp_disc[k])) {   /* 0.1.729: retain discard across BEGIN_ONLY / ->RT/DSW barriers */
+            InterlockedIncrement(&g_rpd_fate[why]); e->rp_disc[k] = e->rp_disc[--e->rp_ndisc];
+        } else k++;
 }
 static void exec_discard(struct mad_exec *e, const struct mad_cmd *c) {
     struct mad_resource *r = c->u.discard.res;
@@ -4723,6 +4764,7 @@ static volatile LONG g_rp_dset_full;
 static unsigned mad_rp_dset_slot(const struct mad_resource *r) { return (unsigned)((((UINT64)(ULONG_PTR)r >> 4) * 0x9E3779B97F4A7C15ull) >> 54); }
 static void mad_rp_dset_add(struct mad_resource *r) {
     unsigned h = mad_rp_dset_slot(r), k;
+    __atomic_fetch_or(&r->x64_flags, MAD_X64L_RES_IN_DSET, __ATOMIC_RELEASE);   /* 0.1.729 Phase E: DiscardResource leaf fast path */
     for (k = 0; k < 8; k++, h = (h + 1) & 1023) {
         struct mad_resource *cur = g_rp_dset[h];
         if (cur == r) return;
@@ -4753,10 +4795,12 @@ static int mad_rp_late_ok(void) {
     }
     return g_rp_late;
 }
+static int mad_res_aliases(const struct mad_resource *a, const struct mad_resource *b);
 static int exec_rp_late_want(const struct mad_exec *e) {
     UINT i;
-    for (i = 0; i < e->nrt; i++) if (e->rt[i] && e->rt[i]->texture && mad_rp_dset_has(e->rt[i])) return 1;
-    return e->depth && e->depth->texture && mad_rp_dset_has(e->depth);
+    const int ext = mad_rp_discard_on() >= 4;
+    for (i = 0; i < e->nrt; i++) if (e->rt[i] && e->rt[i]->texture && (mad_rp_dset_has(e->rt[i]) || (ext && e->rt[i]->placed_heap))) return 1;
+    return e->depth && e->depth->texture && (mad_rp_dset_has(e->depth) || (ext && e->depth->placed_heap));
 }
 /* List i of the call being replayed, if the replay takes it (mad_rp_next's test). */
 static const struct mad_list *mad_rp_list_at(const struct mad_queue *q, UINT i) {
@@ -4771,15 +4815,22 @@ static const struct mad_list *mad_rp_list_at(const struct mad_queue *q, UINT i) 
  * last draw: 1 = a whole discard, or a whole clear of this view covering the
  * aspect (0 colour, 1 depth, 2 stencil), so the store is moot; 0 = a draw
  * while it is bound (a pass loads it), a barrier, copy or partial discard or
- * clear naming it, the end of the call, or 8192 commands. */
+ * clear naming it, the end of the call, or 8192 commands.
+ * madeira-m5 0.1.729 (rp-discard >= 4): also scans past BEGIN_ONLY, safe ->COMMON (no draw/dispatch/copy before discard/clear),
+ * and placed-heap AliasingBarrier(r, r_after) when r_after is immediately whole-discarded/cleared; guards DSV READ_ONLY flags. */
 static int exec_rp_dead(const struct mad_exec *e, const struct mad_resource *r, const struct mad_rtvp *v, int aspect) {
     const struct mad_queue *q = e->q;
     const struct mad_list *l = e->l;
+    const int ext = mad_rp_discard_on() >= 4;
     unsigned j = e->rp_from, n = 0, li = q->rp_idx, k;
     int bound = 1;   /* the pass's targets stay bound until an OMSetRenderTargets says otherwise */
+    int common_seen = 0;
+    const struct mad_resource *alias_watch = NULL;
     /* madeira-m5 0.1.718: a texture created ALLOW_SIMULTANEOUS_ACCESS may be read (as an SRV) with no barrier after it was a render target,
      * so no barrier would stop this scan at its consumption: its store is never dropped */
     if (r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) return 0;
+    /* 0.1.729: never elide store on a read-only DSV aspect (v->plane holds D3D12_DSV_FLAGS bits 0..1) */
+    if (ext && ((aspect == 1 && (v->plane & 1u)) || (aspect == 2 && (v->plane & 2u)))) return 0;
     while (l) {
         for (; j < l->ncmds; j++) {
             const struct mad_cmd *c = &l->cmds[j];
@@ -4790,17 +4841,55 @@ static int exec_rp_dead(const struct mad_exec *e, const struct mad_resource *r, 
                 for (k = 0; k < c->u.rts.n && k < 8; k++) if (c->u.rts.rt[k] == r) bound = 1;
                 break;
             case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT:
-                if (bound) return 0;   /* a pass loads it */
+                if (bound || common_seen || alias_watch) return 0;   /* a pass loads it (or implicit COMMON/alias promotion) */
+                break;
+            case MC_DISPATCH: case MC_DISPATCH_INDIRECT:
+                if (common_seen || alias_watch) return 0;
                 break;
             case MC_DISCARD:
                 if (c->u.discard.res == r) return c->u.discard.whole != 0;
+                if (alias_watch && c->u.discard.res == alias_watch && c->u.discard.whole) return 1;
                 break;
             case MC_CLEAR_RT: case MC_CLEAR_DS:
+                if (alias_watch && c->u.clear.res == alias_watch && !c->u.clear.nrect) return 1;
                 if (c->u.clear.res != r) break;
-                if (c->u.clear.nrect || !mad_rtvp_eq(&c->u.clear.v, v)) return 0;
+                if (c->u.clear.nrect || !mad_rtvp_eq_r(r, &c->u.clear.v, v)) return 0;
                 if (!aspect) return c->kind == MC_CLEAR_RT;
                 return c->kind == MC_CLEAR_DS && (c->u.clear.flags & (aspect == 1 ? D3D12_CLEAR_FLAG_DEPTH : D3D12_CLEAR_FLAG_STENCIL)) != 0;
+            case MC_BARRIER:
+                if (ext && !c->u.barrier.all_tex) {
+                    int touched = 0, abort_bar = 0;
+                    for (k = 0; k < c->u.barrier.n && k < MAD_BAR_MAX; k++) {
+                        const struct mad_resource *br = c->u.barrier.res[k];
+                        UINT8 bcl = c->u.barrier.cls[k];
+                        if (br == r) {
+                            touched = 1;
+                            if (bcl & (BCF_BEGIN_ONLY | BCF_TO_RT_DSW)) continue;
+                            if (bcl & BCF_TO_COMMON) { common_seen = 1; continue; }
+                            if ((bcl & BCF_ALIASING) && !(bcl & BCF_ALIAS_AFTER)) {
+                                if (k + 1 < c->u.barrier.n && (c->u.barrier.cls[k + 1] & BCF_ALIAS_AFTER) &&
+                                    c->u.barrier.res[k + 1] && mad_res_aliases(r, c->u.barrier.res[k + 1])) {
+                                    alias_watch = c->u.barrier.res[k + 1];
+                                    continue;
+                                }
+                            }
+                            abort_bar = 1;
+                        } else if (alias_watch && br == alias_watch && !(bcl & (BCF_BEGIN_ONLY | BCF_TO_RT_DSW | BCF_ALIAS_AFTER))) {
+                            abort_bar = 1;
+                        } else if (!touched && (bcl & BCF_ALIAS_AFTER) && br && mad_res_aliases(r, br)) {
+                            alias_watch = br;
+                        }
+                    }
+                    if (abort_bar) return 0;
+                    break;
+                }
+                if (mad_cmd_names(c, r)) return 0;
+                break;
             default:
+                if (common_seen || alias_watch) {
+                    if (c->kind == MC_COPY_BB || c->kind == MC_COPY_B2T || c->kind == MC_COPY_T2B || c->kind == MC_COPY_T2T || c->kind == MC_RESOLVE)
+                        return 0;
+                }
                 if (mad_cmd_names(c, r)) return 0;
                 break;
             }
@@ -4810,15 +4899,16 @@ static int exec_rp_dead(const struct mad_exec *e, const struct mad_resource *r, 
     }
     return 0;
 }
-/* madeira-m5 0.1.718 rp-discard = 2: the store side measured and nothing changed -- the bytes of the open pass's attachments that a
- * whole discard or clear makes moot before any other use (exec_rp_dead, across the lists of the call). */
+/* madeira-m5 0.1.718/0.1.729 rp-discard = 2/4: the store side measured and nothing changed -- the bytes of the open pass's attachments that a
+ * whole discard, clear, or placed-heap alias makes moot before any other use (exec_rp_dead, across the lists of the call). */
 static void exec_rp_dead_census(struct mad_exec *e) {
     LONG64 moot = 0;
     UINT i;
+    const int ext = mad_rp_discard_on() >= 4;
     for (i = 0; i < e->enc_nrt && i < 8; i++)
-        if (e->enc_rt[i] && e->enc_rt[i]->texture && mad_rp_dset_has(e->enc_rt[i]) && exec_rp_dead(e, e->enc_rt[i], &e->enc_rtp[i], 0))
+        if (e->enc_rt[i] && e->enc_rt[i]->texture && (ext || mad_rp_dset_has(e->enc_rt[i])) && exec_rp_dead(e, e->enc_rt[i], &e->enc_rtp[i], 0))
             moot += mad_tr_bytes(e->enc_rt[i], e->enc_rtp[i].level, e->enc_rtp[i].layers, 0);
-    if (e->enc_depth && e->enc_depth->texture && mad_rp_dset_has(e->enc_depth)) {
+    if (e->enc_depth && e->enc_depth->texture && (ext || mad_rp_dset_has(e->enc_depth))) {
         if (exec_rp_dead(e, e->enc_depth, &e->enc_dp, 1)) moot += mad_tr_bytes(e->enc_depth, e->enc_dp.level, e->enc_dp.layers, 0);
         if (e->enc_depth->has_stencil && exec_rp_dead(e, e->enc_depth, &e->enc_dp, 2)) moot += mad_tr_bytes(e->enc_depth, e->enc_dp.level, e->enc_dp.layers, 1);
     }
@@ -4845,7 +4935,7 @@ static void exec_rp_late_store(struct mad_exec *e) {
         }
     }
     memset(&a, 0, sizeof a); a.op = 24; a.ptr = (UINT64)(ULONG_PTR)&r; a.len = sizeof r;
-    mad_eb_flush_cur(EBF_OTHER);   /* encode-batch: the pass's queued draws reach Metal first, as before */
+    mad_eb_flush_cur(EBF_END);   /* 0.1.729: send the pass's draws once as EBF_END so MTLCommandEncoder_endEncoding emits 0 extra flush */
     MadeiraCtl(&a);
     if (!a.ret) {   /* cannot happen after a probe that answered; never use Unknown again */
         g_rp_late = 0;
@@ -4917,7 +5007,7 @@ static int mad_barrier_hits_renc(const struct mad_cmd *c, struct mad_resource *c
     if (c->u.barrier.all || c->u.barrier.all_tex) return 1;
     if (mad_barrier_names_att(c, rt, nrt, depth)) return 2;
     for (k = 0; k < c->u.barrier.n && k < MAD_BAR_MAX; k++) {
-        UINT8 cl = c->u.barrier.cls[k];
+        UINT8 cl = (UINT8)(c->u.barrier.cls[k] & BCF_CLS_MASK);
         if (cl == BC_RAW_UAV) return 3;
         if (cl == BC_ALL && (c->u.barrier.uav_mask & (1u << k)) &&
             c->u.barrier.res[k] && (c->u.barrier.res[k]->desc.Flags & 0x4u)) return 4;
@@ -4973,7 +5063,7 @@ static int mad_rp_prefix(const struct mad_list *n, struct mad_resource *const *r
         case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT:
             if (!rts || rts->u.rts.n != nrt || rts->u.rts.depth != depth) return 0;
             for (i = 0; i < nrt; i++) if (rts->u.rts.rt[i] != rt[i] || !mad_rtvp_eq(&rts->u.rts.v[i], &rtp[i])) return 0;
-            if (depth && !mad_rtvp_eq(&rts->u.rts.dv, dp)) return 0;
+            if (depth && !mad_rtvp_eq_r(depth, &rts->u.rts.dv, dp)) return 0;
             if (first >= 0) InterlockedIncrement(&g_rp_prefix_kind[first]);   /* 0.1.718 [perf]: what stood in the way */
             return plain && vp && sc && (bl || !blend) ? 2 : 1;
         case MC_RTS: rts = c; break;
@@ -5017,7 +5107,7 @@ static int f7_ts_lookahead_keeps(const struct mad_exec *e) {
         case MC_RTS:   /* the same targets keep the pass (exec_same_targets); anything else ends it before a barrier */
             if (c->u.rts.n != e->nrt || c->u.rts.depth != e->depth || (!c->u.rts.n && !c->u.rts.depth)) return 0;
             for (k = 0; k < c->u.rts.n && k < 8; k++) if (c->u.rts.rt[k] != e->rt[k] || !mad_rtvp_eq(&c->u.rts.v[k], &e->rtp[k])) return 0;
-            if (e->depth && !mad_rtvp_eq(&c->u.rts.dv, &e->dp)) return 0;
+            if (e->depth && !mad_rtvp_eq_r(e->depth, &c->u.rts.dv, &e->dp)) return 0;
             break;
         case MC_DISPATCH: case MC_DISPATCH_INDIRECT: case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T:
         case MC_FILL_BB: case MC_FILL_TEX: case MC_WBI: case MC_RESOLVE:
@@ -5052,7 +5142,7 @@ static const struct mad_cmd *rp_presync_barrier_from(const struct mad_exec *e, u
         case MC_RTS:   /* the same targets keep the pass (exec_same_targets); anything else ends it before a barrier */
             if (c->u.rts.n != e->nrt || c->u.rts.depth != e->depth || (!c->u.rts.n && !c->u.rts.depth)) return NULL;
             for (k = 0; k < c->u.rts.n && k < 8; k++) if (c->u.rts.rt[k] != e->rt[k] || !mad_rtvp_eq(&c->u.rts.v[k], &e->rtp[k])) return NULL;
-            if (e->depth && !mad_rtvp_eq(&c->u.rts.dv, &e->dp)) return NULL;
+            if (e->depth && !mad_rtvp_eq_r(e->depth, &c->u.rts.dv, &e->dp)) return NULL;
             break;
         case MC_DISPATCH: case MC_DISPATCH_INDIRECT: case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T:
         case MC_FILL_BB: case MC_FILL_TEX: case MC_WBI: case MC_RESOLVE:
@@ -5186,10 +5276,12 @@ static void mad_tr_report(double np) {
                   InterlockedExchange(&g_tr_cc_named, 0) / np, InterlockedExchange(&g_tr_cc_end, 0) / np);
         d3d12_log("[perf] rp-discard fates per frame (rp-discard %d): whole discards -> loaded by the next pass that bound them %.1f (%s%.1f MB), cleared before any use %.1f, "
                   "forgotten by a barrier naming everything %.1f, by a barrier or copy naming them %.1f, lost at the end of the call %.1f, carried into the next list %.1f, "
-                  "inside their own pass %.1f, past the 16-entry cap %.1f, kept loading (ALLOW_SIMULTANEOUS_ACCESS) %.1f; stores a later whole discard or clear made moot %.1f MB%s\n",
-                  g_rp_discard, f[RPD_LOADED] / np, (g_rp_discard == 1 || g_rp_discard == 3) ? "not read: " : "would not read: ", dl / mb / np, f[RPD_CLEARED] / np,
+                  "inside their own pass %.1f, past the 16-entry cap %.1f, kept loading (ALLOW_SIMULTANEOUS_ACCESS) %.1f; stores a later whole discard or clear made moot %.1f MB%s; "
+                  "0.1.729: clear-rects promoted %.1f, clear-only passes saved by batching %.1f\n",
+                  g_rp_discard, f[RPD_LOADED] / np, (g_rp_discard == 1 || g_rp_discard >= 3) ? "not read: " : "would not read: ", dl / mb / np, f[RPD_CLEARED] / np,
                   f[RPD_ALL_BARRIER] / np, f[RPD_NAMED] / np, f[RPD_LIST_END] / np, f[RPD_CARRIED] / np, f[RPD_OWN_PASS] / np, f[RPD_CAP] / np, f[RPD_SIMUL] / np,
-                  mt / mb / np, g_rp_discard == 1 ? " (not stored)" : g_rp_discard == 2 ? " (measured, stored)" : g_rp_discard == 3 ? " (load-only)" : "");
+                  mt / mb / np, (g_rp_discard == 1 || g_rp_discard == 5) ? " (not stored)" : (g_rp_discard == 2 || g_rp_discard == 4) ? " (measured, stored)" : g_rp_discard == 3 ? " (load-only)" : "",
+                  InterlockedExchange(&g_rpd_clr_prom, 0) / np, InterlockedExchange(&g_tr_clear_batched, 0) / np);
         o += snprintf(line + o, sizeof line - o, "[perf] rp-carry per frame, the command in the way (rp-carry-barrier %d): next list's prefix:", g_rp_carry_barrier > 0);
         for (k = 0; k < RPK_N && o < (int)sizeof line - 80; k++) { LONG v = InterlockedExchange(&g_rp_prefix_kind[k], 0); if (v) { o += snprintf(line + o, sizeof line - o, " %s %.1f", g_ck_names[k], v / np); any = 1; } }
         if (!any) o += snprintf(line + o, sizeof line - o, " none");
@@ -5230,9 +5322,102 @@ static void mad_rp_close(struct mad_queue *q) {
     e->pass_draws = 0;   /* no list: no capture of it */
     exec_end(e);
     e->cc_flush_end = 1;   /* 0.1.719 */
-    while (e->npend) exec_flush_clear(e, 0);
+    if (e->npend) exec_flush_clears_batch(e, (1u << e->npend) - 1u);
     mad_exec_publish(e);   /* madeira-m5 0.1.718 */
     ReleaseSRWLockExclusive(&g_rp_close_lock);
+}
+
+/* madeira-m5 0.1.729: batch compatible pending clears (matching mip dimensions, sample count, array layers; distinct
+ * textures; up to 8 colors + 1 depth-stencil) into a single multi-attachment Metal clear pass + one fence pair. */
+static void exec_flush_clears_batch(struct mad_exec *e, unsigned mask) {
+    __typeof__(e->pend[0]) picked[16];
+    unsigned np = 0, k;
+    for (k = 0; k < e->npend && k < 16; k++) if (mask & (1u << k)) picked[np++] = e->pend[k];
+    if (!np) return;
+    {   /* remove picked entries from e->pend in one compacted pass */
+        unsigned w = 0;
+        for (k = 0; k < e->npend && k < 16; k++) if (!(mask & (1u << k))) e->pend[w++] = e->pend[k];
+        e->npend = w;
+    }
+    while (np) {
+        struct WMTRenderPassInfo rpi;
+        struct mad_resource *crt[8]; struct mad_rtvp crv[8];
+        struct mad_resource *dres = NULL; struct mad_rtvp dv = { 0, 0, 1, 0 };
+        unsigned nrt = 0, used = 0, rw = 0, rh = 0, rsamp = 1, rlay = 1, natt = 0, w;
+        obj_handle_t enc;
+        memset(&rpi, 0, sizeof rpi);
+        for (k = 0; k < np; k++) {
+            __typeof__(e->pend[0]) *p = &picked[k];
+            unsigned pw, ph, ps, pl, j;
+            if (!p->res || !p->res->texture) { used |= (1u << k); continue; }
+            pw = p->res->width >> p->v.level; if (!pw) pw = 1;
+            ph = p->res->height >> p->v.level; if (!ph) ph = 1;
+            ps = p->res->samples ? p->res->samples : 1;
+            pl = p->v.layers > 1 ? p->v.layers : 1;
+            if (nrt || dres) {
+                if (pw != rw || ph != rh || ps != rsamp || pl != rlay) continue;
+                if (p->is_depth) { if (dres) continue; }
+                else {
+                    if (nrt >= 8) continue;
+                    for (j = 0; j < nrt; j++) if (crt[j] == p->res) break;
+                    if (j < nrt) continue;
+                }
+                if (dres && dres == p->res) continue;
+                for (j = 0; j < nrt; j++) if (crt[j] == p->res) break;
+                if (j < nrt) continue;
+            } else { rw = pw; rh = ph; rsamp = ps; rlay = pl; }
+            if (p->carried) InterlockedIncrement(e->cc_flush_end ? &g_tr_cc_end : &g_tr_cc_named);
+            if (p->is_depth) {
+                UINT8 cf = p->flags;
+                dres = p->res; dv = p->v;
+                rpi.depth.texture = p->res->texture;
+                rpi.depth.level = p->v.level; rpi.depth.slice = p->v.slice;
+                rpi.stencil.level = p->v.level; rpi.stencil.slice = p->v.slice;
+                rpi.depth.load_action = (cf & D3D12_CLEAR_FLAG_DEPTH) ? WMTLoadActionClear : WMTLoadActionLoad;
+                rpi.depth.store_action = WMTStoreActionStore;
+                rpi.depth.clear_depth = p->depth;
+                if (p->res->has_stencil) {
+                    rpi.stencil.texture = p->res->texture;
+                    rpi.stencil.load_action = (cf & D3D12_CLEAR_FLAG_STENCIL) ? WMTLoadActionClear : WMTLoadActionLoad;
+                    rpi.stencil.store_action = WMTStoreActionStore;
+                    rpi.stencil.clear_stencil = p->stencil;
+                }
+            } else {
+                crt[nrt] = p->res; crv[nrt] = p->v;
+                rpi.colors[nrt].texture = p->res->texture;
+                mad_attach_view(&rpi.colors[nrt], p->res, &p->v);
+                rpi.colors[nrt].load_action = WMTLoadActionClear;
+                rpi.colors[nrt].store_action = WMTStoreActionStore;
+                rpi.colors[nrt].clear_color.r = p->rgba[0]; rpi.colors[nrt].clear_color.g = p->rgba[1];
+                rpi.colors[nrt].clear_color.b = p->rgba[2]; rpi.colors[nrt].clear_color.a = p->rgba[3];
+                nrt++;
+            }
+            used |= (1u << k);
+            natt++;
+        }
+        w = 0;
+        for (k = 0; k < np; k++) if (!(used & (1u << k))) picked[w++] = picked[k];
+        np = w;
+        if (!natt) continue;
+        if (natt > 1) InterlockedExchangeAdd(&g_tr_clear_batched, (LONG)(natt - 1));
+        if (e->renc) InterlockedIncrement(&g_pass_end_clear);
+        InterlockedIncrement(&g_pass_clear_only);
+        exec_end(e);
+        if (rlay > 1) rpi.render_target_array_length = rlay;
+        rpi.render_target_width = rw; rpi.render_target_height = rh;
+        rpi.default_raster_sample_count = rsamp;
+        enc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (enc) g_enc_seq++;
+        if (enc) {
+            InterlockedIncrement(&g_tr_clear_only);
+            mad_tr_pass(&rpi, nrt ? crt : NULL, nrt ? crv : NULL, nrt, dres, dres ? &dv : NULL);
+        }
+        e->f6_natt = 0;
+        for (k = 0; k < nrt && e->f6_natt < 9; k++) e->f6_att[e->f6_natt++] = crt[k];
+        if (dres && e->f6_natt < 9) e->f6_att[e->f6_natt++] = dres;
+        if (enc) { exec_fence_render(e, enc, 0); exec_fence_render(e, enc, 1); }
+        e->f6_natt = 0;
+        if (enc) MTLCommandEncoder_endEncoding(enc);
+    }
 }
 
 /* A clear whose target is not part of the next pass still has to happen: it
@@ -5342,7 +5527,7 @@ static int exec_same_targets(struct mad_exec *e) {
         if (w != e->enc_w || h != e->enc_h) return 0;
     }
     for (i = 0; i < e->nrt; i++) if (e->enc_rt[i] != e->rt[i] || !mad_rtvp_eq(&e->enc_rtp[i], &e->rtp[i])) return 0;
-    if (e->depth && !mad_rtvp_eq(&e->enc_dp, &e->dp)) return 0;
+    if (e->depth && !mad_rtvp_eq_r(e->depth, &e->enc_dp, &e->dp)) return 0;
     return 1;
 }
 
@@ -5949,10 +6134,10 @@ static int exec_begin_render(struct mad_exec *e) {
      * one of a texture this pass binds through another view still goes first
      * (the views may overlap). */
     for (k = 0; k < e->npend; ) {
-        int bound = (e->pend[k].res == e->depth && mad_rtvp_eq(&e->pend[k].v, &e->dp)), here = e->pend[k].res == e->depth, ov = 0;
-        if (here && !bound) ov = mad_rtvp_overlap(&e->pend[k].v, &e->dp);
+        int bound = (e->pend[k].res == e->depth && mad_rtvp_eq_r(e->depth, &e->pend[k].v, &e->dp)), here = e->pend[k].res == e->depth, ov = 0;
+        if (here && !bound) ov = mad_rtvp_overlap_r(e->depth, &e->pend[k].v, &e->dp);
         for (i = 0; i < e->nrt && !bound; i++)
-            if (e->rt[i] == e->pend[k].res) { here = 1; if (mad_rtvp_eq(&e->pend[k].v, &e->rtp[i])) bound = 1; else if (mad_rtvp_overlap(&e->pend[k].v, &e->rtp[i])) ov = 1; }
+            if (e->rt[i] == e->pend[k].res) { here = 1; if (mad_rtvp_eq_r(e->rt[i], &e->pend[k].v, &e->rtp[i])) bound = 1; else if (mad_rtvp_overlap_r(e->rt[i], &e->pend[k].v, &e->rtp[i])) ov = 1; }
         if (bound || (!here && mad_clear_defer_on())) { k++; continue; }   /* this pass's Clear load action, or a later pass's */
         if (here && mad_clear_defer_on() && mad_clear_defer_views_on() && !ov) { k++; continue; }   /* madeira-m5 0.1.718 clear-defer-views: a disjoint view of the texture: the clear waits for its own */
         if (here && mad_clear_defer_on()) { InterlockedIncrement(&g_tr_def_flushed); InterlockedIncrement(&g_tr_def_why[TRF_OTHER_VIEW_BIND]); }
@@ -5998,9 +6183,9 @@ static int exec_begin_render(struct mad_exec *e) {
         if (!w) { w = e->depth->width >> e->dp.level; h = e->depth->height >> e->dp.level; }
     }
     if (e->rp_ndisc) {   /* madeira-bcd rp-discard: what a whole DiscardResource left undefined need not be loaded */
-        /* madeira-m5 0.1.718/0.1.728: rp-discard = 1 or 3 changes the load (2 measures; 3 skips late stores); a texture created ALLOW_SIMULTANEOUS_ACCESS keeps loading,
+        /* madeira-m5 0.1.718/0.1.728/0.1.729: rp-discard = 1, 3, 4 or 5 changes the load (2 measures only); a texture created ALLOW_SIMULTANEOUS_ACCESS keeps loading,
          * since nothing proves it was not written through a barrier-less path since the discard; every consumed discard is counted by fate */
-        int on = mad_rp_discard_on() == 1 || mad_rp_discard_on() == 3;
+        int on = mad_rp_discard_on() == 1 || mad_rp_discard_on() >= 3;
         for (i = 0; i < e->nrt; i++)
             if (e->rt[i] && rpi.colors[i].texture && exec_disc_find(e, e->rt[i]) >= 0) {
                 if (rpi.colors[i].load_action != WMTLoadActionLoad) { InterlockedIncrement(&g_rpd_fate[RPD_CLEARED]); continue; }
@@ -6025,7 +6210,7 @@ static int exec_begin_render(struct mad_exec *e) {
         if (e->depth) exec_disc_forget(e, e->depth);
     }
     e->rp_late = 0;   /* madeira-bcd rp-discard: a texture the game discards: the store is decided when the pass ends */
-    if (mad_rp_discard_on() == 1 && !g_capture_on && exec_rp_late_want(e) && mad_rp_late_ok()) {   /* 0.1.718: mode 2 measures at exec_end instead */
+    if ((mad_rp_discard_on() == 1 || mad_rp_discard_on() == 5) && !g_capture_on && exec_rp_late_want(e) && mad_rp_late_ok()) {   /* 0.1.718/0.1.729: mode 2/4 measure at exec_end instead */
         for (i = 0; i < e->nrt; i++) if (rpi.colors[i].texture) rpi.colors[i].store_action = WMTStoreActionUnknown;
         if (rpi.depth.texture) rpi.depth.store_action = WMTStoreActionUnknown;
         if (rpi.stencil.texture) rpi.stencil.store_action = WMTStoreActionUnknown;
@@ -7245,7 +7430,8 @@ static int mad_kernels_ready(struct mad_device *d) {
             if (err) mad_log_nserror("mad_probe_words", err);
             NSObject_release(fn);
         }
-        memset(&bi, 0, sizeof bi); bi.length = MAD_KRING_BYTES; bi.options = WMTResourceStorageModeShared;
+        memset(&bi, 0, sizeof bi); bi.length = MAD_KRING_BYTES;
+        bi.options = WMTResourceStorageModeShared | (mad_res_untracked_on(d) ? WMTResourceHazardTrackingModeUntracked : 0);
         if (d->k_tind_pso) d->k_ring = MTLDevice_newBuffer(d->mtl_device, &bi);
         if (d->k_ring) { mad_resident(d, d->k_ring); d->k_ring_cpu = (unsigned char *)bi.memory.ptr; }
         d->k_state = d->k_tind_pso && d->k_ring ? 1 : -1;
@@ -7606,11 +7792,13 @@ static obj_handle_t mad_cpso_realize(struct mad_pso *p) {
     AcquireSRWLockExclusive(&p->rlock);
     if (!p->cps && p->lazy_cs) {
         struct WMTComputePipelineInfo ci; obj_handle_t err = 0;
+        LONG64 t0 = mad_qpc();
         memset(&ci, 0, sizeof ci);
         if (!p->lz || mad_lzlib_restore(p)) {   /* madeira-bcd pso-lazy-libs */
             ci.compute_function = p->vs_fn;
             p->cps = MTLDevice_newComputePipelineState(p->device_handle, &ci, &err);
         }
+        InterlockedExchangeAdd64(&g_pt_realize, mad_qpc() - t0); InterlockedIncrement(&g_pn_realize);
         if (err) mad_log_nserror("compute pipeline", err);
         if (!p->cps) {
             LONG n = InterlockedIncrement(&g_pso_lazy_failed);
@@ -7623,30 +7811,23 @@ static obj_handle_t mad_cpso_realize(struct mad_pso *p) {
 }
 
 /* madeira-bcd: PIPELINES BUILT OFF THE RENDER THREAD (bcd.cfg / a game's config
- * pso-async, opt-in, default 0; upstream Madeira #516). A lazy pipeline Metal has not compiled before takes 35-50 ms at its first
- * draw, on the thread that submits the frame: a scene that brings in dozens of
- * new materials at once (a new district, a cutscene) holds that thread for
- * hundreds of milliseconds and the frame rate drops to 3-10 for seconds (log
- * 2026-10-26 22:40: 252 such builds, 12.3 s of the submitting thread, in under
- * two minutes, while pso-warm had 4,989 pipelines still to compile). With
- * pso-async = 1 the first draw hands the pipeline to two background threads and
- * its draws are skipped until it is built: an object or effect shows up a few
- * frames late instead of the frame waiting for the compiler. Only plain render
- * pipelines go this way; a compute dispatch can produce data later passes depend
- * on, so a compute pipeline is still built where it is first used. A queue that
- * is full builds at the first draw as before. 0 = at the first draw (as before). */
+ * pso-async, opt-in, default 0; upstream Madeira #516).
+ * madeira-m5 0.1.729: also builds uncached vertex-stride variants asynchronously on the same pool so
+ * outdoor stride-variant misses (~30 per session in HFW) never stall D3D12SubmitDirect either. */
 #define MAD_PA_MAX 2048
 static int g_pso_async = -1;
-static struct mad_pso *g_pa_q[MAD_PA_MAX];
+struct mad_pa_item { struct mad_pso *p; int is_var; UINT strides[16]; };
+static struct mad_pa_item g_pa_q[MAD_PA_MAX];
 static LONG g_pa_head, g_pa_tail;
 static SRWLOCK g_pa_lock = SRWLOCK_INIT;
 static HANDLE g_pa_sem;
 static volatile LONG g_pa_queued, g_pa_built, g_pa_failed, g_pa_inline, g_pa_skips;
 static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T);
+static obj_handle_t mad_pso_var_build(struct mad_pso *p, const UINT strides[16], int *uncached);
 static int mad_pso_async_on(void) {
     if (g_pso_async < 0) {
         int on = mad_pso_lazy_on() && mad_cfg_int_pe("pso-async", 0) > 0;   /* bcd.cfg pso-async: 1 = a new render pipeline is built on a background thread and its draws are skipped until it is ready (no frame waits for the compiler); 0 = built at its first draw */
-        if (on) d3d12_log("[madeira-d3d12] pso-async = 1: new render pipelines are built on 2 background threads; their draws are skipped until they are ready\n");
+        if (on) d3d12_log("[madeira-d3d12] pso-async = 1: new render pipelines and stride variants are built on 2 background threads; their draws are skipped until they are ready\n");
         g_pso_async = on;
     }
     return g_pso_async;
@@ -7655,21 +7836,30 @@ static DWORD WINAPI mad_pa_worker(void *arg) {
     (void)arg;
     mad_name_thread(L"D3D12PsoAsync");   /* madeira-m5 0.1.728 */
     for (;;) {
-        struct mad_pso *p = NULL; obj_handle_t pool; LONG n = 0;
+        struct mad_pa_item it; obj_handle_t pool; LONG n = 0;
+        memset(&it, 0, sizeof it);
         WaitForSingleObject(g_pa_sem, INFINITE);
         AcquireSRWLockExclusive(&g_pa_lock);
-        if (g_pa_head != g_pa_tail) { p = g_pa_q[(ULONG)g_pa_head % MAD_PA_MAX]; g_pa_head++; }
+        if (g_pa_head != g_pa_tail) { it = g_pa_q[(ULONG)g_pa_head % MAD_PA_MAX]; g_pa_head++; }
         ReleaseSRWLockExclusive(&g_pa_lock);
-        if (!p) continue;
+        if (!it.p) continue;
         pool = NSAutoreleasePool_alloc_init();
-        if (mad_pso_realize(p)) n = InterlockedIncrement(&g_pa_built);
-        else InterlockedIncrement(&g_pa_failed);
+        if (it.is_var) {
+            int uncached = 0;
+            obj_handle_t vrps = mad_pso_var_build(it.p, it.strides, &uncached);
+            if (uncached && vrps) NSObject_release(vrps);
+            if (vrps) n = InterlockedIncrement(&g_pa_built);
+            else InterlockedIncrement(&g_pa_failed);
+        } else {
+            if (mad_pso_realize(it.p)) n = InterlockedIncrement(&g_pa_built);
+            else InterlockedIncrement(&g_pa_failed);
+        }
         if (n == 1 || (n && !(n % 250)))
             d3d12_log("[madeira-d3d12] pso-async: %ld pipelines built off the render thread (%ld failed, %ld waiting, %ld built at the draw with the queue full); "
                       "%ld draws skipped while their pipeline was being built\n", (long)g_pa_built, (long)g_pa_failed,
                       (long)(g_pa_queued - g_pa_built - g_pa_failed), (long)g_pa_inline, (long)g_pa_skips);
         if (pool) NSObject_release(pool);
-        pso_Release((ID3D12PipelineState *)p);   /* the queue's reference */
+        pso_Release((ID3D12PipelineState *)it.p);   /* the queue's reference */
     }
     return 0;
 }
@@ -7703,11 +7893,35 @@ static int mad_pso_async_queue(struct mad_pso *p) {
         return 0;
     }
     InterlockedIncrement(&p->refs);   /* the worker releases it once the pipeline is built */
-    g_pa_q[(ULONG)g_pa_tail % MAD_PA_MAX] = p; g_pa_tail++;
+    g_pa_q[(ULONG)g_pa_tail % MAD_PA_MAX].p = p;
+    g_pa_q[(ULONG)g_pa_tail % MAD_PA_MAX].is_var = 0;
+    g_pa_tail++;
     ReleaseSRWLockExclusive(&g_pa_lock);
     ReleaseSemaphore(g_pa_sem, 1, NULL);
     if (InterlockedIncrement(&g_pa_queued) == 1)
         d3d12_log("[madeira-d3d12] pso-async: first pipeline handed to the background builders\n");
+    return 1;
+}
+/* madeira-m5 0.1.729: enqueue a vertex-stride variant onto D3D12PsoAsync (called with p->var_lock held). 1 = queued/already queued. */
+static int mad_pso_var_async_queue_locked(struct mad_pso *p, const UINT strides[16]) {
+    unsigned k;
+    for (k = 0; k < p->nvar_q; k++) if (!memcmp(p->var_q[k], strides, 16 * sizeof(UINT))) return 1;   /* already queued */
+    if (p->nvar_q >= 16 || !mad_pa_start()) return 0;
+    AcquireSRWLockExclusive(&g_pa_lock);
+    if (g_pa_tail - g_pa_head >= MAD_PA_MAX) {
+        ReleaseSRWLockExclusive(&g_pa_lock);
+        InterlockedIncrement(&g_pa_inline);
+        return 0;
+    }
+    memcpy(p->var_q[p->nvar_q++], strides, 16 * sizeof(UINT));
+    InterlockedIncrement(&p->refs);
+    g_pa_q[(ULONG)g_pa_tail % MAD_PA_MAX].p = p;
+    g_pa_q[(ULONG)g_pa_tail % MAD_PA_MAX].is_var = 1;
+    memcpy(g_pa_q[(ULONG)g_pa_tail % MAD_PA_MAX].strides, strides, 16 * sizeof(UINT));
+    g_pa_tail++;
+    ReleaseSRWLockExclusive(&g_pa_lock);
+    ReleaseSemaphore(g_pa_sem, 1, NULL);
+    InterlockedIncrement(&g_pa_queued);
     return 1;
 }
 
@@ -7776,7 +7990,11 @@ static void mad_prebuild_lists(UINT count, ID3D12CommandList *const *lists) {
             if (j == (UINT)n) v[n++] = p;
         }
     }
-    if (n < 2) return;   /* one pipeline: the draw builds it itself */
+    if (n == 0) return;
+    if (n == 1) {   /* madeira-m5 0.1.729: realize single lazy PSO outside q->submit_lock too */
+        if (v[0]->is_compute) mad_cpso_realize(v[0]); else mad_pso_realize(v[0]);
+        return;
+    }
     {
         static SRWLOCK serial = SRWLOCK_INIT;   /* one batch at a time uses the pool */
         struct mad_prebuild w; LONG nt, t;
@@ -7814,51 +8032,59 @@ static int mad_pso_var_cap(void) {
  * encode batch after the draw that uses it and release it on this thread. A cached variant lives until pso_Release. The cache key
  * is the strides of the slots the vertex descriptor uses; an unused slot's stride is normalised to 0, so a stale binding there
  * never misses (and never builds a duplicate). */
-static obj_handle_t mad_pso_for_strides(struct mad_pso *p, const UINT strides_in[16], int *uncached) {
+static obj_handle_t mad_pso_var_build(struct mad_pso *p, const UINT strides[16], int *uncached) {
     unsigned k, i, cap; obj_handle_t err = 0, rps;
     struct WMTVertexDescriptorInfo vd;
     static unsigned said;
-    UINT strides[16];
-    int miss = 0;
+    UINT64 t0;
     *uncached = 0;
-    for (i = 0; i < 16; i++) {
-        strides[i] = (p->vb_mask & (1u << i)) ? strides_in[i] : 0;
-        if ((p->vb_mask & (1u << i)) && strides[i] != p->vb_stride[i]) miss = 1;
-    }
-    if (!miss) return p->rps;                        /* the base pipeline already matches */
-    {   /* madeira-m5 0.1.728: lock-free acquire read of immutable fixed-cap p->var array */
-        unsigned nv = __atomic_load_n(&p->nvar, __ATOMIC_ACQUIRE);
-        if (nv) {
-            const struct mad_pso_var *pv = __atomic_load_n(&p->var, __ATOMIC_ACQUIRE);
-            if (pv) for (k = 0; k < nv; k++) if (!memcmp(pv[k].strides, strides, sizeof pv[k].strides)) return pv[k].rps;
-        }
-    }
     EnterCriticalSection(&p->var_lock);
     for (k = 0; k < p->nvar; k++) if (!memcmp(p->var[k].strides, strides, sizeof p->var[k].strides)) {
         rps = p->var[k].rps; LeaveCriticalSection(&p->var_lock); return rps;
     }
     vd = p->vd;
+    LeaveCriticalSection(&p->var_lock);   /* madeira-m5 0.1.729: never hold p->var_lock across Metal compile so D3D12SubmitDirect never blocks on D3D12PsoAsync */
     for (i = 0; i < 16; i++) if (p->vb_mask & (1u << i)) {
         if (strides[i] == 0) {
-            /* ml904: constant step -- one element for every vertex. Metal's
-             * MTLVertexStepFunctionConstant (0) with step rate 0; the stride
-             * is kept at the packed size so the element's own layout stands. */
             vd.layouts[6 + i].step_function = 0; vd.layouts[6 + i].step_rate = 0;
             vd.layouts[6 + i].stride = p->vb_stride[i];
         } else vd.layouts[6 + i].stride = strides[i];
     }
+    t0 = mad_tick();
     rps = MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &vd, &err);
     if (err) mad_log_nserror("render pipeline (vertex-descriptor variant)", err);
     if (!rps) {
-        /* ml904: second try for the constant case with a zero stride, in case
-         * this Metal wants the layout that way. */
         int retry = 0;
         for (i = 0; i < 16; i++) if ((p->vb_mask & (1u << i)) && strides[i] == 0) { vd.layouts[6 + i].stride = 0; retry = 1; }
         if (retry) { err = 0; rps = MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &vd, &err); if (err) mad_log_nserror("render pipeline (retry)", err); }
     }
+    InterlockedExchangeAdd64(&g_pt_var_realize, (LONG64)(mad_tick() - t0));
+    EnterCriticalSection(&p->var_lock);
+    /* remove from pending async queue table if present */
+    for (k = 0; k < p->nvar_q; k++) if (!memcmp(p->var_q[k], strides, 16 * sizeof(UINT))) {
+        if (k + 1 < p->nvar_q) memcpy(p->var_q[k], p->var_q[p->nvar_q - 1], 16 * sizeof(UINT));
+        p->nvar_q--; break;
+    }
+    for (k = 0; k < p->nvar; k++) if (!memcmp(p->var[k].strides, strides, sizeof p->var[k].strides)) {
+        obj_handle_t dup = rps;
+        rps = p->var[k].rps;
+        LeaveCriticalSection(&p->var_lock);
+        if (dup) NSObject_release(dup);
+        return rps;
+    }
     if (!rps) {
         if (said++ < 8) d3d12_log("[madeira-d3d12] stride variant failed (slot0 stride %u vs assumed %u, slot1 stride %u); using the base pipeline\n",
                                   strides[0], p->vb_stride[0], strides[1]);
+        cap = (unsigned)mad_pso_var_cap();
+        if (!p->var && cap) {
+            struct mad_pso_var *arr = calloc(cap, sizeof *arr);
+            if (arr) { __atomic_store_n(&p->var, arr, __ATOMIC_RELEASE); p->var_cap = cap; }
+        }
+        if (p->rps && p->var && p->nvar < p->var_cap) {   /* cache base fallback so pso-async never re-queues a failed stride */
+            NSObject_retain(p->rps);
+            memcpy(p->var[p->nvar].strides, strides, sizeof p->var[0].strides); p->var[p->nvar].rps = p->rps;
+            __atomic_store_n(&p->nvar, p->nvar + 1, __ATOMIC_RELEASE);
+        }
         LeaveCriticalSection(&p->var_lock); return p->rps;
     }
     InterlockedIncrement(&g_pso_var_built);
@@ -7882,6 +8108,33 @@ static obj_handle_t mad_pso_for_strides(struct mad_pso *p, const UINT strides_in
     }
     LeaveCriticalSection(&p->var_lock);
     return rps;
+}
+static obj_handle_t mad_pso_for_strides(struct mad_pso *p, const UINT strides_in[16], int *uncached) {
+    unsigned k, i;
+    UINT strides[16];
+    int miss = 0;
+    *uncached = 0;
+    for (i = 0; i < 16; i++) {
+        strides[i] = (p->vb_mask & (1u << i)) ? strides_in[i] : 0;
+        if ((p->vb_mask & (1u << i)) && strides[i] != p->vb_stride[i]) miss = 1;
+    }
+    if (!miss) return p->rps;                        /* the base pipeline already matches */
+    {   /* madeira-m5 0.1.728: lock-free acquire read of immutable fixed-cap p->var array */
+        unsigned nv = __atomic_load_n(&p->nvar, __ATOMIC_ACQUIRE);
+        if (nv) {
+            const struct mad_pso_var *pv = __atomic_load_n(&p->var, __ATOMIC_ACQUIRE);
+            if (pv) for (k = 0; k < nv; k++) if (!memcmp(pv[k].strides, strides, sizeof pv[k].strides)) return pv[k].rps;
+        }
+    }
+    if (mad_pso_async_on() && (!p->var_cap || p->nvar < p->var_cap)) {   /* madeira-m5 0.1.729: build uncached stride variants asynchronously on D3D12PsoAsync */
+        EnterCriticalSection(&p->var_lock);
+        for (k = 0; k < p->nvar; k++) if (!memcmp(p->var[k].strides, strides, sizeof p->var[k].strides)) {
+            obj_handle_t hit = p->var[k].rps; LeaveCriticalSection(&p->var_lock); return hit;
+        }
+        if (mad_pso_var_async_queue_locked(p, strides)) { LeaveCriticalSection(&p->var_lock); return 0; }
+        LeaveCriticalSection(&p->var_lock);
+    }
+    return mad_pso_var_build(p, strides, uncached);
 }
 
 static unsigned g_cap_kinds;   /* ml910: kinds captured since the last flush */
@@ -10174,6 +10427,7 @@ tess_go:
          * a per-draw constant stream. Unbound slots keep the assumed stride. */
         for (i = 0; i < 16; i++) strides[i] = e->vb[i].res ? e->vb[i].stride : e->pso->vb_stride[i];
         c_pso.pso = mad_pso_for_strides(e->pso, strides, &var_uncached);
+        if (!c_pso.pso) { InterlockedIncrement(&g_pa_skips); MAD_SKIP(e); return; }   /* 0.1.729 pso-async: stride variant building off-thread */
     }
     /* madeira-m5 0.1.718: a draw that returns before its chain is encoded drops an uncached variant at once (nothing names it yet) */
 #define MAD_VAR_DROP() do { if (var_uncached) { (NSObject_release)(c_pso.pso); var_uncached = 0; } } while (0)
@@ -10837,7 +11091,8 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
         struct WMTBufferInfo bi; UINT64 sz = need < (4u << 20) ? (4u << 20) : (need + 0xffff) & ~(UINT64)0xffff;
         /* an in-flight command buffer keeps its own reference to the old one */
         if (dev->ds_scratch) NSObject_release(dev->ds_scratch);
-        memset(&bi, 0, sizeof bi); bi.length = sz; bi.options = WMTResourceStorageModePrivate;
+        memset(&bi, 0, sizeof bi); bi.length = sz;
+        bi.options = WMTResourceStorageModePrivate | (mad_res_untracked_on(dev) ? WMTResourceHazardTrackingModeUntracked : 0);
         dev->ds_scratch = MTLDevice_newBuffer(dev->mtl_device, &bi);
         dev->ds_scratch_size = dev->ds_scratch ? sz : 0;
     }
@@ -10913,7 +11168,8 @@ static int exec_copy_reinterpret(struct mad_exec *e, const struct mad_cmd *c) {
         struct WMTBufferInfo bi; UINT64 sz = need < (4u << 20) ? (4u << 20) : (need + 0xffff) & ~(UINT64)0xffff;
         /* an in-flight command buffer keeps its own reference to the old one (as in exec_copy_aspect) */
         if (dev->ds_scratch) NSObject_release(dev->ds_scratch);
-        memset(&bi, 0, sizeof bi); bi.length = sz; bi.options = WMTResourceStorageModePrivate;
+        memset(&bi, 0, sizeof bi); bi.length = sz;
+        bi.options = WMTResourceStorageModePrivate | (mad_res_untracked_on(dev) ? WMTResourceHazardTrackingModeUntracked : 0);
         dev->ds_scratch = MTLDevice_newBuffer(dev->mtl_device, &bi);
         dev->ds_scratch_size = dev->ds_scratch ? sz : 0;
     }
@@ -10956,7 +11212,8 @@ static obj_handle_t exec_oneoff_pattern(struct mad_exec *e, const UINT32 per[4],
     static volatile LONG said, failed;
     n = bytes < MAD_FILLPAT_BYTES ? (bytes + 15) & ~(UINT64)15 : MAD_FILLPAT_BYTES;
     if (!n) n = 16;
-    memset(&bi, 0, sizeof bi); bi.length = n; bi.options = WMTResourceStorageModeShared;
+    memset(&bi, 0, sizeof bi); bi.length = n;
+    bi.options = WMTResourceStorageModeShared | (mad_res_untracked_on(e->q->device) ? WMTResourceHazardTrackingModeUntracked : 0);
     b = MTLDevice_newBuffer(e->q->device->mtl_device, &bi);
     if (!b || !bi.memory.ptr) {
         if (b) NSObject_release(b);
@@ -11044,7 +11301,8 @@ static int mad_bc_upload_decoded(struct mad_exec *e, const struct mad_cmd *c) {
     }
     dst_pitch = (size_t)cw * mad_bcn_texel_size(kind);
     slice_bytes = dst_pitch * ch;
-    memset(&bi, 0, sizeof bi); bi.length = slice_bytes * cd; bi.options = WMTResourceStorageModeShared;
+    memset(&bi, 0, sizeof bi); bi.length = slice_bytes * cd;
+    bi.options = WMTResourceStorageModeShared | (mad_res_untracked_on(e->q->device) ? WMTResourceHazardTrackingModeUntracked : 0);
     stage = MTLDevice_newBuffer(e->q->device->mtl_device, &bi);
     if (!stage || !bi.memory.ptr) { if (stage) NSObject_release(stage); return 0; }
     for (z = 0; z < cd; z++)
@@ -11524,6 +11782,7 @@ static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
             td.SampleDesc.Count = 1; td.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
             if (mad_texinfo_from_desc(e->q->device, &td, &ti, &pf, &is_depth)) {
                 ti.pixel_format = spf;   /* resolved in the source's format, copied as it */
+                if (mad_res_untracked_on(e->q->device)) ti.options = (enum WMTResourceOptions)(ti.options | WMTResourceHazardTrackingModeUntracked);
                 dst->resolve_tmp = MTLDevice_newTexture(e->q->device->mtl_device, &ti);
                 dst->resolve_tmp_w = w; dst->resolve_tmp_h = h; dst->resolve_tmp_pf = (UINT)spf;
             }
@@ -11532,7 +11791,7 @@ static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
         target = dst->resolve_tmp;
     }
     exec_end(e);
-    while (e->npend) exec_flush_clear(e, 0);
+    if (e->npend) exec_flush_clears_batch(e, (1u << e->npend) - 1u);
     e->wr_all = 1;
     memset(&rpi, 0, sizeof rpi);
     rpi.colors[0].texture = src->texture;
@@ -12069,9 +12328,22 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     exec_rp_list_begin(&e);   /* madeira-bcd rp-carry: the pass the previous list handed over */
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
+        int clr_prom = 0;
         e.cur = i;   /* ml1137 */
         if (g_capture_on) mad_capture_log_op(c);   /* madeira-bcd */
         if (g_ffx_exp > 0 && c->kind == MC_DISPATCH) { mad_ffx_before(&e, c); if (g_f7_opt_writes > 0) e.f8_wr_all = 1; }   /* madeira-bcd fi-setup-zero, fi-field-check; 0.1.718: their dispatches write game textures */
+        /* madeira-m5 0.1.729: whole-discard clear-rects promotion. After a whole DiscardResource, pixels outside
+         * the clear rect are undefined by D3D12 spec, so promoting partial-rect clear to whole exec_add_clear folds
+         * into the next pass's WMTLoadActionClear and eliminates standalone Load+Store exec_clear_rects passes. */
+        if ((c->kind == MC_CLEAR_RT || c->kind == MC_CLEAR_DS) && c->u.clear.nrect && e.rp_ndisc &&
+            c->u.clear.res && !(c->u.clear.res->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) &&
+            (mad_rp_discard_on() == 1 || mad_rp_discard_on() >= 3) && exec_disc_find(&e, c->u.clear.res) >= 0) {
+            if (c->kind == MC_CLEAR_RT || !c->u.clear.res->has_stencil ||
+                (c->u.clear.flags & (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL)) == (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL)) {
+                clr_prom = 1;
+                InterlockedIncrement(&g_rpd_clr_prom);
+            }
+        }
         if ((e.npend | e.rp_ndisc) || c->kind == MC_DISCARD) exec_rp_note(&e, c);   /* madeira-bcd clear-defer, rp-discard */
         switch (c->kind) {
         case MC_PSO: if (c->u.pso && c->u.pso->is_compute) e.cpso = c->u.pso; else e.pso = c->u.pso;
@@ -12142,11 +12414,11 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             memcpy(e.rtp, c->u.rts.v, sizeof e.rtp); e.dp = c->u.rts.dv;   /* ml925 */
             break;
         case MC_CLEAR_RT:
-            if (c->u.clear.nrect) exec_clear_rects(&e, l, c);   /* madeira-bcd clear-rects */
+            if (c->u.clear.nrect && !clr_prom) exec_clear_rects(&e, l, c);   /* madeira-bcd clear-rects (0.1.729: promoted if whole-discarded) */
             else exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, c->u.clear.rgba, 0.0f, 0, 0, 0);
             break;
         case MC_CLEAR_DS:
-            if (c->u.clear.nrect) exec_clear_rects(&e, l, c);   /* madeira-bcd clear-rects */
+            if (c->u.clear.nrect && !clr_prom) exec_clear_rects(&e, l, c);   /* madeira-bcd clear-rects (0.1.729: promoted if whole-discarded) */
             else exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, NULL, c->u.clear.depth, 1, c->u.clear.stencil, c->u.clear.flags);
             break;
         case MC_ROOTSIG: e.rs = c->u.rootsig; if (g_scbv_on > 0) memset(e.lat_va[0], 0, sizeof e.lat_va[0]); break;   /* madeira-bcd static-cbv: latches are per signature */
@@ -12290,7 +12562,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     }
     if (e.npend) InterlockedExchangeAdd(&g_tr_listend_flush, (LONG)e.npend);   /* madeira-m5 0.1.718 [perf]: clears applied at the list end */
     e.cc_flush_end = 1;   /* 0.1.719: a carried clear applied here is counted at the call end */
-    while (e.npend) exec_flush_clear(&e, 0);
+    if (e.npend) exec_flush_clears_batch(&e, (1u << e.npend) - 1u);
     if (e.rp_ndisc) {   /* madeira-m5 0.1.718 rp-discard: into the next list of the call, or lost */
         if (q->rp_next) { memcpy(q->rp_disc_c, e.rp_disc, e.rp_ndisc * sizeof e.rp_disc[0]); q->rp_ndisc_c = e.rp_ndisc; InterlockedExchangeAdd(&g_rpd_fate[RPD_CARRIED], (LONG)e.rp_ndisc); }
         else InterlockedExchangeAdd(&g_rpd_fate[RPD_LIST_END], (LONG)e.rp_ndisc);
@@ -12372,6 +12644,21 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     if (l->nrings && q->device->gpu_event && mad_ring_share_on()) mad_ring_park(q, l);
 }
 
+/* madeira-m5 0.1.729: if any list binds a lazy PSO, flush q->open_cb before mad_prebuild_lists runs outside q->submit_lock */
+static void mad_ecl_flush_if_lazy(struct mad_queue *q, UINT count, ID3D12CommandList *const *lists) {
+    UINT pi;
+    if (!q) return;
+    for (pi = 0; pi < count; pi++) {
+        const struct mad_list *pl = (const struct mad_list *)lists[pi];
+        if (pl && pl->has_lazy_pso) {
+            EnterCriticalSection(&q->submit_lock);
+            if (q->open_cb && q->open_lists > 0) mad_queue_flush_why(q, MAD_FLUSH_OTHER);
+            LeaveCriticalSection(&q->submit_lock);
+            return;
+        }
+    }
+}
+
 /* ml1120: the replay itself; runs on the caller (async-submit = 0) or on the
  * queue's submission worker. */
 static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList *const *lists) {
@@ -12387,6 +12674,9 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
     obj_handle_t ml1049_pool = NSAutoreleasePool_alloc_init();
     const int rs = mad_rs_on();   /* madeira-bcd: replay split */
     UINT64 rs_t = rs ? mad_tick() : 0;
+    mad_ecl_flush_if_lazy(ml1021_q, count, lists);
+    mad_prebuild_lists(count, lists);   /* madeira-bcd; 0.1.729: outside q->submit_lock so Present/Wait never stall on PSO compile */
+    if (rs) mad_rs_step(RS_PREBUILD, &rs_t);
     struct mad_eb *eb = mad_es_begin();   /* madeira-bcd encode-batch / draw-dedup: this replay's encode state */
     if (ml1021_q) EnterCriticalSection(&ml1021_q->submit_lock);
     if (rs) mad_rs_step(RS_LOCK, &rs_t);
@@ -12396,8 +12686,6 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
     UINT nrun = 0;   /* madeira-m5 0.1.717 [perf]: lists replayed by this call */
     if (g_sd_state < 0) mad_sync_diag_load();   /* madeira-bcd: sync diagnostics, read once */
     if (q) q->ecl_first_list = 1;   /* madeira-m5 0.1.717: the next list replayed begins this ExecuteCommandLists call (mad_exec_list, f7-list-start = 0) */
-    mad_prebuild_lists(count, lists);   /* madeira-bcd */
-    if (rs) mad_rs_step(RS_PREBUILD, &rs_t);
     memset(&rp_k, 0, sizeof rp_k); q->rp_carry = &rp_k; q->rp_next = NULL; q->rp_lists = lists; q->rp_nlists = count;
     for (UINT i = 0; i < count; i++) {
         struct mad_list *l = (struct mad_list *)lists[i];
@@ -12460,7 +12748,12 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
     if (q && g_cb_eager_kick > 0 && q->open_cb && q->open_lists > 0 && q->device && q->device->gpu_event &&
         !q->device->ncap && !g_sk_n && !g_capture_on && g_sd_state <= 0 && !g_fence_strict && !g_gpu_sync) {
         UINT64 committed = (UINT64)InterlockedCompareExchange64(&q->device->gpu_serial_committed, 0, 0);
-        if (mad_gpu_completed(q->device) + (UINT64)(g_cb_eager_kick - 1) >= committed) {
+        UINT64 done = mad_gpu_completed(q->device);
+        /* madeira-m5 0.1.729: kick immediately when GPU is idle (depth == 0); when depth == 1..N-1,
+         * require >= 3 open lists so we keep substantial CBs pipelined without 1-list micro-CBs */
+        int want_kick = (done >= committed) ||
+                        (done + (UINT64)(g_cb_eager_kick == 1 ? 1 : g_cb_eager_kick - 1) >= committed && q->open_lists >= 3);
+        if (want_kick) {
             InterlockedIncrement(&g_cb_eager_kicks);
             mad_queue_flush_why(q, MAD_FLUSH_EAGER_KICK);
         }
@@ -12687,12 +12980,13 @@ static void mad_perf_present(void) {
                 LONG en = InterlockedExchange(&g_es_enc_n, 0), on = InterlockedExchange(&g_es_open_n, 0), un = InterlockedExchange(&g_es_use_n, 0);
                 LONG us = InterlockedExchange(&g_es_use_skipped, 0);
                 LONG vb = InterlockedExchange(&g_pso_var_built, 0), vu = InterlockedExchange(&g_pso_var_uncached, 0);   /* madeira-m5 0.1.718 */
+                LONG64 vt = InterlockedExchange64(&g_pt_var_realize, 0);   /* madeira-m5 0.1.729 */
                 LONG irf = InterlockedExchange(&g_ind_rec_fast, 0), iru = InterlockedExchange(&g_ind_rec_full, 0);   /* madeira-m5 0.1.719 */
                 d3d12_log("[perf] encode split per frame: Metal encode calls %.2f ms (%.0f calls, %.1f us each), encoder open+end %.2f ms (%.0f encoders), "
                           "useResource entries %.0f (%.0f already declared, skipped; bcd.cfg use-dedup) -- the rest of ExecuteCommandLists is the replay itself; "
-                          "pipeline stride variants built %.2f, of which uncached (past pso-variant-cap %d) %.2f; indirect records %.1f (fast %.1f, full %.1f; indirect-fast %d)\n",
+                          "pipeline stride variants built %.2f (%.1f ms total), of which uncached (past pso-variant-cap %d) %.2f; indirect records %.1f (fast %.1f, full %.1f; indirect-fast %d)\n",
                           1000.0 * (double)et / tf / np, en / np, en ? 1e6 * (double)et / tf / en : 0.0,
-                          1000.0 * (double)ot / tf / np, on / np, un / np, us / np, vb / np, g_pso_var_cap, vu / np,
+                          1000.0 * (double)ot / tf / np, on / np, un / np, us / np, vb / np, 1000.0 * (double)vt / tf, g_pso_var_cap, vu / np,
                           (irf + iru) / np, irf / np, iru / np, g_indirect_fast > 0);
                 if (g_eb_on > 0 || g_dd_on > 0) {   /* madeira-bcd encode-batch / draw-dedup */
                     LONG ch = InterlockedExchange(&g_eb_chains, 0), ca = InterlockedExchange(&g_eb_calls, 0), al = InterlockedExchange(&g_eb_alone, 0);
@@ -12973,7 +13267,11 @@ static void mad_perf_present(void) {
 /* madeira-m5 0.1.716 P4e: `who` (MAD_RET_*) names the path whose wait this is, for the [perf] split. */
 static void mad_cb_retire_as(struct mad_device *d, obj_handle_t cb, int who) {
     UINT64 t0 = mad_tick();   /* madeira-m5 0.1.718: mad_tick, not two QPC transitions and a QPF per command buffer */
-    MTLCommandBuffer_waitUntilCompleted(cb);
+    /* madeira-m5 0.1.729: when the retire thread has no timing/diagnostic hooks active, skip waitUntilCompleted
+     * if Metal has already marked the buffer Completed/Error (avoids unnecessary host cvwait round-trips) */
+    if (!(who == MAD_RET_THREAD && g_perf_enabled <= 0 && !g_rbt_n && g_tdisp_state <= 0 && !d->nvis_pending && !g_fault_diag) ||
+        MTLCommandBuffer_status(cb) < WMTCommandBufferStatusCompleted)
+        MTLCommandBuffer_waitUntilCompleted(cb);
     mad_rbt_retire(cb);   /* madeira-bcd trace-buffer-size: what this buffer's traced copies left for the CPU */
     mad_tdsnap_retire(cb);   /* madeira-bcd trace-dispatch: the GPU-only buffers its traced dispatches read */
     mad_perf_cb(d, cb, (double)(mad_tick() - t0) / (double)mad_tick_freq(), who);
@@ -13479,12 +13777,17 @@ static int mad_cc_defer(struct mad_queue *q, ID3D12Fence *fence, UINT64 value) {
         return 0;
     }
     EnterCriticalSection(&f->lock);
-    {   /* madeira-m5 0.1.716 P3: a waiter whose value is already committed (<= f->committed) is released by the
-         * batch in flight; deferring this Signal does not delay it. A stale-low read of committed only keeps a
-         * waiter in the count, i.e. today's behaviour. P1b: an async Wait asleep on this fence (nqwaiters, raised
-         * under this lock) needs the Signal committed now, exactly as a registered waiter does. */
+    {   /* madeira-m5 0.1.716 P3 / 0.1.729: value-aware waiters, nqwaiters (qw_vals[8]), and nblocked (blk_vals[8]).
+         * Any waiter whose target is already committed (<= committed) or strictly beyond this Signal (> value) is
+         * unaffected by deferring this Signal; overflow past 8 slots falls back conservatively to ok = 0. */
         UINT64 committed = (UINT64)__atomic_load_n(&f->committed, __ATOMIC_ACQUIRE);
-        ok = !f->nblocked && !f->nqwaiters;
+        unsigned nbt = 0, nqt = 0;
+        ok = 1;
+        for (i = 0; i < 8; i++) {
+            if (f->blk_vals[i]) { nbt++; if (f->blk_vals[i] <= value && f->blk_vals[i] > committed) ok = 0; }
+            if (f->qw_vals[i])  { nqt++; if (f->qw_vals[i]  <= value && f->qw_vals[i]  > committed) ok = 0; }
+        }
+        if (nbt < f->nblocked || nqt < f->nqwaiters) ok = 0;
         for (i = 0; i < f->nwaiters && ok; i++)
             if (f->waiters[i].value <= value && f->waiters[i].value > committed) ok = 0;   /* someone waits for it already: deliver as before */
     }
@@ -13721,10 +14024,15 @@ static void mad_fence_committed(struct mad_fence *f, UINT64 value) {
  * per Wait job and per wake). */
 static int mad_wait_committed(struct mad_fence *f, UINT64 value) {
     UINT64 t0, t1; static LONG said;
-    int counted = 0, timed_out = 0, slept = 0;
+    int counted = 0, qslot = -1, timed_out = 0, slept = 0;
     if ((UINT64)f->committed >= value || f->value >= value) return 0;
-    if (g_cb_coalesce > 0) {   /* madeira-m5 cb-coalesce: the observe before g_commit_lock (the flush takes it after submit_lock) */
-        EnterCriticalSection(&f->lock); f->nqwaiters++; LeaveCriticalSection(&f->lock); counted = 1;   /* 0.1.716 P1b: visible to mad_cc_defer from here on */
+    if (g_cb_coalesce > 0) {   /* madeira-m5 cb-coalesce / 0.1.729: value-aware nqwaiters (qw_vals[8], 0 = empty; value >= 1 here since value > f->value) */
+        unsigned qi;
+        EnterCriticalSection(&f->lock);
+        for (qi = 0; qi < 8; qi++) if (!f->qw_vals[qi]) { f->qw_vals[qi] = value; qslot = (int)qi; break; }
+        f->nqwaiters++;
+        LeaveCriticalSection(&f->lock);
+        counted = 1;   /* 0.1.716 P1b: visible to mad_cc_defer from here on */
         mad_cc_observe(f, value, &g_cc_fl_wait);   /* a deferral decided before the count: its ndeferred was raised under the same lock */
     }
     t0 = mad_tick();
@@ -13746,7 +14054,12 @@ static int mad_wait_committed(struct mad_fence *f, UINT64 value) {
         }
     }
     LeaveCriticalSection(&g_commit_lock);
-    if (counted) { EnterCriticalSection(&f->lock); f->nqwaiters--; LeaveCriticalSection(&f->lock); }   /* 0.1.716 P1b: after the loop, the 5 s timeout included */
+    if (counted) {
+        EnterCriticalSection(&f->lock);
+        if (qslot >= 0) f->qw_vals[qslot] = 0;
+        f->nqwaiters--;
+        LeaveCriticalSection(&f->lock);
+    }   /* 0.1.716 P1b: after the loop, the 5 s timeout included */
     t1 = mad_tick();
     InterlockedExchangeAdd64(&g_perf_waitjob_ticks, (LONG64)(t1 - t0));
     if (timed_out && (UINT64)f->committed < value && f->value < value && InterlockedIncrement(&said) <= 4)
@@ -13855,13 +14168,24 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
                     : q->type == D3D12_COMMAND_LIST_TYPE_COPY ? L"D3D12SubmitCopy" : L"D3D12SubmitDirect");   /* madeira-m5 0.1.723 */
     mad_eco_prio_self(0);   /* madeira-bcd eco-prio (opt-in) */
     for (;;) {
-        struct mad_subjob *j;
+        struct mad_subjob *j, *jtail;
         UINT64 t0, t1;   /* madeira-m5 0.1.718: mad_tick; a QPC here was a PE -> unix transition, 4-6 of them per job */
         obj_handle_t pool;
+        LONG njobs = 1;
         EnterCriticalSection(&q->sub_lock);
         while (!q->sub_head && !q->sub_quit) SleepConditionVariableCS(&q->sub_work, &q->sub_lock, INFINITE);
         if (!q->sub_head) { LeaveCriticalSection(&q->sub_lock); return 0; }
-        j = q->sub_head; q->sub_head = j->next; if (!q->sub_head) q->sub_tail = NULL;
+        j = jtail = q->sub_head; q->sub_head = j->next; j->next = NULL;
+        if (j->kind == MAD_SUB_ECL) {   /* madeira-m5 0.1.729: coalesce adjacent MAD_SUB_ECL jobs (up to 64 lists) so rp-carry/rp-discard/clear-defer-carry span consecutive submissions */
+            UINT tot = j->count;
+            while (q->sub_head && q->sub_head->kind == MAD_SUB_ECL && tot + q->sub_head->count <= 64) {
+                struct mad_subjob *nx = q->sub_head;
+                q->sub_head = nx->next; nx->next = NULL;
+                jtail->next = nx; jtail = nx;
+                tot += nx->count; njobs++;
+            }
+        }
+        if (!q->sub_head) q->sub_tail = NULL;
         q->sub_busy = 1;
         LeaveCriticalSection(&q->sub_lock);
 
@@ -13874,10 +14198,23 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
             /* madeira-m5 0.1.717 typed-view-shadow: refreshed HERE, on the worker, after every Wait job queued before this
              * one has resolved (the FIFO), right before the replay. 0.1.728: COPY queues never bind shader views. */
             if (q->type != D3D12_COMMAND_LIST_TYPE_COPY) mad_tvs_refresh();
-            mad_ecl_run((ID3D12CommandQueue *)q, j->count, (ID3D12CommandList *const *)j->lists);
-            for (i = 0; i < j->count; i++) {
-                InterlockedDecrement(&j->lists[i]->inflight);
-                list_Release((ID3D12GraphicsCommandList *)j->lists[i]);
+            if (!j->next) {
+                mad_ecl_run((ID3D12CommandQueue *)q, j->count, (ID3D12CommandList *const *)j->lists);
+                for (i = 0; i < j->count; i++) {
+                    InterlockedDecrement(&j->lists[i]->inflight);
+                    list_Release((ID3D12GraphicsCommandList *)j->lists[i]);
+                }
+            } else {
+                struct mad_list *merged[64];
+                struct mad_subjob *cur;
+                UINT m = 0;
+                for (cur = j; cur; cur = cur->next)
+                    for (i = 0; i < cur->count && m < 64; i++) merged[m++] = cur->lists[i];
+                mad_ecl_run((ID3D12CommandQueue *)q, m, (ID3D12CommandList *const *)merged);
+                for (i = 0; i < m; i++) {
+                    InterlockedDecrement(&merged[i]->inflight);
+                    list_Release((ID3D12GraphicsCommandList *)merged[i]);
+                }
             }
             break;
         }
@@ -13925,7 +14262,7 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
         {   /* ml1128: per-kind elapsed, and the pool drain on its own */
             LONG64 tk = (LONG64)mad_tick(), d = tk - (LONG64)t0;
             switch (j->kind) {
-            case MAD_SUB_ECL: InterlockedIncrement64(&g_xp.n_ecl); InterlockedExchangeAdd64(&g_xp.t_ecl, d); break;
+            case MAD_SUB_ECL: InterlockedExchangeAdd64(&g_xp.n_ecl, (LONG64)njobs); InterlockedExchangeAdd64(&g_xp.t_ecl, d); break;
             case MAD_SUB_SIGNAL: InterlockedIncrement64(&g_xp.n_sig); InterlockedExchangeAdd64(&g_xp.t_sig, d); break;
             case MAD_SUB_WAIT: InterlockedIncrement64(&g_xp.n_wait); InterlockedExchangeAdd64(&g_xp.t_wait, d); break;
             case MAD_SUB_PRESENT: InterlockedIncrement64(&g_xp.pres_done); InterlockedExchangeAdd64(&g_xp.t_prs, d); break;
@@ -13935,10 +14272,10 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
         }
         t1 = mad_tick();
         InterlockedExchangeAdd64(&g_perf_worker_ticks, (LONG64)(t1 - t0));
-        InterlockedIncrement(&g_perf_jobs);
+        InterlockedExchangeAdd(&g_perf_jobs, njobs);
         InterlockedExchangeAdd64(&q->perf_worker_ticks, (LONG64)(t1 - t0));   /* madeira-m5 0.1.716 P4a: this worker alone */
-        InterlockedIncrement(&q->perf_jobs);
-        free(j);
+        InterlockedExchangeAdd(&q->perf_jobs, njobs);
+        while (j) { struct mad_subjob *nx = j->next; free(j); j = nx; }
 
         EnterCriticalSection(&q->sub_lock);
         q->sub_busy = 0;
@@ -14602,6 +14939,7 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
         if (d->mtl_queue) NSObject_release(d->mtl_queue);
         if (d->mtl_device) NSObject_release(d->mtl_device);
         free(d->smp_cache);   /* sampler-cache: the table only (the samplers stay, as before); NULL with sampler-cache = 0 */
+        free(d->smp_x64);     /* madeira-m5 0.1.729 Phase E: lock-free .x64leaf sampler table */
         DeleteCriticalSection(&d->live_lock);
         DeleteCriticalSection(&d->view_lock); free(d->vmap);
         d3d12_log("[madeira-d3d12] destroyed %s\n", d->name);
@@ -14724,8 +15062,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateFence(ID3D12Device *This, UINT64 i
     f->flags = flags;
     f->dev = (struct mad_device *)This;   /* madeira-m5 cb-coalesce: mad_cc_observe resolves the deferred queue through the device */
     f->last_sig_kind = 3;   /* madeira-m5 0.1.718 (Round 4 report B3): no queue Signal yet = the CPU/none edge, not "direct" (0) */
-    if (g_fpb < 0) mad_fpb_init();   /* madeira-m5 0.1.728 x64-leaf Phase D: fast GetCompletedValue only when fence-poll-backoff is off */
-    f->x64_flags = (g_x64_leaf > 0 && g_fpb == 0) ? MAD_X64L_OK : 0;
+    if (g_fpb < 0) mad_fpb_init();   /* madeira-m5 0.1.728/0.1.729 x64-leaf Phase D/E: fast GetCompletedValue when fence-poll-backoff is off */
+    f->x64_flags = (g_x64_leaf > 0 && g_fpb == 0) ? (MAD_X64L_OK | (mad_cc_on() >= 2 ? MAD_X64L_FENCE_CC2 : 0)) : 0;
     if (flags) {
         static LONG said_flags;
         if (InterlockedIncrement(&said_flags) <= 4)
@@ -17763,6 +18101,40 @@ _Static_assert(offsetof(struct mad_fence, value) == MAD_X64L_FENCE_VALUE_OFF &&
                offsetof(struct mad_fence, ndeferred) == MAD_X64L_FENCE_NDEFERRED_OFF, "x64-leaf: struct mad_fence");
 _Static_assert(offsetof(struct mad_pso, rps) == MAD_X64L_PSO_RPS_OFF &&
                offsetof(struct mad_pso, cps) == MAD_X64L_PSO_CPS_OFF, "x64-leaf: struct mad_pso");
+/* madeira-m5 0.1.729 Phase E */
+_Static_assert(MC_BARRIER == MAD_X64L_MC_BARRIER && MC_DISCARD == MAD_X64L_MC_DISCARD && MAD_BAR_MAX == MAD_X64L_BAR_MAX, "x64-leaf: enum values (Phase E)");
+_Static_assert(BC_RAR == MAD_X64L_BC_RAR && BC_RAW_ATT == MAD_X64L_BC_RAW_ATT && BC_RAW_COPY == MAD_X64L_BC_RAW_COPY &&
+               BC_RAW_UAV == MAD_X64L_BC_RAW_UAV && BC_ALL == MAD_X64L_BC_ALL && BC_NONE == MAD_X64L_BC_NONE &&
+               BCF_ALIAS_AFTER == MAD_X64L_BCF_ALIAS_AFTER && BCF_BEGIN_ONLY == MAD_X64L_BCF_BEGIN_ONLY &&
+               BCF_TO_RT_DSW == MAD_X64L_BCF_TO_RT_DSW && BCF_TO_COMMON == MAD_X64L_BCF_TO_COMMON &&
+               BCF_ALIASING == MAD_X64L_BCF_ALIASING, "x64-leaf: barrier classes/flags (Phase E)");
+_Static_assert(offsetof(struct mad_cmd, u.barrier.res) == offsetof(struct mad_x64l_cmd, u.barrier.res) &&
+               offsetof(struct mad_cmd, u.barrier.cls) == offsetof(struct mad_x64l_cmd, u.barrier.cls) &&
+               offsetof(struct mad_cmd, u.barrier.uav_mask) == offsetof(struct mad_x64l_cmd, u.barrier.uav_mask) &&
+               offsetof(struct mad_cmd, u.barrier.n) == offsetof(struct mad_x64l_cmd, u.barrier.n) &&
+               offsetof(struct mad_cmd, u.barrier.all) == offsetof(struct mad_x64l_cmd, u.barrier.all) &&
+               offsetof(struct mad_cmd, u.barrier.all_tex) == offsetof(struct mad_x64l_cmd, u.barrier.all_tex) &&
+               offsetof(struct mad_cmd, u.barrier.cls_noref) == offsetof(struct mad_x64l_cmd, u.barrier.cls_noref) &&
+               offsetof(struct mad_cmd, u.barrier.vsread) == offsetof(struct mad_x64l_cmd, u.barrier.vsread) &&
+               offsetof(struct mad_cmd, u.barrier.spill) == offsetof(struct mad_x64l_cmd, u.barrier.spill), "x64-leaf: mad_cmd.u.barrier");
+_Static_assert(offsetof(struct mad_cmd, u.discard.res) == offsetof(struct mad_x64l_cmd, u.discard.res) &&
+               offsetof(struct mad_cmd, u.discard.whole) == offsetof(struct mad_x64l_cmd, u.discard.whole), "x64-leaf: mad_cmd.u.discard");
+_Static_assert(offsetof(struct mad_obj, refs) == MAD_X64L_OBJ_REFS_OFF &&
+               offsetof(struct mad_resource, refs) == MAD_X64L_OBJ_REFS_OFF &&
+               offsetof(struct mad_pso, refs) == MAD_X64L_OBJ_REFS_OFF &&
+               offsetof(struct mad_memheap, refs) == MAD_X64L_OBJ_REFS_OFF, "x64-leaf: COM refs offset");
+_Static_assert(offsetof(struct mad_device, smp_x64) == MAD_X64L_DEV_SMP_X64_OFF &&
+               offsetof(struct mad_device, smp_x64_n) == MAD_X64L_DEV_SMP_X64_N_OFF, "x64-leaf: mad_device.smp_x64");
+_Static_assert(offsetof(struct mad_fence, committed) == MAD_X64L_FENCE_COMMITTED_OFF, "x64-leaf: mad_fence.committed");
+_Static_assert(offsetof(struct mad_resource, buffer) == MAD_X64L_RES_BUFFER_OFF &&
+               offsetof(struct mad_resource, x64_flags) == MAD_X64L_RES_X64_FLAGS_OFF &&
+               offsetof(struct mad_resource, texture) == MAD_X64L_RES_TEXTURE_OFF &&
+               offsetof(struct mad_resource, gpu_resource_id) == MAD_X64L_RES_GPU_RES_ID_OFF &&
+               offsetof(struct mad_resource, is_depth) == MAD_X64L_RES_IS_DEPTH_OFF &&
+               offsetof(struct mad_resource, has_stencil) == MAD_X64L_RES_HAS_STENCIL_OFF &&
+               offsetof(struct mad_resource, samples) == MAD_X64L_RES_SAMPLES_OFF &&
+               offsetof(struct mad_resource, x64_mips) == MAD_X64L_RES_X64_MIPS_OFF &&
+               offsetof(struct mad_resource, x64_layers) == MAD_X64L_RES_X64_LAYERS_OFF, "x64-leaf: mad_resource Phase E");
 static LONG g_res_serial, g_heap_serial;
 /* madeira-bcd: placed-resource registry per heap, for the alias report. */
 static void mad_pl_add(struct mad_memheap *h, struct mad_resource *r) {
@@ -17973,6 +18345,12 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         r->tex_type = ti.type; r->tex_pf = pf; r->tex_mips = ti.mipmap_level_count;   /* ml913 */
         r->tex_layers = ti.type == WMTTextureType3D ? 1 : ti.array_length;
         r->tex_depth = ti.type == WMTTextureType3D ? ti.depth : 1;   /* ml924 */
+        /* madeira-m5 0.1.729 Phase E: publish texture type/dims for .x64leaf CreateShaderResourceView / DiscardResource */
+        r->x64_mips = (UINT16)r->tex_mips;
+        r->x64_layers = (UINT16)r->tex_layers;
+        if (r->tex_type == WMTTextureType2DArray) r->x64_flags |= MAD_X64L_RES_TEX_2DARRAY;
+        else if (r->tex_type == WMTTextureType3D) r->x64_flags |= MAD_X64L_RES_TEX_3D;
+        else if (r->tex_type == WMTTextureTypeCubeArray) r->x64_flags |= MAD_X64L_RES_TEX_CUBEARRAY;
         /* ml1053: BASE textures were not in the view map, so every sm5 texture
          * binding that named one fell back to mad_texture_of_view -- a linear
          * walk of every SRV'd resource and every view of each, per range, per
@@ -19289,6 +19667,7 @@ static void STDMETHODCALLTYPE device_CreateDepthStencilView(ID3D12Device *This,
     case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY: mad_view_all(r, &v->p, desc->Texture2DMSArray.FirstArraySlice, desc->Texture2DMSArray.ArraySize, 0); break;
     default: break;
     }
+    if (desc) v->p.plane = (UINT16)(desc->Flags & 3u);   /* madeira-m5 0.1.729: preserve D3D12_DSV_FLAG_READ_ONLY_DEPTH/STENCIL for rp-discard=4 */
     if (v->p.layers > 1 && said++ < 6)
         d3d12_log("[madeira-d3d12] layered DSV: %s %ux%u level %u first %u layers %u\n", r->name, r->width, r->height, v->p.level, v->p.slice, v->p.layers);
 }
@@ -19649,6 +20028,33 @@ static void STDMETHODCALLTYPE device_CreateSampler(ID3D12Device *This,
         mad_smpdesc_put(si.gpu_resource_id, desc->Filter, desc->AddressU, desc->AddressV, desc->AddressW, desc->MaxAnisotropy,
                         desc->ComparisonFunc, (desc->BorderColor[0] > 0.5f) ? 2u : (desc->BorderColor[3] > 0.5f) ? 1u : 0u,
                         desc->MinLOD, desc->MaxLOD, bias);
+    if (cache_on && desc && (((UINT)desc->Filter >> 7) & 3u) < 2u && (d->x64_flags & MAD_X64L_DEV_SMP_CACHE)) {
+        /* madeira-m5 0.1.729 Phase E: populate append-only lock-free .x64leaf sampler table (never realloc'd) */
+        UINT32 bdr = (desc->BorderColor[0] > 0.5f) ? 2u : (desc->BorderColor[3] > 0.5f) ? 1u : 0u;
+        float max_lod = desc->MaxLOD > 1000.0f ? 1000.0f : desc->MaxLOD;
+        AcquireSRWLockExclusive(&g_smp_cache_lock);
+        if (!d->smp_x64) d->smp_x64 = calloc(MAD_X64L_SMP_CAP, sizeof *d->smp_x64);
+        if (d->smp_x64) {
+            LONG i, n = d->smp_x64_n; int dup = 0;
+            for (i = 0; i < n; i++) {
+                const struct mad_x64l_smp_ent *se = &d->smp_x64[i];
+                if (se->filter == (UINT32)desc->Filter && se->au == (UINT32)desc->AddressU &&
+                    se->av == (UINT32)desc->AddressV && se->aw == (UINT32)desc->AddressW &&
+                    se->aniso == desc->MaxAnisotropy && se->cmp == (UINT32)desc->ComparisonFunc &&
+                    se->border == bdr && se->min_lod == desc->MinLOD && se->max_lod == max_lod) { dup = 1; break; }
+            }
+            if (!dup && n < MAD_X64L_SMP_CAP) {
+                struct mad_x64l_smp_ent *se = &d->smp_x64[n];
+                se->filter = (UINT32)desc->Filter; se->au = (UINT32)desc->AddressU;
+                se->av = (UINT32)desc->AddressV; se->aw = (UINT32)desc->AddressW;
+                se->aniso = desc->MaxAnisotropy; se->cmp = (UINT32)desc->ComparisonFunc;
+                se->border = bdr; se->min_lod = desc->MinLOD; se->max_lod = max_lod;
+                se->id = si.gpu_resource_id;
+                __atomic_store_n(&d->smp_x64_n, n + 1, __ATOMIC_RELEASE);
+            }
+        }
+        ReleaseSRWLockExclusive(&g_smp_cache_lock);
+    }
     /* The sampler object itself is kept alive by the device for the process's
      * life. Samplers are few and immutable, and tying one to a descriptor slot
      * that the application may overwrite would need a lifetime story that this
@@ -23781,7 +24187,7 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
     for (i = 0; i < n; i++) {   /* ml1116: fence-chain = 3 waits only for resources an encoder in flight wrote */
         struct mad_resource *r = NULL, *r2 = NULL;   /* madeira-m5 0.1.718: r2 = the second resource of an aliasing barrier */
         UINT8 cls = BC_ALL;
-        int vs = 0, f5_vs = 0, uav_haz = 0;   /* 0.1.719: vsread; 0.1.727: f5_vsread & uav_mask */
+        int vs = 0, f5_vs = 0, uav_haz = 0, r_is_after = 0;   /* 0.1.719: vsread; 0.1.727: f5_vsread & uav_mask; 0.1.729: aliasing after */
         const UINT W = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_DEPTH_WRITE |
                        D3D12_RESOURCE_STATE_STREAM_OUT | D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_RESOLVE_DEST;
         const UINT F5_VS = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
@@ -23790,25 +24196,30 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
             UINT bs = (UINT)b[i].Transition.StateBefore, as = (UINT)b[i].Transition.StateAfter;
             r = (struct mad_resource *)b[i].Transition.pResource;
             /* ml1137: COMMON on either side and any write after are "wait for everything" */
-            if (b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) cls = BC_RAR;
-            else if (!as || (as & W) || !bs) {
-                cls = BC_ALL;
-                if (!bs || !as || (bs & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) || (as & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) uav_haz = 1;
-                if (as & F5_VS) f5_vs = 1;
+            if (b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) cls = (UINT8)(BC_RAR | BCF_BEGIN_ONLY);
+            else {
+                UINT8 bcf = !as ? BCF_TO_COMMON
+                    : !(as & ~(UINT)(D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE)) ? BCF_TO_RT_DSW : 0;
+                if (!as || (as & W) || !bs) {
+                    cls = BC_ALL;
+                    if (!bs || !as || (bs & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) || (as & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) uav_haz = 1;
+                    if (as & F5_VS) f5_vs = 1;
+                }
+                else if (!(bs & W)) {
+                    cls = BC_RAR;
+                    if (as & F5_VS) f5_vs = 1;
+                }
+                else if (!(bs & ~(UINT)(D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE))) {
+                    cls = BC_RAW_ATT;
+                    /* madeira-m5 f7-frag = 2: the attachment becomes readable outside the fragment stage (a vertex or
+                     * compute SRV, a copy or resolve source, indirect arguments...): its wait must stay at the vertex stage */
+                    if (as & ~(UINT)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_READ)) { vs = 1; f5_vs = 1; }
+                }
+                else if (bs == D3D12_RESOURCE_STATE_COPY_DEST) { cls = BC_RAW_COPY; if (as & F5_VS) f5_vs = 1; }
+                else if (bs == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) { cls = BC_RAW_UAV; uav_haz = 1; if (as & F5_VS) f5_vs = 1; }
+                else { uav_haz = 1; if (as & F5_VS) f5_vs = 1; }
+                cls = (UINT8)(cls | bcf);
             }
-            else if (!(bs & W)) {
-                cls = BC_RAR;
-                if (as & F5_VS) f5_vs = 1;
-            }
-            else if (!(bs & ~(UINT)(D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE))) {
-                cls = BC_RAW_ATT;
-                /* madeira-m5 f7-frag = 2: the attachment becomes readable outside the fragment stage (a vertex or
-                 * compute SRV, a copy or resolve source, indirect arguments...): its wait must stay at the vertex stage */
-                if (as & ~(UINT)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_READ)) { vs = 1; f5_vs = 1; }
-            }
-            else if (bs == D3D12_RESOURCE_STATE_COPY_DEST) { cls = BC_RAW_COPY; if (as & F5_VS) f5_vs = 1; }
-            else if (bs == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) { cls = BC_RAW_UAV; uav_haz = 1; if (as & F5_VS) f5_vs = 1; }
-            else { uav_haz = 1; if (as & F5_VS) f5_vs = 1; }
         } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
             r = (struct mad_resource *)b[i].UAV.pResource;
             cls = BC_RAW_UAV; uav_haz = 1;   /* UAV accesses happen only in compute and render encoders */
@@ -23817,21 +24228,23 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
              * (the sync is unchanged: BC_ALL); only a NULL pair ("all aliases of this heap") still names every texture. Before,
              * every aliasing barrier applied every pending clear early and forgot every tracked discard. */
             r = (struct mad_resource *)b[i].Aliasing.pResourceBefore; r2 = (struct mad_resource *)b[i].Aliasing.pResourceAfter;
-            if (!r) { r = r2; r2 = NULL; }
+            if (!r) { r = r2; r2 = NULL; r_is_after = 1; }
+            cls = (UINT8)(BC_ALL | BCF_ALIASING);
             uav_haz = 1;
             InterlockedIncrement(&g_bar_all[r ? MAD_BAR_ALIAS_NAMED : MAD_BAR_ALIAS_NULL]);
         }
         if (!r) {
+            UINT8 bc_plain = (UINT8)(cls & BCF_CLS_MASK);
             c->u.barrier.all = 1;
-            if (cls == BC_RAW_UAV) InterlockedIncrement(&g_bar_all[MAD_BAR_NULL_UAV]);   /* orders UAV accesses: no texture in RT/DS state is among them */
+            if (bc_plain == BC_RAW_UAV) InterlockedIncrement(&g_bar_all[MAD_BAR_NULL_UAV]);   /* orders UAV accesses: no texture in RT/DS state is among them */
             else { c->u.barrier.all_tex = 1; if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_ALIASING) InterlockedIncrement(&g_bar_all[MAD_BAR_NULL_OTHER]); }
-            if (c->u.barrier.cls_noref == BC_NONE || cls > c->u.barrier.cls_noref) c->u.barrier.cls_noref = cls;
+            if (c->u.barrier.cls_noref == BC_NONE || bc_plain > c->u.barrier.cls_noref) c->u.barrier.cls_noref = bc_plain;
             continue;
         }
-        mad_barrier_add(l, &c, r, cls, uav_haz);
+        mad_barrier_add(l, &c, r, r_is_after ? (UINT8)(cls | BCF_ALIAS_AFTER) : cls, uav_haz);
         if (vs) c->u.barrier.vsread |= 1;
         if (f5_vs) c->u.barrier.vsread |= 2;
-        if (r2) mad_barrier_add(l, &c, r2, cls, uav_haz);
+        if (r2) mad_barrier_add(l, &c, r2, (UINT8)(cls | BCF_ALIAS_AFTER), uav_haz);
     }
 }
 /* madeira-bcd indirect-expand (2026-11-21; Teardown through BCD Dock, build 686, a tester's six sessions on an
@@ -25107,8 +25520,30 @@ void STDMETHODCALLTYPE mad_ecfb_list_CopyBufferRegion(ID3D12GraphicsCommandList 
 HRESULT STDMETHODCALLTYPE mad_ecfb_res_Map(ID3D12Resource *This, UINT sub, const D3D12_RANGE *read_range, void **data) {
     return res_Map(This, sub, read_range, data);
 }
+/* madeira-m5 0.1.729 Phase E: Release, CreateSRV, CreateSampler, ResourceBarrier, DiscardResource */
+ULONG STDMETHODCALLTYPE mad_ecfb_res_Release(ID3D12Resource *This) {
+    return res_Release(This);
+}
+ULONG STDMETHODCALLTYPE mad_ecfb_pso_Release(ID3D12PipelineState *This) {
+    return pso_Release(This);
+}
+ULONG STDMETHODCALLTYPE mad_ecfb_memheap_Release(ID3D12Heap *This) {
+    return memheap_Release(This);
+}
+void STDMETHODCALLTYPE mad_ecfb_device_CreateShaderResourceView(ID3D12Device *This, ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    device_CreateShaderResourceView(This, res, desc, h);
+}
+void STDMETHODCALLTYPE mad_ecfb_device_CreateSampler(ID3D12Device *This, const D3D12_SAMPLER_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    device_CreateSampler(This, desc, h);
+}
+void STDMETHODCALLTYPE mad_ecfb_list_ResourceBarrier(ID3D12GraphicsCommandList *This, UINT n, const D3D12_RESOURCE_BARRIER *b) {
+    list_ResourceBarrier(This, n, b);
+}
+void STDMETHODCALLTYPE mad_ecfb_list_DiscardResource(ID3D12GraphicsCommandList *This, ID3D12Resource *res, const D3D12_DISCARD_REGION *region) {
+    list_DiscardResource(This, res, region);
+}
 static void mad_x64_leaf_init(void) {   /* once, at the end of build_vtables: the ARM64EC slots are what it replaces */
-    long long want = mad_cfg_int_pe("x64-leaf", 0);   /* 1: thirty-two hot COM methods (GetGPUVirtualAddress, CopyDescriptorsSimple, CreateConstantBufferView, the root descriptor-table setters, the two draws, SetPipelineState, the descriptor-heap handle getters, resource and heap GetDesc, GetDescriptorHandleIncrementSize; 0.1.718: the two root signatures, viewports, scissors, topology, stencil reference, blend factor, Dispatch; 0.1.723: IASetIndexBuffer, IASetVertexBuffers; 0.1.728 Phase D: fence_GetCompletedValue, alloc_Reset, list_Close, list_Reset, list_SetDescriptorHeaps, list_OMSetRenderTargets, list_CopyBufferRegion, res_Map, res_Unmap) run as x86-64 code inside the DLL, so the game's calls to them never leave the x86 JIT; 0 (default): the ARM64EC methods, as before. Not taken while a sync diagnostic, static-cbv, view-census or trace-buffer-size is on */
+    long long want = mad_cfg_int_pe("x64-leaf", 0);   /* 1: forty-two hot COM methods (GetGPUVirtualAddress, CopyDescriptorsSimple, CreateConstantBufferView, the root descriptor-table setters, the two draws, SetPipelineState, the descriptor-heap handle getters, resource and heap GetDesc, GetDescriptorHandleIncrementSize; 0.1.718: the two root signatures, viewports, scissors, topology, stencil reference, blend factor, Dispatch; 0.1.723: IASetIndexBuffer, IASetVertexBuffers; 0.1.728 Phase D: fence_GetCompletedValue, alloc_Reset, list_Close, list_Reset, list_SetDescriptorHeaps, list_OMSetRenderTargets, list_CopyBufferRegion, res_Map, res_Unmap; 0.1.729 Phase E: res/pso/memheap AddRef & Release, CreateShaderResourceView, CreateSampler, ResourceBarrier, DiscardResource) run as x86-64 code inside the DLL, so the game's calls to them never leave the x86 JIT; 0 (default): the ARM64EC methods, as before. Not taken while a sync diagnostic, static-cbv, view-census or trace-buffer-size is on */
     if (!want) { g_x64_leaf = 0; return; }
     mad_sync_diag_load();   /* the diagnostics are read once; what they say now holds for the process */
     if (g_sd_state > 0 || mad_scbv_on() > 0 || mad_vc_on() || mad_rbt_on()) {
@@ -25125,6 +25560,9 @@ static void mad_x64_leaf_init(void) {   /* once, at the end of build_vtables: th
     MAD_X64L_INSTALL(g_heap_vtbl.GetGPUDescriptorHandleForHeapStart, mad_x64l_heap_GetGPUDescriptorHandleForHeapStart);
     MAD_X64L_INSTALL(g_device_vtbl.GetDescriptorHandleIncrementSize, mad_x64l_device_GetDescriptorHandleIncrementSize);
     MAD_X64L_INSTALL(g_res_vtbl.Unmap, mad_x64l_res_Unmap);   /* madeira-m5 0.1.728 Phase D */
+    MAD_X64L_INSTALL(g_res_vtbl.AddRef, mad_x64l_res_AddRef);   /* madeira-m5 0.1.729 Phase E */
+    MAD_X64L_INSTALL(g_pso_vtbl.AddRef, mad_x64l_pso_AddRef);
+    MAD_X64L_INSTALL(g_memheap_vtbl.AddRef, mad_x64l_memheap_AddRef);
     MAD_X64L_INSTALL(g_device_vtbl.CopyDescriptorsSimple, mad_x64l_device_CopyDescriptorsSimple);
     MAD_X64L_INSTALL(g_device_vtbl.CreateConstantBufferView, mad_x64l_device_CreateConstantBufferView);
     MAD_X64L_INSTALL(g_list_vtbl.SetGraphicsRootDescriptorTable, mad_x64l_list_SetGraphicsRootDescriptorTable);
@@ -25153,10 +25591,18 @@ static void mad_x64_leaf_init(void) {   /* once, at the end of build_vtables: th
     MAD_X64L_INSTALL(g_list_vtbl.OMSetRenderTargets, mad_x64l_list_OMSetRenderTargets);
     MAD_X64L_INSTALL(g_list_vtbl.CopyBufferRegion, mad_x64l_list_CopyBufferRegion);
     MAD_X64L_INSTALL(g_res_vtbl.Map, mad_x64l_res_Map);
+    /* madeira-m5 0.1.729 Phase E: Release, CreateSRV, CreateSampler, ResourceBarrier, DiscardResource */
+    MAD_X64L_INSTALL(g_res_vtbl.Release, mad_x64l_res_Release);
+    MAD_X64L_INSTALL(g_pso_vtbl.Release, mad_x64l_pso_Release);
+    MAD_X64L_INSTALL(g_memheap_vtbl.Release, mad_x64l_memheap_Release);
+    MAD_X64L_INSTALL(g_device_vtbl.CreateShaderResourceView, mad_x64l_device_CreateShaderResourceView);
+    MAD_X64L_INSTALL(g_device_vtbl.CreateSampler, mad_x64l_device_CreateSampler);
+    MAD_X64L_INSTALL(g_list_vtbl.ResourceBarrier, mad_x64l_list_ResourceBarrier);
+    MAD_X64L_INSTALL(g_list_vtbl.DiscardResource, mad_x64l_list_DiscardResource);
 #undef MAD_X64L_INSTALL
     g_x64_leaf = 1;
-    d3d12_log("[madeira-d3d12] x64-leaf = 1: 32 COM methods run as x86-64 code inside the DLL (section .x64leaf; GetGPUVirtualAddress at %p in the PE view; "
-              "0.1.718 Phase B + 0.1.723 Phase C + 0.1.728 Phase D: GetCompletedValue, Reset/Close, SetDescriptorHeaps, OMSetRenderTargets, CopyBufferRegion, Map/Unmap); "
+    d3d12_log("[madeira-d3d12] x64-leaf = 1: 42 COM methods run as x86-64 code inside the DLL (section .x64leaf; GetGPUVirtualAddress at %p in the PE view; "
+              "0.1.718 Phase B + 0.1.723 Phase C + 0.1.728 Phase D + 0.1.729 Phase E: AddRef/Release, CreateSRV, CreateSampler, ResourceBarrier, DiscardResource, CC2 fence poll); "
               "every device, command list and fence created from now on carries x64_flags\n", (void *)g_res_vtbl.GetGPUVirtualAddress);
 }
 
@@ -25448,6 +25894,11 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
     if (!d) return E_OUTOFMEMORY;
     d->vtbl = &g_device_vtbl; d->refs = 1; d->iid = &IID_ID3D12Device; d->name = "Device";
     d->x64_flags = g_x64_leaf > 0 ? MAD_X64L_OK : 0;   /* madeira-m5 0.1.717 x64-leaf: decided once, in build_vtables above */
+    if (g_x64_leaf > 0) {   /* madeira-m5 0.1.729 Phase E: publish raw-typed & sampler-cache flags for .x64leaf */
+        mad_sampler_red_load();
+        if (mad_raw_typed_on()) d->x64_flags |= MAD_X64L_DEV_RAW_TYPED;
+        if (mad_smp_cache_on() && !g_smp_census) d->x64_flags |= MAD_X64L_DEV_SMP_CACHE;
+    }
     g_last_device = d;
     {   /* madeira-m5 0.1.718 [perf]: what one QueryPerformanceCounter costs here (on iPadOS each is at least a PE -> unix transition; the
          * worker and replay deltas read mad_tick, the generic timer, since 0.1.718). Once per process, 1000 calls. */
@@ -25518,7 +25969,7 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
         d3d12_log("[madeira-d3d12] residency set: %s\n", d->resset ? "attached to the queue" : "UNAVAILABLE (per-draw lists only)");
         memset(&nbi, 0, sizeof nbi);
         nbi.length = 65536;
-        nbi.options = WMTResourceStorageModeShared;
+        nbi.options = WMTResourceStorageModeShared | (mad_res_untracked_on(d) ? WMTResourceHazardTrackingModeUntracked : 0);
         d->null_buffer = MTLDevice_newBuffer(d->mtl_device, &nbi);
         if (d->null_buffer) {
             if (nbi.memory.ptr) memset(nbi.memory.ptr, 0, 65536);

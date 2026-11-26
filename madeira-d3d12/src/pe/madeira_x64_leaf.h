@@ -1,14 +1,14 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
-/* madeira-m5 0.1.717 x64-leaf (0.1.718 Phase B, 0.1.723 Phase C, 0.1.728 Phase D: 32 leaves):
+/* madeira-m5 0.1.717 x64-leaf (0.1.718 Phase B, 0.1.723 Phase C, 0.1.728 Phase D, 0.1.729 Phase E: 42 leaves):
  * the layout contract between madeira_d3d12.c (ARM64EC) and madeira_x64_leaf.c (pure x86-64), included by both.
  *
  * Horizon Forbidden West makes 1.3-1.5 M x64->ARM64EC transitions a second, 69 % of them into
  * four COM methods whose bodies are a handful of loads and stores (Round 3 forensic report,
  * section 4.2). Each transition costs 110-150 instructions and a full barrier (section 4.3).
- * With bcd.cfg x64-leaf = 1 the vtable slots of thirty-two such methods (0.1.717: 13; 0.1.718 Phase B: +8;
- * 0.1.723 Phase C: +2; 0.1.728 Phase D: +9: fence_GetCompletedValue, alloc_Reset, list_Close, list_Reset,
- * list_SetDescriptorHeaps, list_OMSetRenderTargets, list_CopyBufferRegion, res_Map, res_Unmap) name x86-64
- * code linked into the DLL (section ".x64leaf", classified X64 in the ARM64EC code map), which FEX runs as
+ * With bcd.cfg x64-leaf = 1 the vtable slots of forty-two such methods (0.1.717: 13; 0.1.718 Phase B: +8;
+ * 0.1.723 Phase C: +2; 0.1.728 Phase D: +9; 0.1.729 Phase E: +10: device_CreateShaderResourceView,
+ * device_CreateSampler, list_ResourceBarrier, list_DiscardResource, res/pso/memheap AddRef & Release) name
+ * x86-64 code linked into the DLL (section ".x64leaf", classified X64 in the ARM64EC code map), which FEX runs as
  * translated x64 without leaving the JIT. Every leaf reads and writes only fields of the object
  * it was called on, at the offsets below, and tail-jumps to the ARM64EC body for anything else.
  * Default 0: the vtables are exactly what they were.
@@ -27,7 +27,17 @@
  * on this object. Written once, when the object is created, by ARM64EC code; the leaves only read
  * it. It is set only when x64-leaf = 1 and no diagnostic mode that hooks these methods (desc-guard
  * and the other sync diagnostics, static-cbv, view-census, trace-buffer-size) was selected at device creation. */
-#define MAD_X64L_OK 1
+#define MAD_X64L_OK                 1
+#define MAD_X64L_FENCE_CC2          2   /* 0.1.729: fence created under cb-coalesce >= 2 (value-aware deferred poll) */
+#define MAD_X64L_DEV_RAW_TYPED      2   /* 0.1.729: device has raw-typed-views enabled (SRV leaf skips raw/struct buf fast path) */
+#define MAD_X64L_DEV_SMP_CACHE      4   /* 0.1.729: device allows x64 lock-free sampler cache (sampler-cache=1 && !sampler-census) */
+
+/* per-resource x64_flags (in padding after mapped) */
+#define MAD_X64L_RES_SRV_LISTED     1   /* resource already in d->srv_res (mad_view_list_add is a no-op) */
+#define MAD_X64L_RES_IN_DSET        2   /* resource already in g_rp_dset (mad_rp_dset_add is a no-op) */
+#define MAD_X64L_RES_TEX_2DARRAY    4   /* r->tex_type == WMTTextureType2DArray */
+#define MAD_X64L_RES_TEX_3D         8   /* r->tex_type == WMTTextureType3D */
+#define MAD_X64L_RES_TEX_CUBEARRAY  16  /* r->tex_type == WMTTextureTypeCubeArray */
 
 /* struct mad_cmd: the recorded command. kind at 0, the union at 8, 160 bytes in all. */
 #define MAD_X64L_CMD_SIZE          160
@@ -50,8 +60,23 @@
 #define MAD_X64L_MC_STENCIL_REF    27
 #define MAD_X64L_MC_CROOTSIG       28
 #define MAD_X64L_MC_CROOT          29
+#define MAD_X64L_MC_BARRIER        34   /* 0.1.729 Phase E */
+#define MAD_X64L_MC_DISCARD        36   /* 0.1.729 Phase E */
 #define MAD_X64L_IB_U16            0    /* WMTIndexTypeUInt16 */
 #define MAD_X64L_IB_U32            1    /* WMTIndexTypeUInt32 */
+#define MAD_X64L_BAR_MAX           16   /* MAD_BAR_MAX */
+/* enum BC_* + barrier kind flags packed into high 5 bits of u.barrier.cls[] (0.1.729) */
+#define MAD_X64L_BC_RAR            0
+#define MAD_X64L_BC_RAW_ATT        1
+#define MAD_X64L_BC_RAW_COPY       2
+#define MAD_X64L_BC_RAW_UAV        3
+#define MAD_X64L_BC_ALL            4
+#define MAD_X64L_BC_NONE           255
+#define MAD_X64L_BCF_ALIAS_AFTER   0x08u
+#define MAD_X64L_BCF_BEGIN_ONLY    0x10u
+#define MAD_X64L_BCF_TO_RT_DSW     0x20u
+#define MAD_X64L_BCF_TO_COMMON     0x40u
+#define MAD_X64L_BCF_ALIASING      0x80u
 /* list_IASetPrimitiveTopology logs once from this value on (D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ): the leaf takes the slow path there */
 #define MAD_X64L_TOPO_FALLBACK     10
 #define MAD_X64L_ROOT_PARAM_MAX    64   /* MAD_ROOT_PARAM_MAX: a root parameter index at or past it takes the slow path */
@@ -60,8 +85,14 @@
 #define MAD_X64L_DESC_SIZE         24
 #define MAD_X64L_RTV_SIZE          16
 
-/* struct mad_device: x64_flags sits in the padding after device_lost. */
+/* common COM object refcount offset (vtbl + refs) */
+#define MAD_X64L_OBJ_REFS_OFF      8
+
+/* struct mad_device: x64_flags sits in the padding after device_lost; x64 sampler cache right after it. */
 #define MAD_X64L_DEV_X64_FLAGS_OFF 60
+#define MAD_X64L_DEV_SMP_X64_OFF   64
+#define MAD_X64L_DEV_SMP_X64_N_OFF 72
+#define MAD_X64L_SMP_CAP           64
 
 /* struct mad_list: x64_flags sits in the padding after type; has_lazy_pso in padding after inflight. */
 #define MAD_X64L_LIST_TYPE_OFF     32
@@ -83,8 +114,9 @@
 #define MAD_X64L_ALLOC_RECORDING_OFF 36
 #define MAD_X64L_ALLOC_GEN_OFF     40
 
-/* struct mad_fence (0.1.728 Phase D) */
+/* struct mad_fence (0.1.728 Phase D + 0.1.729 cc=2 value-aware) */
 #define MAD_X64L_FENCE_VALUE_OFF   80
+#define MAD_X64L_FENCE_COMMITTED_OFF 96
 #define MAD_X64L_FENCE_X64_FLAGS_OFF 132
 #define MAD_X64L_FENCE_NDEFERRED_OFF 152
 
@@ -93,10 +125,19 @@
 #define MAD_X64L_PSO_CPS_OFF       40
 
 /* struct mad_resource */
+#define MAD_X64L_RES_BUFFER_OFF    80
 #define MAD_X64L_RES_CPU_OFF       88
 #define MAD_X64L_RES_SIZE_OFF      96
 #define MAD_X64L_RES_GPU_ADDRESS_OFF 112
 #define MAD_X64L_RES_MAPPED_OFF    120
+#define MAD_X64L_RES_X64_FLAGS_OFF 124
+#define MAD_X64L_RES_TEXTURE_OFF   128
+#define MAD_X64L_RES_GPU_RES_ID_OFF 136
+#define MAD_X64L_RES_IS_DEPTH_OFF  152
+#define MAD_X64L_RES_HAS_STENCIL_OFF 156
+#define MAD_X64L_RES_SAMPLES_OFF   160
+#define MAD_X64L_RES_X64_MIPS_OFF  180
+#define MAD_X64L_RES_X64_LAYERS_OFF 182
 #define MAD_X64L_RES_DESC_OFF      208
 
 /* struct mad_heap (a descriptor heap) */
@@ -110,8 +151,17 @@
 #define MAD_X64L_MEMHEAP_DESC_OFF  40
 
 /* ---- mirrors: what the x64 side sees ------------------------------------------------------ */
+struct mad_x64l_obj { void *vtbl; volatile int32_t refs; };
 struct mad_x64l_rtvp { uint16_t level, slice, layers, plane; };
 struct mad_x64l_rtv { void *res; struct mad_x64l_rtvp p; };
+/* 0.1.729 Phase E: append-only lock-free sampler cache entry (64 bytes, keyed by D3D12_SAMPLER_DESC minus MipLODBias) */
+struct mad_x64l_smp_ent {
+    uint32_t filter, au, av, aw, aniso, cmp, border;
+    float min_lod, max_lod;
+    uint32_t pad_;
+    uint64_t id;
+    uint64_t pad2_[2];
+};
 struct mad_x64l_cmd {
     int kind; int pad_;
     union {
@@ -134,6 +184,9 @@ struct mad_x64l_cmd {
         /* 0.1.728 Phase D */
         struct { void *rt[8]; unsigned n; unsigned pad_; void *depth; struct mad_x64l_rtvp v[8], dv; } rts;
         struct { void *dst, *src; uint64_t doff, soff, len; } bb;
+        /* 0.1.729 Phase E */
+        struct { void *res[MAD_X64L_BAR_MAX]; uint8_t cls[MAD_X64L_BAR_MAX]; uint16_t uav_mask; uint8_t n, all, all_tex, cls_noref, vsread, spill; } barrier;
+        struct { void *res; unsigned whole; } discard;
         unsigned char raw[MAD_X64L_CMD_SIZE - MAD_X64L_CMD_U_OFF];
     } u;
 };
@@ -143,6 +196,8 @@ struct mad_x64l_device {
     uint64_t mtl_device, mtl_queue, dsso;
     int device_lost;
     int x64_flags;
+    const struct mad_x64l_smp_ent *smp_x64;
+    volatile int32_t smp_x64_n;
 };
 struct mad_x64l_alloc {
     void *vtbl; int refs; const void *iid; const char *name;
@@ -153,13 +208,16 @@ struct mad_x64l_alloc {
 struct mad_x64l_fence {
     unsigned char head[MAD_X64L_FENCE_VALUE_OFF];
     uint64_t value;
-    unsigned char mid1[MAD_X64L_FENCE_X64_FLAGS_OFF - MAD_X64L_FENCE_VALUE_OFF - 8];
+    uint64_t submitted;
+    int64_t committed;
+    unsigned char mid1[MAD_X64L_FENCE_X64_FLAGS_OFF - MAD_X64L_FENCE_COMMITTED_OFF - 8];
     int32_t x64_flags;
     unsigned char mid2[MAD_X64L_FENCE_NDEFERRED_OFF - MAD_X64L_FENCE_X64_FLAGS_OFF - 4];
     volatile int32_t ndeferred;
 };
 struct mad_x64l_pso {
-    unsigned char head[MAD_X64L_PSO_RPS_OFF];
+    void *vtbl; volatile int32_t refs;
+    unsigned char head[MAD_X64L_PSO_RPS_OFF - 12];
     uint64_t rps;
     uint64_t cps;
 };
@@ -195,23 +253,38 @@ struct mad_x64l_heap {
     unsigned count;
 };
 struct mad_x64l_resource {
-    unsigned char head[MAD_X64L_RES_CPU_OFF];
+    void *vtbl; volatile int32_t refs;
+    unsigned char head[MAD_X64L_RES_BUFFER_OFF - 12];
+    uint64_t buffer;
     void *cpu;
     uint64_t size;
     unsigned char mid0[MAD_X64L_RES_GPU_ADDRESS_OFF - MAD_X64L_RES_SIZE_OFF - 8];
     uint64_t gpu_address;
     volatile int32_t mapped;
-    unsigned char mid1[MAD_X64L_RES_DESC_OFF - MAD_X64L_RES_MAPPED_OFF - 4];
+    volatile int32_t x64_flags;
+    uint64_t texture;
+    uint64_t gpu_resource_id;
+    uint32_t width, height;
+    int32_t is_depth;
+    int32_t has_stencil;
+    uint32_t samples;
+    unsigned char mid1[MAD_X64L_RES_X64_MIPS_OFF - MAD_X64L_RES_SAMPLES_OFF - 4];
+    uint16_t x64_mips;
+    uint16_t x64_layers;
+    unsigned char mid2[MAD_X64L_RES_DESC_OFF - MAD_X64L_RES_X64_LAYERS_OFF - 2];
     D3D12_RESOURCE_DESC desc;
 };
 struct mad_x64l_memheap {
-    unsigned char head[MAD_X64L_MEMHEAP_DESC_OFF];
+    void *vtbl; volatile int32_t refs;
+    unsigned char head[MAD_X64L_MEMHEAP_DESC_OFF - 12];
     D3D12_HEAP_DESC desc;
 };
 
 /* The mirrors against the constants: compiled on both sides. */
 #define MAD_X64L_CHECK(c) _Static_assert(c, "madeira_x64_leaf.h: " #c)
 MAD_X64L_CHECK(sizeof(struct mad_x64l_cmd) == MAD_X64L_CMD_SIZE);
+MAD_X64L_CHECK(sizeof(struct mad_x64l_smp_ent) == 64);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_obj, refs) == MAD_X64L_OBJ_REFS_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u) == MAD_X64L_CMD_U_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.root.value) == MAD_X64L_CMD_U_OFF + 8);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.heaps.smp) == MAD_X64L_CMD_U_OFF + 8);
@@ -225,9 +298,14 @@ MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.ib.gpu_va) == MAD_X64L_CMD_U_OFF 
 MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.vb.slot) == MAD_X64L_CMD_U_OFF && offsetof(struct mad_x64l_cmd, u.vb.gpu_va) == MAD_X64L_CMD_U_OFF + 24 && offsetof(struct mad_x64l_cmd, u.vb.stride) == MAD_X64L_CMD_U_OFF + 32);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.rts.depth) == MAD_X64L_CMD_U_OFF + 72 && offsetof(struct mad_x64l_cmd, u.rts.dv) == MAD_X64L_CMD_U_OFF + 144);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.bb.doff) == MAD_X64L_CMD_U_OFF + 16 && offsetof(struct mad_x64l_cmd, u.bb.len) == MAD_X64L_CMD_U_OFF + 32);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.barrier.cls) == MAD_X64L_CMD_U_OFF + 128 && offsetof(struct mad_x64l_cmd, u.barrier.uav_mask) == MAD_X64L_CMD_U_OFF + 144 &&
+               offsetof(struct mad_x64l_cmd, u.barrier.n) == MAD_X64L_CMD_U_OFF + 146 && offsetof(struct mad_x64l_cmd, u.barrier.spill) == MAD_X64L_CMD_U_OFF + 151);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_cmd, u.discard.res) == MAD_X64L_CMD_U_OFF && offsetof(struct mad_x64l_cmd, u.discard.whole) == MAD_X64L_CMD_U_OFF + 8);
 MAD_X64L_CHECK(sizeof(struct mad_x64l_desc) == MAD_X64L_DESC_SIZE);
 MAD_X64L_CHECK(sizeof(struct mad_x64l_rtv) == MAD_X64L_RTV_SIZE);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_device, x64_flags) == MAD_X64L_DEV_X64_FLAGS_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_device, smp_x64) == MAD_X64L_DEV_SMP_X64_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_device, smp_x64_n) == MAD_X64L_DEV_SMP_X64_N_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_list, type) == MAD_X64L_LIST_TYPE_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_list, x64_flags) == MAD_X64L_LIST_X64_FLAGS_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_list, alloc) == MAD_X64L_LIST_ALLOC_OFF);
@@ -245,23 +323,36 @@ MAD_X64L_CHECK(offsetof(struct mad_x64l_list, ncdata) == MAD_X64L_LIST_NCDATA_OF
 MAD_X64L_CHECK(offsetof(struct mad_x64l_alloc, recording) == MAD_X64L_ALLOC_RECORDING_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_alloc, generation) == MAD_X64L_ALLOC_GEN_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_fence, value) == MAD_X64L_FENCE_VALUE_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_fence, committed) == MAD_X64L_FENCE_COMMITTED_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_fence, x64_flags) == MAD_X64L_FENCE_X64_FLAGS_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_fence, ndeferred) == MAD_X64L_FENCE_NDEFERRED_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_pso, refs) == MAD_X64L_OBJ_REFS_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_pso, rps) == MAD_X64L_PSO_RPS_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_pso, cps) == MAD_X64L_PSO_CPS_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, refs) == MAD_X64L_OBJ_REFS_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, buffer) == MAD_X64L_RES_BUFFER_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, cpu) == MAD_X64L_RES_CPU_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, size) == MAD_X64L_RES_SIZE_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, gpu_address) == MAD_X64L_RES_GPU_ADDRESS_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, mapped) == MAD_X64L_RES_MAPPED_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, x64_flags) == MAD_X64L_RES_X64_FLAGS_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, texture) == MAD_X64L_RES_TEXTURE_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, gpu_resource_id) == MAD_X64L_RES_GPU_RES_ID_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, is_depth) == MAD_X64L_RES_IS_DEPTH_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, has_stencil) == MAD_X64L_RES_HAS_STENCIL_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, samples) == MAD_X64L_RES_SAMPLES_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, x64_mips) == MAD_X64L_RES_X64_MIPS_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, x64_layers) == MAD_X64L_RES_X64_LAYERS_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_resource, desc) == MAD_X64L_RES_DESC_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_heap, type) == MAD_X64L_HEAP_TYPE_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_heap, slots) == MAD_X64L_HEAP_SLOTS_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_heap, buffer) == MAD_X64L_HEAP_BUFFER_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_heap, cpu) == MAD_X64L_HEAP_CPU_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_heap, gpu_address) == MAD_X64L_HEAP_GPU_ADDRESS_OFF);
+MAD_X64L_CHECK(offsetof(struct mad_x64l_memheap, refs) == MAD_X64L_OBJ_REFS_OFF);
 MAD_X64L_CHECK(offsetof(struct mad_x64l_memheap, desc) == MAD_X64L_MEMHEAP_DESC_OFF);
 
-/* ---- the thirty-two leaves (defined in madeira_x64_leaf.c, installed by madeira_d3d12.c) ---- */
+/* ---- the forty-two leaves (defined in madeira_x64_leaf.c, installed by madeira_d3d12.c) ---- */
 D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE mad_x64l_res_GetGPUVirtualAddress(ID3D12Resource *This);
 D3D12_RESOURCE_DESC * STDMETHODCALLTYPE mad_x64l_res_GetDesc(ID3D12Resource *This, D3D12_RESOURCE_DESC *ret);
 D3D12_HEAP_DESC * STDMETHODCALLTYPE mad_x64l_memheap_GetDesc(ID3D12Heap *This, D3D12_HEAP_DESC *ret);
@@ -269,6 +360,9 @@ D3D12_CPU_DESCRIPTOR_HANDLE * STDMETHODCALLTYPE mad_x64l_heap_GetCPUDescriptorHa
 D3D12_GPU_DESCRIPTOR_HANDLE * STDMETHODCALLTYPE mad_x64l_heap_GetGPUDescriptorHandleForHeapStart(ID3D12DescriptorHeap *This, D3D12_GPU_DESCRIPTOR_HANDLE *out);
 UINT STDMETHODCALLTYPE mad_x64l_device_GetDescriptorHandleIncrementSize(ID3D12Device *This, D3D12_DESCRIPTOR_HEAP_TYPE type);
 void STDMETHODCALLTYPE mad_x64l_res_Unmap(ID3D12Resource *This, UINT sub, const D3D12_RANGE *written);   /* 0.1.728 Phase D */
+ULONG STDMETHODCALLTYPE mad_x64l_res_AddRef(ID3D12Resource *This);   /* 0.1.729 Phase E */
+ULONG STDMETHODCALLTYPE mad_x64l_pso_AddRef(ID3D12PipelineState *This);
+ULONG STDMETHODCALLTYPE mad_x64l_memheap_AddRef(ID3D12Heap *This);
 void STDMETHODCALLTYPE mad_x64l_device_CopyDescriptorsSimple(ID3D12Device *This, UINT n, D3D12_CPU_DESCRIPTOR_HANDLE dst,
                                                             D3D12_CPU_DESCRIPTOR_HANDLE src, D3D12_DESCRIPTOR_HEAP_TYPE type);
 void STDMETHODCALLTYPE mad_x64l_device_CreateConstantBufferView(ID3D12Device *This, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc,
@@ -299,8 +393,16 @@ void STDMETHODCALLTYPE mad_x64l_list_SetDescriptorHeaps(ID3D12GraphicsCommandLis
 void STDMETHODCALLTYPE mad_x64l_list_OMSetRenderTargets(ID3D12GraphicsCommandList *This, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE *rtvs, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE *dsv);
 void STDMETHODCALLTYPE mad_x64l_list_CopyBufferRegion(ID3D12GraphicsCommandList *This, ID3D12Resource *dst, UINT64 dst_off, ID3D12Resource *src, UINT64 src_off, UINT64 len);
 HRESULT STDMETHODCALLTYPE mad_x64l_res_Map(ID3D12Resource *This, UINT sub, const D3D12_RANGE *read_range, void **data);
+/* 0.1.729 Phase E: SRV, Sampler, ResourceBarrier, DiscardResource, Release */
+void STDMETHODCALLTYPE mad_x64l_device_CreateShaderResourceView(ID3D12Device *This, ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE h);
+void STDMETHODCALLTYPE mad_x64l_device_CreateSampler(ID3D12Device *This, const D3D12_SAMPLER_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE h);
+void STDMETHODCALLTYPE mad_x64l_list_ResourceBarrier(ID3D12GraphicsCommandList *This, UINT n, const D3D12_RESOURCE_BARRIER *b);
+void STDMETHODCALLTYPE mad_x64l_list_DiscardResource(ID3D12GraphicsCommandList *This, ID3D12Resource *res, const D3D12_DISCARD_REGION *region);
+ULONG STDMETHODCALLTYPE mad_x64l_res_Release(ID3D12Resource *This);
+ULONG STDMETHODCALLTYPE mad_x64l_pso_Release(ID3D12PipelineState *This);
+ULONG STDMETHODCALLTYPE mad_x64l_memheap_Release(ID3D12Heap *This);
 
-/* ---- the twenty-five ARM64EC fallbacks (madeira_d3d12.c) the leaves with a slow path jump to ----
+/* ---- the thirty-two ARM64EC fallbacks (madeira_d3d12.c) the leaves with a slow path jump to ----
  * External linkage, so each has an entry thunk and the word before its body that FEX reads
  * ([target - 4]). The x64 side declares them itself, naming the "#" bodies. */
 #if defined(__arm64ec__)
@@ -332,6 +434,14 @@ void STDMETHODCALLTYPE mad_ecfb_list_SetDescriptorHeaps(ID3D12GraphicsCommandLis
 void STDMETHODCALLTYPE mad_ecfb_list_OMSetRenderTargets(ID3D12GraphicsCommandList *This, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE *rtvs, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE *dsv);
 void STDMETHODCALLTYPE mad_ecfb_list_CopyBufferRegion(ID3D12GraphicsCommandList *This, ID3D12Resource *dst, UINT64 dst_off, ID3D12Resource *src, UINT64 src_off, UINT64 len);
 HRESULT STDMETHODCALLTYPE mad_ecfb_res_Map(ID3D12Resource *This, UINT sub, const D3D12_RANGE *read_range, void **data);
+/* 0.1.729 Phase E */
+void STDMETHODCALLTYPE mad_ecfb_device_CreateShaderResourceView(ID3D12Device *This, ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE h);
+void STDMETHODCALLTYPE mad_ecfb_device_CreateSampler(ID3D12Device *This, const D3D12_SAMPLER_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE h);
+void STDMETHODCALLTYPE mad_ecfb_list_ResourceBarrier(ID3D12GraphicsCommandList *This, UINT n, const D3D12_RESOURCE_BARRIER *b);
+void STDMETHODCALLTYPE mad_ecfb_list_DiscardResource(ID3D12GraphicsCommandList *This, ID3D12Resource *res, const D3D12_DISCARD_REGION *region);
+ULONG STDMETHODCALLTYPE mad_ecfb_res_Release(ID3D12Resource *This);
+ULONG STDMETHODCALLTYPE mad_ecfb_pso_Release(ID3D12PipelineState *This);
+ULONG STDMETHODCALLTYPE mad_ecfb_memheap_Release(ID3D12Heap *This);
 #endif
 
 #endif /* MADEIRA_X64_LEAF_H */

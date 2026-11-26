@@ -31,7 +31,9 @@ PURE = ['res_GetGPUVirtualAddress', 'res_GetDesc', 'memheap_GetDesc',
         'heap_GetCPUDescriptorHandleForHeapStart', 'heap_GetGPUDescriptorHandleForHeapStart',
         'device_GetDescriptorHandleIncrementSize',
         # madeira-m5 0.1.728 Phase D
-        'res_Unmap']
+        'res_Unmap',
+        # madeira-m5 0.1.729 Phase E
+        'res_AddRef', 'pso_AddRef', 'memheap_AddRef']
 FALLBACK = ['device_CopyDescriptorsSimple', 'device_CreateConstantBufferView',
             'list_SetGraphicsRootDescriptorTable', 'list_SetComputeRootDescriptorTable',
             'list_DrawInstanced', 'list_DrawIndexedInstanced', 'list_SetPipelineState',
@@ -42,7 +44,10 @@ FALLBACK = ['device_CopyDescriptorsSimple', 'device_CreateConstantBufferView',
             'list_IASetIndexBuffer', 'list_IASetVertexBuffers',
             # madeira-m5 0.1.728 Phase D: fence poll, lifecycle, heaps, render targets, buffer copy, Map
             'fence_GetCompletedValue', 'alloc_Reset', 'list_Close', 'list_Reset',
-            'list_SetDescriptorHeaps', 'list_OMSetRenderTargets', 'list_CopyBufferRegion', 'res_Map']
+            'list_SetDescriptorHeaps', 'list_OMSetRenderTargets', 'list_CopyBufferRegion', 'res_Map',
+            # madeira-m5 0.1.729 Phase E: SRV, Sampler, ResourceBarrier, DiscardResource, Release
+            'device_CreateShaderResourceView', 'device_CreateSampler', 'list_ResourceBarrier',
+            'list_DiscardResource', 'res_Release', 'pso_Release', 'memheap_Release']
 LEAVES = PURE + FALLBACK
 SECTION = '.x64leaf'
 PAGE = 0x1000
@@ -114,7 +119,8 @@ def host_checks():
                   'MAD_X64L_MC_VP', 'MAD_X64L_MC_SCISSOR', 'MAD_X64L_MC_TOPO', 'MAD_X64L_MC_BLEND_FACTOR', 'MAD_X64L_MC_DISPATCH',   # 0.1.718 Phase B
                   'MAD_X64L_MC_ROOTSIG', 'MAD_X64L_MC_STENCIL_REF', 'MAD_X64L_MC_CROOTSIG', 'MAD_X64L_TOPO_FALLBACK',
                   'MAD_X64L_MC_IB', 'MAD_X64L_MC_VB', 'MAD_X64L_IB_U16', 'MAD_X64L_IB_U32',   # 0.1.723 Phase C
-                  'MAD_X64L_MC_HEAPS', 'MAD_X64L_MC_RTS', 'MAD_X64L_MC_COPY_BB']   # 0.1.728 Phase D
+                  'MAD_X64L_MC_HEAPS', 'MAD_X64L_MC_RTS', 'MAD_X64L_MC_COPY_BB',   # 0.1.728 Phase D
+                  'MAD_X64L_MC_BARRIER', 'MAD_X64L_MC_DISCARD']   # 0.1.729 Phase E
     assert len(constants) >= 20, constants
     header_asserts = re.findall(r'^MAD_X64L_CHECK\((.*)\);', header, re.M)
     native_asserts = [m for m in re.findall(r'_Static_assert\(((?:[^;])*?)"x64-leaf:', native, re.S)]
@@ -128,12 +134,13 @@ def host_checks():
               'MC_DISPATCH == MAD_X64L_MC_DISPATCH', 'MC_ROOTSIG == MAD_X64L_MC_ROOTSIG', 'MC_STENCIL_REF == MAD_X64L_MC_STENCIL_REF',
               'MC_CROOTSIG == MAD_X64L_MC_CROOTSIG', 'D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ == MAD_X64L_TOPO_FALLBACK',   # 0.1.718 Phase B
               'MC_IB == MAD_X64L_MC_IB', 'MC_VB == MAD_X64L_MC_VB', 'WMTIndexTypeUInt16 == MAD_X64L_IB_U16', 'WMTIndexTypeUInt32 == MAD_X64L_IB_U32',   # 0.1.723 Phase C
-              'MC_HEAPS == MAD_X64L_MC_HEAPS', 'MC_RTS == MAD_X64L_MC_RTS', 'MC_COPY_BB == MAD_X64L_MC_COPY_BB'):   # 0.1.728 Phase D
+              'MC_HEAPS == MAD_X64L_MC_HEAPS', 'MC_RTS == MAD_X64L_MC_RTS', 'MC_COPY_BB == MAD_X64L_MC_COPY_BB',   # 0.1.728 Phase D
+              'MC_BARRIER == MAD_X64L_MC_BARRIER', 'MC_DISCARD == MAD_X64L_MC_DISCARD'):   # 0.1.729 Phase E
         assert c in native, f'{c}: asserted in madeira_d3d12.c'
 
     # 4. madeira_d3d12.c: external fallbacks that call the static methods; the install behind the switch
     for name in FALLBACK:
-        m = re.search(rf'\n(?:void|UINT64|HRESULT) STDMETHODCALLTYPE mad_ecfb_{name}\(', native)
+        m = re.search(rf'\n(?:void|UINT64|HRESULT|ULONG) STDMETHODCALLTYPE mad_ecfb_{name}\(', native)
         assert m, f'{name}: ARM64EC fallback missing'
         wrapper = body_of(native, m.group(0))
         assert re.search(rf'\b{name}\(This', wrapper), f'{name}: the fallback calls the ARM64EC method'

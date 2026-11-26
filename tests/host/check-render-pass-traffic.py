@@ -101,8 +101,8 @@ check("replay loop: the list end may hand the open pass over before ending it",
       "    if (e.renc) InterlockedIncrement(&g_pass_end_list);\n    exec_end(&e);\n" in loop
       and "    if (e.npend) InterlockedExchangeAdd(&g_tr_listend_flush, (LONG)e.npend);   /* madeira-m5 0.1.718 [perf]: clears applied at the list end */\n"
       "    e.cc_flush_end = 1;   /* 0.1.719: a carried clear applied here is counted at the call end */\n"
-      "    while (e.npend) exec_flush_clear(&e, 0);" in loop
-      and loop.index("exec_end(&e);\n") < loop.index("while (e.npend) exec_flush_clear(&e, 0);"))
+      "    if (e.npend) exec_flush_clears_batch(&e, (1u << e.npend) - 1u);" in loop
+      and loop.index("exec_end(&e);\n") < loop.index("if (e.npend) exec_flush_clears_batch(&e, (1u << e.npend) - 1u);"))
 check("replay loop: clear-defer-carry hands pending clears to the next list only into a free carry slot, with the mode, before the list-end flush (0.1.719)",
       "    if (e.npend && q->rp_next && q->rp_carry && !q->rp_carry->renc && !q->rp_carry->npend && mad_clear_carry_on() > 0) {" in loop
       and "memcpy(k->pend, e.pend, e.npend * sizeof e.pend[0]); k->npend = e.npend; k->mode = e.mode;" in loop
@@ -137,7 +137,7 @@ for name, sig in (("exec_flush_clear", "static void exec_flush_clear(struct mad_
 census = func("static void f7_store_census(")
 check("the ml1137 census sees a whole discard after a store", "case MC_DISCARD:" in census and "&g_ac_st_discarded" in census)
 check("late stores: only with rp-discard, no capture, a discarded texture attached and op 24 answering",
-      "if (mad_rp_discard_on() == 1 && !g_capture_on && exec_rp_late_want(e) && mad_rp_late_ok()) {" in begin
+      "if ((mad_rp_discard_on() == 1 || mad_rp_discard_on() == 5) && !g_capture_on && exec_rp_late_want(e) && mad_rp_late_ok()) {" in begin
       and "if (e->rp_late) exec_rp_late_store(e);   /* madeira-bcd rp-discard: the store actions the pass left open */" in func("static void exec_end(struct mad_exec *e) {")
       and "MTLCommandEncoder_endEncoding(e->renc);" in func("static void exec_end(struct mad_exec *e) {")
       and "if (c->u.discard.whole && mad_rp_discard_on()) mad_rp_dset_add(r);" in disc
@@ -260,7 +260,15 @@ struct mad_pso { const char *vs_name, *ps_name; };
 struct mad_rootsig; struct mad_heap; struct mad_memheap; struct mad_queryheap; struct mad_skinx;
 ''' + rtvp + r'''
 struct mad_resource { obj_handle_t texture, buffer; UINT32 width, height; int is_depth, has_stencil; UINT samples;
-                      enum WMTTextureType tex_type; enum WMTPixelFormat tex_pf; UINT tex_mips; D3D12_RESOURCE_DESC desc; };
+                      enum WMTTextureType tex_type; enum WMTPixelFormat tex_pf; UINT tex_mips; D3D12_RESOURCE_DESC desc;
+                      volatile LONG x64_flags; struct mad_memheap *placed_heap; UINT64 placed_off, placed_size; };
+#define MAD_X64L_RES_IN_DSET 2
+static int mad_res_aliases(const struct mad_resource *a, const struct mad_resource *b) {
+    if (!a || !b) return 0;
+    if (a == b) return 1;
+    if (!a->placed_heap || a->placed_heap != b->placed_heap) return 0;
+    return a->placed_off < b->placed_off + b->placed_size && b->placed_off < a->placed_off + a->placed_size;
+}
 struct mad_vis_batch { UINT64 next; int dirty; unsigned active; };
 struct mad_device { LONG has_query_heaps; };
 struct mad_alloc { LONG generation; };
@@ -290,7 +298,7 @@ static void *InterlockedCompareExchangePointer(void *volatile *p, void *x, void 
 /* encode-batch: what this thread queued goes out (recorded: op 24 must come after it) */
 ''' + eb_enum + r'''
 static int eb_flushed;
-static void mad_eb_flush_cur(int why) { if (why == EBF_OTHER) eb_flushed = 1; }
+static void mad_eb_flush_cur(int why) { if (why == EBF_OTHER || why == EBF_END) eb_flushed = 1; }
 /* MadeiraCtl op 24 as tools/patch-winemetal-rp-store.py answers it (op24_ok = 0: a winemetal without it) */
 static int op24_ok, op24_probes, n24, f24[64]; static struct { UINT64 enc; UINT8 color[8], depth, stencil, pad[6]; } r24[64];
 void MadeiraCtl(struct madeira_ctl_args *a) {
@@ -358,6 +366,7 @@ static void mad_label(obj_handle_t enc, const char *fmt, ...) { (void)enc; (void
 static void exec_rp_late_store(struct mad_exec *e);
 static void exec_rp_dead_census(struct mad_exec *e);
 static int mad_rp_discard_on(void);
+static void exec_flush_clears_batch(struct mad_exec *e, UINT mask);
 ''' + func("static void exec_end(struct mad_exec *e) {") + helpers + block + flush_add + \
     func("static void exec_attachless_area(") + func("static int exec_same_targets(struct mad_exec *e) {") + begin + \
     rar + r'''
