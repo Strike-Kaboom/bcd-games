@@ -3735,6 +3735,12 @@ jobs:
       - name: Patch winemetal late render-pass store actions
         run: python3 tools/patch-winemetal-rp-store.py
 
+      # madeira-m5 0.1.730: unretained command buffers (MadeiraCtl op 25, cb-unretained = 1)
+      # and inline compute memoryBarrierWithScope: (compute cmd 12, probe op 26, cs-barrier-keep = 1).
+      # Native only.
+      - name: Patch winemetal M5 fast path (unretained CB + compute memoryBarrier)
+        run: python3 tools/patch-winemetal-m5-fast.py
+
       # bcd.cfg heap-untracked = 1 (opt-in): madeira-d3d12's placement heaps
       # (D3D12 DEFAULT heaps, its texture heaps) without Metal hazard tracking;
       # the runtime's encoder fences order its work. Native only.

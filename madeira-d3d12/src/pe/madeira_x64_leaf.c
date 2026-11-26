@@ -253,8 +253,13 @@ MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_DrawInstanced(ID3D12GraphicsC
 MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_DrawIndexedInstanced(ID3D12GraphicsCommandList *This, UINT icount, UINT inst, UINT start, INT base, UINT istart) {
     struct mad_x64l_list *l = (struct mad_x64l_list *)This;
     struct mad_x64l_cmd *c;
-    if (!mad_x64l_push(l, MAD_X64L_MC_DRAW_INDEXED, &c)) { MAD_X64L_TAIL return mad_ecfb_list_DrawIndexedInstanced(This, icount, inst, start, base, istart); }
-    if (c) { c->u.drawi.icount = icount; c->u.drawi.inst = inst; c->u.drawi.start = start; c->u.drawi.base = base; c->u.drawi.istart = istart; }
+    if (!l || !(l->x64_flags & MAD_X64L_OK) || (!l->closed && l->ncmds >= l->ccap)) {
+        MAD_X64L_TAIL return mad_ecfb_list_DrawIndexedInstanced(This, icount, inst, start, base, istart);
+    }
+    if (l->closed) return;
+    c = &l->cmds[l->ncmds++];
+    c->kind = MAD_X64L_MC_DRAW_INDEXED;
+    c->u.drawi.icount = icount; c->u.drawi.inst = inst; c->u.drawi.start = start; c->u.drawi.base = base; c->u.drawi.istart = istart;
 }
 MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_SetPipelineState(ID3D12GraphicsCommandList *This, ID3D12PipelineState *pso) {
     struct mad_x64l_list *l = (struct mad_x64l_list *)This;
@@ -355,7 +360,7 @@ MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_IASetVertexBuffers(ID3D12Grap
     struct mad_x64l_list *l = (struct mad_x64l_list *)This;
     UINT i;
     if (!n) return;
-    if (!(l->x64_flags & MAD_X64L_OK) || n > 16 || (uint64_t)l->ncmds + n > (uint64_t)l->ccap) { MAD_X64L_TAIL return mad_ecfb_list_IASetVertexBuffers(This, start, n, views); }
+    if (!l || !(l->x64_flags & MAD_X64L_OK) || n > 16 || (uint64_t)l->ncmds + n > (uint64_t)l->ccap) { MAD_X64L_TAIL return mad_ecfb_list_IASetVertexBuffers(This, start, n, views); }
     if (l->closed) return;
     for (i = 0; i < n; i++) {
         struct mad_x64l_cmd *c = &l->cmds[l->ncmds++];
@@ -677,7 +682,7 @@ MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_ResourceBarrier(ID3D12Graphic
                 if (!as || (as & W) || !bs) {
                     cls = MAD_X64L_BC_ALL;
                     if (!bs || !as || (bs & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) || (as & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) uav_haz = 1;
-                    if (as & F5_VS) f5_vs = 1;
+                    if (!as || (as & F5_VS) || uav_haz) f5_vs = 1;
                 } else if (!(bs & W)) {
                     cls = MAD_X64L_BC_RAR;
                     if (as & F5_VS) f5_vs = 1;
@@ -690,10 +695,10 @@ MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_ResourceBarrier(ID3D12Graphic
                 } else if (bs == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
                     cls = MAD_X64L_BC_RAW_UAV;
                     uav_haz = 1;
-                    if (as & F5_VS) f5_vs = 1;
+                    f5_vs = 1;
                 } else {
                     uav_haz = 1;
-                    if (as & F5_VS) f5_vs = 1;
+                    f5_vs = 1;
                 }
                 cls = (uint8_t)(cls | bcf);
             }
@@ -701,6 +706,7 @@ MAD_X64L_LEAF void STDMETHODCALLTYPE mad_x64l_list_ResourceBarrier(ID3D12Graphic
             r = (void *)b[i].UAV.pResource;
             cls = MAD_X64L_BC_RAW_UAV;
             uav_haz = 1;
+            f5_vs = 1;
         }
         if (uav_haz) c->u.barrier.uav_mask |= (uint16_t)(1u << c->u.barrier.n);
         c->u.barrier.cls[c->u.barrier.n] = cls;

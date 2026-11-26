@@ -359,6 +359,9 @@ static int mad_name_in_list(const char *list, const char *name) {
     return 0;
 }
 static LONG g_barrier_renc_closed, g_barrier_renc_kept, g_br2_why[4], g_br3_uav_kept, g_benc_bar_kept, g_stencil_srv, g_barrier_seen;
+/* madeira-m5 0.1.730: unretained CBs (op 25), inline compute memoryBarrier (cmd 12 / op 26), compute/blit carry across lists */
+static int g_cb_unretained = -1, g_cs_barrier_keep = -1, g_cs_carry = -1;
+static volatile LONG g_cb_unretained_made, g_cenc_bar_kept, g_cenc_bar_skip, g_cenc_bar_rar, g_cenc_membar_emitted, g_cs_carried, g_blit_carried, g_f5_vs_syncs;
 static volatile LONG64 g_perf_draws_total;   /* madeira-m5 0.1.725: cumulative draws executed, for gameplay-gated Present role 'P' */
 static int g_attachless_split = -1; static LONG g_attachless_split_n;   /* ml1311 */
 struct mad_obj {
@@ -521,6 +524,11 @@ struct mad_device {
      * other member moves. */
     struct mad_smp_cache_ent *smp_cache;
     LONG smp_cache_n;
+    /* madeira-m5 0.1.730 cb-unretained: GPU-lifetime deferred release + unresident queue gated on flush_all_gen */
+    struct mad_uret { obj_handle_t obj; obj_handle_t heap; void *mem; UINT64 serial; UINT64 fgen; UINT8 unres; } *uret;
+    unsigned nuret, uret_cap;
+    volatile LONG64 flush_all_gen;
+    UINT64 flush_all_serial[16];
 };
 static LONG g_tview_live, g_tview_made, g_xview_live;   /* ml1126 */
 static LONG g_resolve_locked, g_resolve_miss;   /* ml1132: address lookups that took live_lock */
@@ -951,6 +959,14 @@ static inline void mad_es_time(int kind, UINT64 dt) {
     if (kind == 0) { InterlockedExchangeAdd64(&g_es_enc_t, (LONG64)dt); InterlockedIncrement(&g_es_enc_n); }
     else { InterlockedExchangeAdd64(&g_es_open_t, (LONG64)dt); if (kind == 1) InterlockedIncrement(&g_es_open_n); }
 }
+/* madeira-m5 0.1.730: inline compute memoryBarrierWithScope: (tools/patch-winemetal-m5-fast.py, compute cmd 12) */
+#define MAD_WMT_COMPUTE_MEM_BARRIER 12u
+struct mad_wmtcmd_compute_mem_barrier {
+    enum WMTComputeCommandType type;
+    uint16_t reserved[3];
+    struct WMTMemoryPointer next;
+    uint64_t scope;
+};
 /* One command's size, and the memory it points at (*pay, *plen). 0: not queued. */
 static size_t mad_eb_size(int kind, const struct wmtcmd_base *c, const void **pay, size_t *plen) {
     *pay = NULL; *plen = 0;
@@ -1014,6 +1030,7 @@ static size_t mad_eb_size(int kind, const struct wmtcmd_base *c, const void **pa
     }
     case WMTComputeCommandSetTexture: return sizeof(struct wmtcmd_compute_settexture);
     case WMTComputeCommandWaitForFence: case WMTComputeCommandUpdateFence: return sizeof(struct wmtcmd_compute_fence_op);
+    case MAD_WMT_COMPUTE_MEM_BARRIER: return sizeof(struct mad_wmtcmd_compute_mem_barrier);
     default: return 0;
     }
     switch (c->type) {
@@ -1611,6 +1628,7 @@ struct mad_pso {
     struct madeira_ir_air_range *ps_air;
     struct mad_tess *tess;                          /* ml1083: hull/domain as an object/mesh pipeline, NULL if not built */
     struct mad_tess *tess_strip;                    /* ml1147b: a DXBC geometry pipeline's STRIP-topology variant */
+    struct mad_device *owner;                       /* madeira-m5 0.1.730: for GPU-lifetime deferral under cb-unretained */
 };
 
 /* ml1083: TESSELLATION.
@@ -1724,6 +1742,8 @@ struct mad_memheap;
 static void mad_pl_del(struct mad_memheap *h, struct mad_resource *r);
 struct mad_device;
 static void mad_mheap_reclaim(struct mad_device *d, int all);   /* ml1148 */
+static void mad_uret_push(struct mad_device *d, obj_handle_t obj, obj_handle_t heap, void *mem, UINT8 unres);
+static void mad_uret_reclaim(struct mad_device *d, int all);
 struct mad_rootsig;
 static UINT mad_root_layout(const struct mad_rootsig *rs, UINT offsets[MAD_ROOT_PARAM_MAX]);
 static int mad_tiled_on(void);   /* d3d12-tiled-resources (opt-in), see TILED RESOURCES */
@@ -2387,7 +2407,10 @@ static ULONG STDMETHODCALLTYPE list_Release(ID3D12GraphicsCommandList *This) {
     if (r == 0) { mad_pd_purge(This);   /* ml1143 */
         if (l->alloc && !l->closed) InterlockedDecrement(&l->alloc->recording);
         if (l->alloc) ID3D12CommandAllocator_Release((ID3D12CommandAllocator *)l->alloc);
-        for (unsigned k = 0; k < l->nrings; k++) NSObject_release(l->rings[k]);
+        for (unsigned k = 0; k < l->nrings; k++) {
+            if (g_cb_unretained > 0 && l->device) mad_uret_push(l->device, l->rings[k], 0, NULL, 0);
+            else NSObject_release(l->rings[k]);
+        }
         if (l->nrings) InterlockedExchangeAdd(&g_ring_chunks, -(LONG)l->nrings);   /* madeira-bcd metal-gap: live chunks */
         free(l->rings); free(l->ring_cpu); free(l->ring_gpu); free(l->cmds); free(l->used); free(l->cdata);
         free(l);
@@ -2622,7 +2645,7 @@ struct mad_exec {
     struct mad_rtvp rtp[8], dp; struct mad_rtvp enc_rtp[8], enc_dp;            /* ml925: bound / encoded sub-views */
     struct mad_resource *enc_rt[8]; UINT enc_nrt; struct mad_resource *enc_depth; /* what the open encoder has */
     UINT enc_w, enc_h;              /* ml934b: and the area it was created with */
-    UINT8 enc_wrote_uav, enc_uav_bar_pending;   /* madeira-m5 0.1.728 barrier-render = 3: open render pass wrote a UAV / passed a UAV barrier */
+    UINT8 enc_wrote_uav, enc_uav_bar_pending, f5_renc_vs_synced;   /* madeira-m5 0.1.728 barrier-render = 3; 0.1.730: fence-5 vertex-synced pass */
     struct mad_resource *benc_res[16]; UINT8 benc_nres, benc_overflow;   /* madeira-m5 0.1.728: src+dst touched by open blit encoder (safe blit keep-open) */
     struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; UINT8 carried; int is_depth; struct mad_rtvp v; } pend[16];   /* 0.1.719: carried = from the list before (clear-defer-carry) */
     unsigned npend;
@@ -2682,6 +2705,8 @@ struct mad_exec {
     /* madeira-bcd: GPU fault attribution (mad_fault_*), only after a first fault */
     struct mad_pso *cenc_pso;   /* the one pipeline the open compute encoder runs */
     unsigned cenc_seq;          /* its label's C#<seq> */
+    UINT64 cenc_bar_scope;      /* madeira-m5 0.1.730 cs-barrier-keep: pending MTLBarrierScope for next dispatch on open e->cenc */
+    unsigned cenc_dispatches;   /* madeira-m5 0.1.730: dispatches encoded on open e->cenc (forces flush before DispatchIndirect) */
     struct mad_pso *diag_pso[6]; unsigned diag_npso; int diag_more;   /* pipelines the open render pass drew with */
     unsigned sn_chunk[8], sn_n;
     unsigned nic;
@@ -3402,9 +3427,20 @@ static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) 
      * vertex-stage wait (skinning, culling, indirect arguments). Hazard it does
      * not cover: a vertex shader reading a texture the previous render pass
      * just drew. */
-    if (!update && e->mode == 5) {
-        if (InterlockedExchange(&e->q->device->f5_nonrender, 0)) f.stages = (enum WMTRenderStages)(WMTRenderStageVertex | WMTRenderStageObject);
-        else f.stages = WMTRenderStageFragment;
+    if (update && e->mode == 5 && e->enc_wrote_uav) InterlockedExchange(&e->q->device->f5_nonrender, 1);   /* madeira-m5 0.1.730: pixel UAV writes -> next pass waits at vertex */
+    if (!update) {
+        if (e->mode == 5) {
+            if (InterlockedExchange(&e->q->device->f5_nonrender, 0)) {
+                f.stages = (enum WMTRenderStages)(WMTRenderStageVertex | WMTRenderStageObject);
+                e->f5_renc_vs_synced = 1;
+                InterlockedIncrement(&g_f5_vs_syncs);
+            } else {
+                f.stages = WMTRenderStageFragment;
+                e->f5_renc_vs_synced = 0;
+            }
+        } else {
+            e->f5_renc_vs_synced = 1;
+        }
     }
     MTLRenderCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&f);
     e->xc[update ? XC_FENCE_UPDATES : XC_FENCE_WAITS]++;
@@ -3526,13 +3562,13 @@ static void exec_end(struct mad_exec *e) {
         if (e->rp_late) exec_rp_late_store(e);   /* madeira-bcd rp-discard: the store actions the pass left open */
         else if (e->l && (mad_rp_discard_on() == 2 || mad_rp_discard_on() == 4)) exec_rp_dead_census(e);   /* madeira-m5 0.1.718/0.1.729: what the store side WOULD drop, counted */
         MTLCommandEncoder_endEncoding(e->renc); e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
-        e->enc_wrote_uav = 0; e->enc_uav_bar_pending = 0;
+        e->enc_wrote_uav = 0; e->enc_uav_bar_pending = 0; e->f5_renc_vs_synced = 0;
         if (e->q->vis && e->q->vis->dirty) { e->q->vis->next++; e->q->vis->dirty = 0; }   /* ml1088: DXMT's endEncoder */
         e->vis_prev = ~(UINT64)0; e->enc_vis_buf = 0;
         e->pass_draws = 0;
     }
     if (e->benc) { MTLCommandEncoder_endEncoding(e->benc); e->benc = 0; e->benc_nres = 0; e->benc_overflow = 0; }
-    if (e->cenc) { MTLCommandEncoder_endEncoding(e->cenc); e->cenc = 0; }
+    if (e->cenc) { MTLCommandEncoder_endEncoding(e->cenc); e->cenc = 0; e->cenc_bar_scope = 0; e->cenc_dispatches = 0; }
     if (cdraws && g_capture_on) mad_capture_pass(e, crt, cn, crtp, cdepth, &cdp, cseq, cdraws);   /* ml1098: after the pass, before anything else */
     if (e->nic) mad_ic_encode(e);   /* madeira-bcd: ind-count, the argument records this encoder consumed */
 }
@@ -4970,10 +5006,15 @@ struct mad_rp_carry {
     obj_handle_t renc, vis_buf; unsigned seq, draws, nrt, w, h;
     struct mad_resource *rt[8], *depth; struct mad_rtvp rtp[8], dp;
     int mode, f6_synced, late; unsigned f6_cur, f6_natt; struct mad_resource *f6_att[9];
-    UINT8 enc_wrote_uav, enc_uav_bar_pending;   /* madeira-m5 0.1.728 barrier-render = 3 */
+    UINT8 enc_wrote_uav, enc_uav_bar_pending, f5_renc_vs_synced;   /* madeira-m5 0.1.728 barrier-render = 3; 0.1.730: fence-5 vertex sync */
     unsigned npend; unsigned char pend[sizeof(((struct mad_exec *)0)->pend)];
     struct mad_f8_wr f8_wr[12]; unsigned f8_nwr; int f8_wr_all;   /* madeira-m5 0.1.718 f7-writes */
     LONG64 bytes;
+    /* madeira-m5 0.1.730 cs-carry: open compute/blit encoder carried to the next list in the same ECL call */
+    obj_handle_t cenc, benc;
+    struct mad_pso *cenc_pso; unsigned cenc_seq, cenc_dispatches; UINT64 cenc_bar_scope;
+    struct mad_resource *benc_res[16]; UINT8 benc_nres, benc_overflow;
+    int cs_mode;
 };
 static int mad_rp_carry_on(void) {
     if (g_rp_carry < 0) {
@@ -5178,7 +5219,7 @@ static void exec_rp_take(struct mad_exec *e, struct mad_rp_carry *k) {
     memcpy(e->f6_att, k->f6_att, sizeof e->f6_att); e->f6_natt = k->f6_natt;
     memcpy(e->pend, k->pend, sizeof e->pend); e->npend = k->npend;
     memcpy(e->f8_wr, k->f8_wr, sizeof e->f8_wr); e->f8_nwr = k->f8_nwr; e->f8_wr_all = k->f8_wr_all;   /* 0.1.718 f7-writes */
-    e->enc_wrote_uav = k->enc_wrote_uav; e->enc_uav_bar_pending = k->enc_uav_bar_pending;   /* 0.1.728 barrier-render = 3 */
+    e->enc_wrote_uav = k->enc_wrote_uav; e->enc_uav_bar_pending = k->enc_uav_bar_pending; e->f5_renc_vs_synced = k->f5_renc_vs_synced;   /* 0.1.728 barrier-render = 3; 0.1.730 fence-5 */
     e->rp_late = k->late; e->rp_from = 0;   /* its last draw was in the list before */
     k->renc = 0; k->npend = 0;   /* 0.1.719: the slot is empty again (clear-defer-carry reads npend when no pass is carried) */
 }
@@ -5231,9 +5272,9 @@ static void exec_rp_list_end(struct mad_exec *e) {
         memcpy(k->f6_att, e->f6_att, sizeof k->f6_att); k->f6_natt = e->f6_natt;
         memcpy(k->pend, e->pend, sizeof k->pend); k->npend = e->npend; k->bytes = b; k->late = e->rp_late;
         memcpy(k->f8_wr, e->f8_wr, sizeof k->f8_wr); k->f8_nwr = e->f8_nwr; k->f8_wr_all = e->f8_wr_all;   /* 0.1.718 f7-writes */
-        k->enc_wrote_uav = e->enc_wrote_uav; k->enc_uav_bar_pending = e->enc_uav_bar_pending;   /* 0.1.728 barrier-render = 3 */
+        k->enc_wrote_uav = e->enc_wrote_uav; k->enc_uav_bar_pending = e->enc_uav_bar_pending; k->f5_renc_vs_synced = e->f5_renc_vs_synced;   /* 0.1.728 barrier-render = 3; 0.1.730 fence-5 */
         e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0; e->enc_vis_buf = 0;
-        e->enc_wrote_uav = 0; e->enc_uav_bar_pending = 0;
+        e->enc_wrote_uav = 0; e->enc_uav_bar_pending = 0; e->f5_renc_vs_synced = 0;
         e->f6_natt = 0; e->pass_draws = 0; e->npend = 0; e->rp_late = 0; e->f8_nwr = 0; e->f8_wr_all = 0;
         InterlockedIncrement(&g_rp_carried); InterlockedExchangeAdd64(&g_rp_carried_b, b);
         return;
@@ -5592,12 +5633,55 @@ static void mad_fault_mark(obj_handle_t fn, const char *name) {
     lstrcpynA(g_fault_bad[i].name, name, sizeof g_fault_bad[i].name);
     d3d12_log("[madeira-d3d12] GPU fault: %s (function 0x%llx) will be skipped from now on\n", name, (unsigned long long)fn);
 }
+/* madeira-m5 0.1.730: opt-in unretained command buffers (MadeiraCtl op 25, cb-unretained = 1)
+ * and inline compute encoder memoryBarrierWithScope: (compute cmd 12, probe op 26, cs-barrier-keep = 1). */
+static int mad_cb_unretained_on(void) {
+    if (g_cb_unretained < 0) {
+        int want = mad_cfg_int_pe("cb-unretained", 0) ? 1 : 0;
+        if (want && !mad_fault_info_on()) {
+            struct madeira_ctl_args a;
+            memset(&a, 0, sizeof a); a.op = 25; a.ptr = 0;
+            MadeiraCtl(&a);
+            g_cb_unretained = (a.ret == 1) ? 1 : 0;
+            d3d12_log("[madeira-d3d12] 0.1.730 cb-unretained = %d (%s)\n", g_cb_unretained,
+                      g_cb_unretained ? "commandBufferWithUnretainedReferences active (MadeiraCtl op 25)"
+                                      : "winemetal does not answer op 25; staying on retained commandBuffer");
+        } else {
+            g_cb_unretained = 0;
+            if (want) d3d12_log("[madeira-d3d12] 0.1.730 cb-unretained = 0 (disabled while gpu-fault-info is on)\n");
+        }
+    }
+    return g_cb_unretained;
+}
+static int mad_cs_barrier_keep_on(void) {
+    if (g_cs_barrier_keep < 0) {
+        int want = mad_cfg_int_pe("cs-barrier-keep", 0) ? 1 : 0;
+        if (want) {
+            struct madeira_ctl_args a;
+            memset(&a, 0, sizeof a); a.op = 26;
+            MadeiraCtl(&a);
+            g_cs_barrier_keep = (a.ret == 1) ? 1 : 0;
+            d3d12_log("[madeira-d3d12] 0.1.730 cs-barrier-keep = %d (%s)\n", g_cs_barrier_keep,
+                      g_cs_barrier_keep ? "compute encoders stay open across barriers with inline memoryBarrierWithScope (op 26)"
+                                        : "winemetal does not answer op 26; barriers still close compute encoders");
+        } else {
+            g_cs_barrier_keep = 0;
+        }
+    }
+    return g_cs_barrier_keep;
+}
 static obj_handle_t mad_batch_cb(obj_handle_t queue) {
     if (mad_fault_info_on()) {
         struct madeira_ctl_args a;
         memset(&a, 0, sizeof a); a.op = 8; a.ptr = (UINT64)queue;
         MadeiraCtl(&a);
         if (a.ret == 1 && a.len) return (obj_handle_t)a.len;
+    }
+    if (mad_cb_unretained_on() > 0 && !g_fault_diag && !g_capture_on && !g_census_on && g_sd_state <= 0 && !g_skin_now) {
+        struct madeira_ctl_args a;
+        memset(&a, 0, sizeof a); a.op = 25; a.ptr = (UINT64)queue;
+        MadeiraCtl(&a);
+        if (a.ret == 1 && a.len) { InterlockedIncrement(&g_cb_unretained_made); return (obj_handle_t)a.len; }
     }
     return MTLCommandQueue_commandBuffer(queue);
 }
@@ -10888,6 +10972,12 @@ tess_go:
      * hit no longer flushes the batch (77-134 flushes a frame in HFW, every one a hit). Only a variant past pso-variant-cap is
      * uncached: its draw's chain is sent now, so Metal retains the pipeline, and this thread releases it; the draw-dedup state
      * forgets the handle so a later SetPSO is never left out against a dead one. */
+    if (var_uncached && g_cb_unretained > 0) {
+        mad_eb_flush_cur(EBF_VARIANT);
+        mad_uret_push(dev, c_pso.pso, 0, NULL, 0);
+        if (dd) dd->pso = 0;
+        var_uncached = 0;
+    }
     if (var_uncached) {
         mad_eb_flush_cur(EBF_VARIANT);
         (NSObject_release)(c_pso.pso);
@@ -11086,17 +11176,24 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
                       s->serial, c->u.tt.splane, sb, d->serial, c->u.tt.dplane, db);
         MAD_SKIP(e); return;
     }
-    EnterCriticalSection(&dev->heap_lock);
-    if (dev->ds_scratch_size < need) {
-        struct WMTBufferInfo bi; UINT64 sz = need < (4u << 20) ? (4u << 20) : (need + 0xffff) & ~(UINT64)0xffff;
-        /* an in-flight command buffer keeps its own reference to the old one */
-        if (dev->ds_scratch) NSObject_release(dev->ds_scratch);
-        memset(&bi, 0, sizeof bi); bi.length = sz;
-        bi.options = WMTResourceStorageModePrivate | (mad_res_untracked_on(dev) ? WMTResourceHazardTrackingModeUntracked : 0);
-        dev->ds_scratch = MTLDevice_newBuffer(dev->mtl_device, &bi);
-        dev->ds_scratch_size = dev->ds_scratch ? sz : 0;
+    {
+        obj_handle_t old_ds = 0;
+        EnterCriticalSection(&dev->heap_lock);
+        if (dev->ds_scratch_size < need) {
+            struct WMTBufferInfo bi; UINT64 sz = need < (4u << 20) ? (4u << 20) : (need + 0xffff) & ~(UINT64)0xffff;
+            /* an in-flight command buffer keeps its own reference to the old one (unless cb-unretained) */
+            old_ds = dev->ds_scratch;
+            memset(&bi, 0, sizeof bi); bi.length = sz;
+            bi.options = WMTResourceStorageModePrivate | (mad_res_untracked_on(dev) ? WMTResourceHazardTrackingModeUntracked : 0);
+            dev->ds_scratch = MTLDevice_newBuffer(dev->mtl_device, &bi);
+            dev->ds_scratch_size = dev->ds_scratch ? sz : 0;
+        }
+        LeaveCriticalSection(&dev->heap_lock);
+        if (old_ds) {
+            if (g_cb_unretained > 0) mad_uret_push(dev, old_ds, 0, NULL, 0);
+            else NSObject_release(old_ds);
+        }
     }
-    LeaveCriticalSection(&dev->heap_lock);
     if (!dev->ds_scratch) { MAD_SKIP(e); return; }
     if (InterlockedIncrement(&said) <= 16)
         d3d12_log("[madeira-d3d12] aspect copy r#%u %s -> r#%u %s, %ux%u through a staging buffer\n",
@@ -11163,17 +11260,24 @@ static int exec_copy_reinterpret(struct mad_exec *e, const struct mad_cmd *c) {
     if (dh > mh - c->u.tt.dy) dh = mh - c->u.tt.dy;
     need = img * depth;
     if (!need || !dw || !dh || row > 0xffffffffu || img > 0xffffffffu) { MAD_SKIP(e); return 1; }
-    EnterCriticalSection(&dev->heap_lock);
-    if (dev->ds_scratch_size < need) {
-        struct WMTBufferInfo bi; UINT64 sz = need < (4u << 20) ? (4u << 20) : (need + 0xffff) & ~(UINT64)0xffff;
-        /* an in-flight command buffer keeps its own reference to the old one (as in exec_copy_aspect) */
-        if (dev->ds_scratch) NSObject_release(dev->ds_scratch);
-        memset(&bi, 0, sizeof bi); bi.length = sz;
-        bi.options = WMTResourceStorageModePrivate | (mad_res_untracked_on(dev) ? WMTResourceHazardTrackingModeUntracked : 0);
-        dev->ds_scratch = MTLDevice_newBuffer(dev->mtl_device, &bi);
-        dev->ds_scratch_size = dev->ds_scratch ? sz : 0;
+    {
+        obj_handle_t old_ds = 0;
+        EnterCriticalSection(&dev->heap_lock);
+        if (dev->ds_scratch_size < need) {
+            struct WMTBufferInfo bi; UINT64 sz = need < (4u << 20) ? (4u << 20) : (need + 0xffff) & ~(UINT64)0xffff;
+            /* an in-flight command buffer keeps its own reference to the old one (as in exec_copy_aspect) */
+            old_ds = dev->ds_scratch;
+            memset(&bi, 0, sizeof bi); bi.length = sz;
+            bi.options = WMTResourceStorageModePrivate | (mad_res_untracked_on(dev) ? WMTResourceHazardTrackingModeUntracked : 0);
+            dev->ds_scratch = MTLDevice_newBuffer(dev->mtl_device, &bi);
+            dev->ds_scratch_size = dev->ds_scratch ? sz : 0;
+        }
+        LeaveCriticalSection(&dev->heap_lock);
+        if (old_ds) {
+            if (g_cb_unretained > 0) mad_uret_push(dev, old_ds, 0, NULL, 0);
+            else NSObject_release(old_ds);
+        }
     }
-    LeaveCriticalSection(&dev->heap_lock);
     if (!dev->ds_scratch) { MAD_SKIP(e); return 1; }
     if (InterlockedIncrement(&said) <= 16)
         d3d12_log("[madeira-d3d12] t2t-reinterp r#%u (format %u, %ux%u) -> r#%u (format %u, %ux%u at %u,%u mip %u): %u bytes a %s\n",
@@ -11316,7 +11420,8 @@ static int mad_bc_upload_decoded(struct mad_exec *e, const struct mad_cmd *c) {
     k.dst = t->texture; k.slice = c->u.bt.slice; k.level = c->u.bt.level;
     k.origin.x = c->u.bt.x; k.origin.y = c->u.bt.y; k.origin.z = c->u.bt.z;
     MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
-    NSObject_release(stage);   /* the command buffer retains what it reads */
+    if (g_cb_unretained > 0) mad_uret_push(e->q->device, stage, 0, NULL, 0);
+    else NSObject_release(stage);   /* the command buffer retains what it reads */
     if (InterlockedIncrement(&n_ok) <= 4 || (n_ok % 1000) == 0)
         d3d12_log("[madeira-d3d12] ml1310 BC%d upload decoded on the CPU: %ux%ux%u texels into %ux%u mip %u (%ld so far)\n",
                   kind > 10 ? kind - 10 : kind, cw, ch, cd, t->width, t->height, (unsigned)c->u.bt.level, (long)n_ok);
@@ -11371,7 +11476,10 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
                 cp.copy_length = c->u.fill.len - o < MAD_FILLPAT_BYTES ? c->u.fill.len - o : MAD_FILLPAT_BYTES;
                 MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&cp);
             }
-            if (own) NSObject_release(own);   /* the command buffer retains what it reads */
+            if (own) {
+                if (g_cb_unretained > 0) mad_uret_push(e->q->device, own, 0, NULL, 0);
+                else NSObject_release(own);   /* the command buffer retains what it reads */
+            }
             return;
         }
         memset(&k, 0, sizeof k);
@@ -11453,7 +11561,10 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
                     k.origin.x = 0; k.origin.y = y; k.origin.z = is3d ? z : 0;
                     MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
                 }
-        if (own) NSObject_release(own);   /* the command buffer retains what it reads */
+        if (own) {
+            if (g_cb_unretained > 0) mad_uret_push(e->q->device, own, 0, NULL, 0);
+            else NSObject_release(own);   /* the command buffer retains what it reads */
+        }
         return;
     }
     case MC_COPY_T2B: {
@@ -11772,7 +11883,8 @@ static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
     }
     if (!direct) {
         if (dst->resolve_tmp && (dst->resolve_tmp_w != w || dst->resolve_tmp_h != h || dst->resolve_tmp_pf != (UINT)spf)) {
-            NSObject_release(dst->resolve_tmp);
+            if (g_cb_unretained > 0) mad_uret_push(e->q->device, dst->resolve_tmp, 0, NULL, 0);
+            else NSObject_release(dst->resolve_tmp);
             dst->resolve_tmp = 0;
         }
         if (!dst->resolve_tmp) {
@@ -11825,13 +11937,18 @@ static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
         k.dst = dview ? dview : dst->texture; k.dst_slice = dslice; k.dst_level = dlevel;
         MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
     }
-    /* The command buffer keeps the view alive until it has run. */
-    if (dview) NSObject_release(dview);
+    /* The command buffer keeps the view alive until it has run (or mad_uret_push under cb-unretained). */
+    if (dview) {
+        if (g_cb_unretained > 0) mad_uret_push(e->q->device, dview, 0, NULL, 0);
+        else NSObject_release(dview);
+    }
 }
 
 static volatile LONG g_cs_concurrent = -1;   /* madeira-duo cs-concurrent, see exec_dispatch */
 static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
+    struct mad_wmtcmd_compute_mem_barrier c_bar;
     struct wmtcmd_compute_setpso c_pso;
+    const struct wmtcmd_base *c_head;
     e->wr_all = 1;   /* ml1116: a dispatch writes through UAVs we do not enumerate here */
     struct wmtcmd_compute_setbuffer sb[4];   /* ml1008: MSC uses 3; the sm5 path binds cb + arg + both heaps */
     struct wmtcmd_compute_useresource ur[256];
@@ -11868,6 +11985,9 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         if (mad_fault_skip_pso(e->cpso)) { MAD_SKIP(e); return; }
         if (e->cenc && e->cenc_pso != e->cpso) exec_end(e);
     }
+    /* madeira-m5 0.1.730: DispatchIndirect reads args in the GPU command front-end, which requires an
+     * encoder fence boundary rather than shader-core memoryBarrierWithScope */
+    if (e->cenc && c->kind == MC_DISPATCH_INDIRECT && (e->cenc_bar_scope || e->cenc_dispatches > 0)) exec_end(e);
     if (!e->cenc) {
         if (e->renc) InterlockedIncrement(&g_pass_end_dispatch);
         exec_end(e);
@@ -11891,7 +12011,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
                 d3d12_log("[madeira-d3d12] cs-concurrent: compute encoders are concurrent between barriers (bcd.cfg cs-concurrent)\n");
         }
         e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, cs_concurrent > 0 && (e->mode < 6 || !mad_f6_compute_open_on())); if (e->cenc) g_enc_seq++;   /* madeira-m5 0.1.726: safe in modes 6 and 7 too when f6-compute-open = 0 (every non-RAR barrier closes the encoder) */
-        e->cenc_pso = e->cpso; e->cenc_seq = g_enc_seq;
+        e->cenc_pso = e->cpso; e->cenc_seq = g_enc_seq; e->cenc_bar_scope = 0; e->cenc_dispatches = 0;
         if (g_fault_diag) mad_label(e->cenc, "C#%u %s fn=%llx:%s", g_enc_seq, e->cpso->vs_name,
                                     (unsigned long long)e->cpso->vs_fn, e->cpso->vs_name);
         else if (g_enc_labels) mad_label(e->cenc, "C#%u %s", g_enc_seq, e->cpso->vs_name);   /* ml1142 */
@@ -11938,6 +12058,16 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     memset(&c_pso, 0, sizeof c_pso);
     c_pso.type = WMTComputeCommandSetPSO; c_pso.pso = e->cpso->cps;
     c_pso.threadgroup_size.width = e->cpso->tg[0]; c_pso.threadgroup_size.height = e->cpso->tg[1]; c_pso.threadgroup_size.depth = e->cpso->tg[2];
+    c_head = (const struct wmtcmd_base *)&c_pso;
+    if (e->cenc_bar_scope) {   /* madeira-m5 0.1.730 cs-barrier-keep: inline memoryBarrierWithScope before this dispatch */
+        memset(&c_bar, 0, sizeof c_bar);
+        c_bar.type = (enum WMTComputeCommandType)MAD_WMT_COMPUTE_MEM_BARRIER;
+        c_bar.scope = e->cenc_bar_scope;
+        c_bar.next.ptr = &c_pso;
+        c_head = (const struct wmtcmd_base *)&c_bar;
+        e->cenc_bar_scope = 0;
+        InterlockedIncrement(&g_cenc_membar_emitted);
+    }
     tail = (struct wmtcmd_base *)&c_pso;
 #define MAD_APPEND(node) do { tail->next.ptr = (node); tail = (struct wmtcmd_base *)(node); } while (0)
     memset(sb, 0, sizeof sb);
@@ -11989,12 +12119,13 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     }
     tail->next.ptr = NULL;
 #undef MAD_APPEND
-    MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&c_pso);
+    MTLComputeCommandEncoder_encodeCommands(e->cenc, c_head);
     if (ml1302_chold) {   /* ml1302: held until the batch is encoded, see exec_draw */
         mad_eb_flush_cur(EBF_OTHER);
         ReleaseSRWLockShared(&dev->list_lock);
     }
     mad_use_commit(e);
+    e->cenc_dispatches++;
     e->draws++;
     if (g_capture_on && g_cap_uav) mad_capture_dispatch_outputs(e, c);   /* madeira-bcd: contact sheets */
     if (e->ncap_after_buf) {   /* ml922 */
@@ -12234,6 +12365,128 @@ static int mad_barrier_hits_benc(const struct mad_cmd *c, const struct mad_exec 
     }
     return 0;
 }
+/* madeira-m5 0.1.730 cs-barrier-keep: does barrier c require an inline memoryBarrierWithScope on an open compute
+ * encoder? Pure non-UAV RT/DS transitions (RT/DS->read, read->RT/DS, read->read) cannot conflict with compute
+ * dispatches (which waited on dev_fence at open and never write non-UAV RT/DS). */
+static int mad_barrier_hits_cenc(const struct mad_cmd *c) {
+    unsigned k;
+    if (c->u.barrier.all || c->u.barrier.all_tex || c->u.barrier.uav_mask) return 1;
+    for (k = 0; k < c->u.barrier.n && k < MAD_BAR_MAX; k++) {
+        UINT8 raw = c->u.barrier.cls[k], cl = (UINT8)(raw & BCF_CLS_MASK);
+        if ((raw & (BCF_ALIASING | BCF_TO_COMMON)) || cl == BC_RAW_UAV || cl == BC_RAW_COPY) return 1;
+        if (c->u.barrier.res[k] && (c->u.barrier.res[k]->desc.Flags & 0x4u)) return 1;
+        if (cl != BC_RAW_ATT && cl != BC_RAR && !(raw & BCF_TO_RT_DSW)) return 1;
+    }
+    return 0;
+}
+/* madeira-m5 0.1.730 cs-carry: carry an open compute or blit encoder into the next list of the same ECL call
+ * when that list immediately continues with compatible work, eliminating encoder splits and MTLFence drains. */
+static int mad_cs_carry_on(void) {
+    if (g_cs_carry < 0) {
+        g_cs_carry = mad_cfg_int_pe("cs-carry", 0) ? 1 : 0;
+        if (g_cs_carry) d3d12_log("[madeira-d3d12] 0.1.730 cs-carry = 1: open compute and blit encoders carry into the next list of the same submission\n");
+    }
+    return g_cs_carry;
+}
+static int mad_cs_is_pure_state(enum mad_ck kind) {
+    switch (kind) {
+    case MC_PSO: case MC_ROOT: case MC_HEAPS: case MC_VP: case MC_SCISSOR: case MC_TOPO: case MC_IB: case MC_VB:
+    case MC_ROOTSIG: case MC_ROOT_CONST: case MC_STENCIL_REF: case MC_CROOTSIG: case MC_CROOT: case MC_CROOT_CONST:
+    case MC_BLEND_FACTOR: case MC_CBV_LATCH: case MC_DISCARD:
+        return 1;
+    default:
+        return 0;
+    }
+}
+static int mad_benc_aliases_res(const struct mad_exec *e, const struct mad_resource *r) {
+    unsigned j;
+    if (!r) return 0;
+    for (j = 0; j < e->benc_nres; j++) if (mad_res_aliases(r, e->benc_res[j])) return 1;
+    return 0;
+}
+static int mad_benc_aliases_cmd(const struct mad_exec *e, const struct mad_cmd *c) {
+    switch (c->kind) {
+    case MC_FILL_BB: return mad_benc_aliases_res(e, c->u.fill.res);
+    case MC_COPY_BB: return mad_benc_aliases_res(e, c->u.bb.dst) || mad_benc_aliases_res(e, c->u.bb.src);
+    case MC_COPY_B2T: case MC_COPY_T2B: return mad_benc_aliases_res(e, c->u.bt.tex) || mad_benc_aliases_res(e, c->u.bt.buf);
+    case MC_COPY_T2T: return mad_benc_aliases_res(e, c->u.tt.dst) || mad_benc_aliases_res(e, c->u.tt.src);
+    case MC_FILL_TEX: return mad_benc_aliases_res(e, c->u.filltex.res);
+    default: return 1;
+    }
+}
+static void exec_cs_list_begin(struct mad_exec *e) {
+    struct mad_rp_carry *k = e->q->rp_carry;
+    if (!k) return;
+    if (k->cenc && !e->renc && !e->benc && !e->cenc) {
+        e->cenc = k->cenc; e->cenc_pso = k->cenc_pso; e->cenc_seq = k->cenc_seq;
+        e->cenc_bar_scope = k->cenc_bar_scope; e->cenc_dispatches = k->cenc_dispatches;
+        e->mode = k->cs_mode;
+        k->cenc = 0; k->cenc_pso = NULL; k->cenc_seq = 0; k->cenc_bar_scope = 0; k->cenc_dispatches = 0;
+    } else if (k->benc && !e->renc && !e->benc && !e->cenc) {
+        e->benc = k->benc;
+        memcpy(e->benc_res, k->benc_res, sizeof e->benc_res);
+        e->benc_nres = k->benc_nres; e->benc_overflow = k->benc_overflow;
+        e->mode = k->cs_mode;
+        k->benc = 0; k->benc_nres = 0; k->benc_overflow = 0;
+    }
+}
+static void exec_cs_list_end(struct mad_exec *e) {
+    struct mad_queue *q = e->q;
+    struct mad_rp_carry *k = q->rp_carry;
+    const struct mad_list *nx = q->rp_next;
+    unsigned j;
+    if (!nx || !k || (!e->cenc && !e->benc) || e->renc || e->npend || k->renc || k->cenc || k->benc || k->npend) return;
+    if (mad_cs_carry_on() <= 0 || !(e->mode == 1 || e->mode == 5)) return;
+    if (e->nic || e->sk || g_capture_on || g_fault_diag || g_census_on || g_sd_state > 0) return;
+    if (e->cenc) {
+        if (mad_cs_barrier_keep_on() <= 0) return;
+        for (j = 0; j < nx->ncmds; j++) {
+            const struct mad_cmd *c = &nx->cmds[j];
+            if (mad_cs_is_pure_state(c->kind)) continue;
+            if (c->kind == MC_BARRIER) continue;
+            if (c->kind == MC_DISPATCH) {
+                k->cenc = e->cenc; k->cenc_pso = e->cenc_pso; k->cenc_seq = e->cenc_seq;
+                k->cenc_bar_scope = e->cenc_bar_scope | 3ull;   /* safe even across merged ECL implicit-decay boundaries */
+                k->cenc_dispatches = e->cenc_dispatches; k->cs_mode = e->mode;
+                e->cenc = 0; e->cenc_pso = NULL; e->cenc_seq = 0; e->cenc_bar_scope = 0; e->cenc_dispatches = 0;
+                InterlockedIncrement(&g_cs_carried);
+            }
+            return;
+        }
+    } else if (e->benc && !e->benc_overflow && e->benc_nres > 0) {
+        for (j = 0; j < nx->ncmds; j++) {
+            const struct mad_cmd *c = &nx->cmds[j];
+            if (mad_cs_is_pure_state(c->kind)) continue;
+            if (c->kind == MC_BARRIER) {
+                if (g_barrier_render == 3 && !mad_barrier_hits_benc(c, e)) continue;
+                return;
+            }
+            if ((c->kind == MC_COPY_BB || c->kind == MC_COPY_B2T || c->kind == MC_COPY_T2B ||
+                 c->kind == MC_COPY_T2T || c->kind == MC_FILL_BB || c->kind == MC_FILL_TEX) &&
+                !mad_benc_aliases_cmd(e, c)) {
+                k->benc = e->benc;
+                memcpy(k->benc_res, e->benc_res, sizeof k->benc_res);
+                k->benc_nres = e->benc_nres; k->benc_overflow = e->benc_overflow;
+                k->cs_mode = e->mode;
+                e->benc = 0; e->benc_nres = 0; e->benc_overflow = 0;
+                InterlockedIncrement(&g_blit_carried);
+            }
+            return;
+        }
+    }
+}
+static void mad_cs_close(struct mad_queue *q) {
+    struct mad_rp_carry *k = q->rp_carry;
+    struct mad_exec *e = &g_rp_close_e;
+    if (!k || (!k->cenc && !k->benc)) return;
+    AcquireSRWLockExclusive(&g_rp_close_lock);
+    memset(e, 0, offsetof(struct mad_exec, ud));
+    e->q = q; e->cb = q->open_cb; e->vis_prev = ~(UINT64)0;
+    exec_cs_list_begin(e);
+    exec_end(e);
+    mad_exec_publish(e);
+    ReleaseSRWLockExclusive(&g_rp_close_lock);
+}
 /* madeira-m5 0.1.728: 8-entry MRU committed-buffer VA cache for MC_IB/MC_VB, invalidated on d->aidx_ver changes */
 static struct mad_resource *exec_resolve_va(struct mad_exec *e, UINT64 addr, UINT64 *off) {
     struct mad_device *d = e->q->device;
@@ -12326,6 +12579,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         memcpy(e.rp_disc, q->rp_disc_c, q->rp_ndisc_c * sizeof e.rp_disc[0]); e.rp_ndisc = q->rp_ndisc_c; q->rp_ndisc_c = 0;
     }
     exec_rp_list_begin(&e);   /* madeira-bcd rp-carry: the pass the previous list handed over */
+    exec_cs_list_begin(&e);   /* madeira-m5 0.1.730 cs-carry: carried compute/blit encoder */
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
         int clr_prom = 0;
@@ -12470,19 +12724,29 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                 } else if (e.renc && g_barrier_render >= 2) InterlockedIncrement(&g_barrier_renc_kept);
                 break;
             }
-            if (e.mode == 5 && ((c->u.barrier.vsread & 2) || c->u.barrier.all || c->u.barrier.all_tex))   /* madeira-m5 0.1.727: close vertex-reads-RT hazard for fence-chain = 5 */
+            if (e.mode == 5 && ((c->u.barrier.vsread & 2) || c->u.barrier.all || c->u.barrier.all_tex))   /* madeira-m5 0.1.727/0.1.730: close vertex-reads-RT/COMMON/UAV/aliasing hazard for fence-chain = 5 */
                 InterlockedExchange(&e.q->device->f5_nonrender, 1);
-            if ((e.mode == 1 || e.mode == 5) && g_barrier_render >= 2) {   /* madeira-m5 0.1.725/0.1.726/0.1.728: fence-chain 1/5 always sync before every encoder; mode 3 keeps non-UAV passes open across non-attachment UAV barriers & keeps blit encoders open across unrelated barriers */
-                if (mad_barrier_rar_only(c)) { if (e.renc) InterlockedIncrement(&g_barrier_renc_kept); break; }
+            if ((e.mode == 1 || e.mode == 5) && g_barrier_render >= 2) {   /* madeira-m5 0.1.725-0.1.730: fence-chain 1/5 smart barriers + cs-barrier-keep + mode 3 in both modes 1 & 5 */
+                if (mad_barrier_rar_only(c)) {
+                    if (e.renc) InterlockedIncrement(&g_barrier_renc_kept);
+                    else if (e.cenc) InterlockedIncrement(&g_cenc_bar_rar);
+                    break;
+                }
                 e.fence_needed = 1;
-                if (e.cenc) exec_end(&e);
-                else if (e.benc) {
-                    if (g_barrier_render == 3 && e.mode == 1 && !mad_barrier_hits_benc(c, &e)) InterlockedIncrement(&g_benc_bar_kept);
+                if (e.cenc) {
+                    if (mad_cs_barrier_keep_on() > 0 && !g_fault_diag && !g_capture_on && !g_census_on && g_sd_state <= 0) {
+                        if (!mad_barrier_hits_cenc(c)) InterlockedIncrement(&g_cenc_bar_skip);
+                        else { e.cenc_bar_scope |= 3ull; InterlockedIncrement(&g_cenc_bar_kept); }
+                    } else exec_end(&e);
+                } else if (e.benc) {
+                    if (g_barrier_render == 3 && !mad_barrier_hits_benc(c, &e)) InterlockedIncrement(&g_benc_bar_kept);
                     else exec_end(&e);
                 } else if (e.renc) {
                     int br_hit = mad_barrier_hits_renc(c, e.enc_rt, e.enc_nrt, e.enc_depth);
+                    int f5_vs_need = (e.mode == 5 && !e.f5_renc_vs_synced && ((c->u.barrier.vsread & 2) || c->u.barrier.all || c->u.barrier.all_tex));
                     if (!br_hit && mad_barrier_aliases_renc(c, e.enc_rt, e.enc_nrt, e.enc_depth)) br_hit = 2;
-                    if (g_barrier_render == 3 && e.mode == 1 && !e.enc_wrote_uav && !c->u.barrier.all_tex && br_hit != 2 &&
+                    if (!br_hit && f5_vs_need) br_hit = 1;
+                    if (g_barrier_render == 3 && !f5_vs_need && !e.enc_wrote_uav && !c->u.barrier.all_tex && br_hit != 2 &&
                         !mad_barrier_aliases_renc(c, e.enc_rt, e.enc_nrt, e.enc_depth)) {
                         if (br_hit) { e.enc_uav_bar_pending = 1; InterlockedIncrement(&g_br3_uav_kept); }
                         InterlockedIncrement(&g_barrier_renc_kept);
@@ -12549,6 +12813,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             rs_t = t1;
         }
     }
+    exec_cs_list_end(&e);   /* madeira-m5 0.1.730 cs-carry: may hand open compute/blit encoder to next list */
     exec_rp_list_end(&e);   /* madeira-bcd rp-carry: may hand the open pass to the next list */
     if (e.renc) InterlockedIncrement(&g_pass_end_list);
     exec_end(&e);
@@ -12717,6 +12982,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
             if (rs) mad_rs_step(RS_BATCH, &rs_t);
         }
         if ((rp_k.renc || rp_k.npend) && l != rp_want) mad_rp_close(q);   /* madeira-bcd rp-carry: handed to a list that is not this one (0.1.719: a clear-only carry too) */
+        if ((rp_k.cenc || rp_k.benc) && l != rp_want) mad_cs_close(q);   /* madeira-m5 0.1.730 cs-carry */
         q->rp_next = mad_rp_next(q, count, lists, i); rp_want = q->rp_next; q->rp_idx = i;
         if (l) mad_exec_list(q, l, q->open_cb);   /* times itself */
         if (l) { q->ecl_first_list = 0; nrun++; }   /* madeira-m5 0.1.717: the lists behind it belong to the same call */
@@ -12724,6 +12990,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
         q->open_lists++;
         q->executed++;
         if (q->open_lists >= 48) {
+            mad_cs_close(q);
             mad_rp_close(q);      /* madeira-bcd rp-carry: nothing is carried into a full batch (mad_rp_next) */
             InterlockedIncrement(&g_flush_why[MAD_FLUSH_CAP48]);   /* madeira-m5 0.1.716 P4c: under submit_lock, with the buffer open */
             q->flush_why_cur = MAD_FLUSH_CAP48;   /* 0.1.719 T1-a */
@@ -12731,6 +12998,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
             if (rs) mad_rs_step(RS_FLUSH, &rs_t);
         }
     }
+    mad_cs_close(q);
     mad_rp_close(q); q->rp_carry = NULL; q->rp_next = NULL; q->rp_lists = NULL; q->rp_nlists = 0;   /* madeira-bcd rp-carry: never past the call */
     q->rp_ndisc_c = 0;   /* madeira-m5 0.1.718 rp-discard: nor the discard set */
     q->ecl_first_list = 0;   /* madeira-m5 0.1.717: never past the call either */
@@ -13044,7 +13312,7 @@ static void mad_perf_present(void) {
                 {   /* madeira-m5 0.1.718 wait-self: how the worker's Wait jobs resolved, against the state of this queue's command buffer at entry */
                     static const char *const hn[3] = { "satisfied at entry", "satisfied by the observe", "slept" };
                     char line[640]; int o = 0; unsigned h;
-                    o += snprintf(line + o, sizeof line - o, "[perf] queue-Wait jobs per frame by outcome (wait-self %d):", g_wait_self > 0);
+                    o += snprintf(line + o, sizeof line - o, "[perf] queue-Wait jobs per frame by outcome (wait-self %d):", g_wait_self > 0 ? g_wait_self : 0);
                     for (h = 0; h < 3; h++) {
                         LONG nc = InterlockedExchange(&g_ws_n[h][0], 0), no = InterlockedExchange(&g_ws_n[h][1], 0);
                         LONG64 nl = InterlockedExchange64(&g_ws_lists[h], 0);
@@ -13066,6 +13334,17 @@ static void mad_perf_present(void) {
             d3d12_log("[perf] ml1116 encoders per frame: fence waits %.1f, fence updates %.1f, barriers %.1f (fence-chain %d)\n",
                       g_perf_presents ? (double)(cw - lw) / g_perf_presents : 0.0, g_perf_presents ? (double)(cu - lu) / g_perf_presents : 0.0,
                       g_perf_presents ? (double)(cb - lb) / g_perf_presents : 0.0, g_fence_chain);
+            if (g_perf_presents && (g_cb_unretained > 0 || g_cs_barrier_keep > 0 || g_cs_carry > 0 || g_fence_chain == 5)) {
+                double np = (double)g_perf_presents;
+                struct mad_device *pd = g_perf_present_q ? g_perf_present_q->device : NULL;
+                d3d12_log("[perf] 0.1.730 m5-fast per frame: cb-unretained %d (%.1f CBs, %u uret live); cs-barrier-keep %d (kept %.1f, membar %.1f, non-uav-skip %.1f, rar %.1f); "
+                          "cs-carry %d (cenc %.1f, benc %.1f); f5-vs-syncs %.1f\n",
+                          g_cb_unretained > 0, InterlockedExchange(&g_cb_unretained_made, 0) / np, pd ? pd->nuret : 0u,
+                          g_cs_barrier_keep > 0, InterlockedExchange(&g_cenc_bar_kept, 0) / np, InterlockedExchange(&g_cenc_membar_emitted, 0) / np,
+                          InterlockedExchange(&g_cenc_bar_skip, 0) / np, InterlockedExchange(&g_cenc_bar_rar, 0) / np,
+                          g_cs_carry > 0, InterlockedExchange(&g_cs_carried, 0) / np, InterlockedExchange(&g_blit_carried, 0) / np,
+                          InterlockedExchange(&g_f5_vs_syncs, 0) / np);
+            }
             lw = cw; lu = cu; lb = cb;
             if (g_f6_used && g_perf_presents) {   /* ml1134 */
                 double np = (double)g_perf_presents;
@@ -13408,6 +13687,16 @@ static void mad_device_flush_all_why(struct mad_device *d, int why) {
     LeaveCriticalSection(&d->live_lock);
     for (i = 0; i < n; i++) mad_queue_flush_why(snap[i], why);
     for (i = 0; i < n; i++) queue_Release((ID3D12CommandQueue *)snap[i]);
+    /* madeira-m5 0.1.730 cb-unretained: every queue's open CB that existed before this flush_all
+     * is now committed with serial <= d->gpu_serial; advance flush_all_gen for mad_uret_reclaim */
+    if (g_cb_unretained > 0) {
+        UINT64 fg;
+        EnterCriticalSection(&d->heap_lock);
+        fg = (UINT64)d->flush_all_gen;
+        d->flush_all_serial[fg & 15] = (UINT64)d->gpu_serial;
+        __atomic_store_n(&d->flush_all_gen, (LONG64)(fg + 1), __ATOMIC_RELEASE);
+        LeaveCriticalSection(&d->heap_lock);
+    }
 }
 /* madeira-m5 0.1.719 T1-b (cb-coalesce-idle-flush): the fence worker's flush-all that NEVER WAITS for a queue. The same snapshot and
  * references as mad_device_flush_all_why; each queue whose open command buffer carries deferred Signals is committed if its submit_lock
@@ -14084,10 +14373,14 @@ static int mad_wait_committed(struct mad_fence *f, UINT64 value) {
 /* madeira-m5 0.1.718 wait-self (default 0; opt-in middle mode between cb-coalesce 2 and 3): see mad_sub_worker's MAD_SUB_WAIT. */
 static int mad_wait_self(void) {
     if (g_wait_self < 0) {
-        g_wait_self = mad_cfg_int_pe("wait-self", 0) ? 1 : 0;   /* 0.1.718 (default 0): 1 = with cb-coalesce 1 or 2, an async queue Wait whose fence is already satisfied does not commit its own queue's open command buffer first (the "Wait self" commit); 0 = it commits it, as 0.1.716 (cb-coalesce = 3 skips it always) */
+        long long v = mad_cfg_int_pe("wait-self", 0);   /* 0.1.718/0.1.730 (default 0): 1 = with cb-coalesce 1 or 2, an async queue Wait whose fence is already satisfied leaves its own queue's open CB open; 2 = also keeps it open while sleeping when this queue has no deferred Signals and fence-chain is 1 or 5; 0 = commits it */
+        g_wait_self = v <= 0 ? 0 : v >= 2 ? 2 : 1;
         if (g_wait_self)
-            d3d12_log("[madeira-d3d12] wait-self = 1 (opt-in): an async queue Wait already satisfied at entry leaves its own command buffer open "
-                      "(with cb-coalesce 1 or 2); [perf] queue-Wait jobs by outcome count them\n");
+            d3d12_log("[madeira-d3d12] wait-self = %d (opt-in): %s "
+                      "(with cb-coalesce 1 or 2); [perf] queue-Wait jobs by outcome count them\n",
+                      g_wait_self, g_wait_self >= 2
+                          ? "an async queue Wait leaves its own command buffer open at entry and while sleeping when no Signals are deferred (fence-chain 1/5)"
+                          : "an async queue Wait already satisfied at entry leaves its own command buffer open");
     }
     return g_wait_self;
 }
@@ -14231,11 +14524,17 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
              * "Wait self" commit, 6-7 a frame in HFW): with f7-list-start = 1 every list start waits for the device fence, so
              * the list that follows in the kept-open buffer is ordered as it would be in a fresh one. Gated on cb-coalesce == 2
              * (where GetCompletedValue observes deferrals); cb-coalesce = 3 keeps skipping it always. */
-            if (mad_wait_self() > 0 && (mad_cc_on() == 1 || mad_cc_on() == 2) &&
-                ((UINT64)__atomic_load_n(&wf->committed, __ATOMIC_ACQUIRE) >= j->value || __atomic_load_n(&wf->value, __ATOMIC_ACQUIRE) >= j->value)) {
-                InterlockedIncrement(&g_ws_skipped);
-            } else
-                mad_wait_flush(q, 1);   /* as queue_Wait does: every open buffer without cb-coalesce, this queue's with it (0.1.716 P1; mode 3: none) */
+            {
+                int ws = mad_wait_self(), cc = mad_cc_on();
+                int fm = q->device ? mad_fence_mode(q->device) : 0;
+                if (ws > 0 && (cc == 1 || cc == 2) &&
+                    (((UINT64)__atomic_load_n(&wf->committed, __ATOMIC_ACQUIRE) >= j->value ||
+                      __atomic_load_n(&wf->value, __ATOMIC_ACQUIRE) >= j->value) ||
+                     (ws >= 2 && (fm == 1 || fm == 5) && q->ndef_sigs == 0))) {
+                    InterlockedIncrement(&g_ws_skipped);
+                } else
+                    mad_wait_flush(q, 1);   /* as queue_Wait does: every open buffer without cb-coalesce, this queue's with it (0.1.716 P1; mode 3: none) */
+            }
             w0 = (LONG64)mad_tick();
             how = mad_wait_committed(wf, j->value);
             InterlockedIncrement(&g_ws_n[how][cb_open]); InterlockedExchangeAdd64(&g_ws_lists[how], (LONG64)cb_lists);   /* 0.1.718 [perf] */
@@ -14918,6 +15217,7 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
             if (g_hp_dev == d) g_hp_dev = NULL;
             for (k = 0; k < d->ntheaps; k++) { if (d->theaps[k].heap) NSObject_release(d->theaps[k].heap); free(d->theaps[k].fl); }
             mad_mheap_reclaim(d, 1); free(d->mhret);   /* ml1148 */
+            mad_uret_reclaim(d, 1); free(d->uret);     /* madeira-m5 0.1.730 cb-unretained */
             for (k = 0; k < d->nfillpat; k++) if (d->fillpat[k].buf) NSObject_release(d->fillpat[k].buf);   /* ml1151 */
             if (d->k_ring) NSObject_release(d->k_ring);          /* madeira-bcd: helper kernels */
             if (d->k_tind_pso) NSObject_release(d->k_tind_pso);
@@ -15449,10 +15749,70 @@ static void mad_release_after_gpu(struct mad_device *d, obj_handle_t obj) {
     }
     if (!queued) NSObject_release(obj);
 }
+/* madeira-m5 0.1.730 cb-unretained: GPU-lifetime deferred release + deferred mad_unresident queue.
+ * Every object/heap/storage released while cb-unretained is active stays alive and resident until
+ * BOTH mad_device_flush_all_why has committed every open CB across all queues (flush_all_gen > fgen)
+ * AND the GPU has completed every CB from that flush_all plus 2 more (serial + 2 <= done). */
+static void mad_uret_push(struct mad_device *d, obj_handle_t obj, obj_handle_t heap, void *mem, UINT8 unres) {
+    int queued = 0;
+    if (!obj && !heap && !mem) return;
+    if (d) {
+        EnterCriticalSection(&d->heap_lock);
+        if (mad_grow((void **)&d->uret, &d->uret_cap, d->nuret + 1, sizeof *d->uret)) {
+            struct mad_uret *e = &d->uret[d->nuret++];
+            e->obj = obj; e->heap = heap; e->mem = mem; e->unres = unres;
+            e->serial = (UINT64)d->gpu_serial;
+            e->fgen = (UINT64)__atomic_load_n(&d->flush_all_gen, __ATOMIC_ACQUIRE);
+            queued = 1;
+        }
+        LeaveCriticalSection(&d->heap_lock);
+    }
+    if (!queued) {
+        if (obj) { if (unres && d) mad_unresident(d, obj); NSObject_release(obj); }
+        if (heap) { if (unres && d) mad_unresident(d, heap); NSObject_release(heap); }
+        if (mem) VirtualFree(mem, 0, MEM_RELEASE);
+    }
+}
+static void mad_uret_reclaim(struct mad_device *d, int all) {
+    UINT64 done, cur_fgen;
+    int pass;
+    if (!d || (!all && !d->nuret)) return;
+    done = mad_gpu_completed(d);
+    cur_fgen = (UINT64)__atomic_load_n(&d->flush_all_gen, __ATOMIC_ACQUIRE);
+    for (pass = 0; pass < 2; pass++) {
+        for (;;) {
+            obj_handle_t got[64]; void *mem[64]; UINT8 unres[64]; unsigned n = 0, i = 0;
+            EnterCriticalSection(&d->heap_lock);
+            while (i < d->nuret && n < 64) {
+                struct mad_uret *e = &d->uret[i];
+                int ready = all;
+                if (!ready && e->serial + 2 <= done && cur_fgen > e->fgen) {
+                    UINT64 age = cur_fgen - e->fgen;
+                    if (age >= 16 || d->flush_all_serial[e->fgen & 15] + 2 <= done) ready = 1;
+                }
+                if ((pass == 0) == (e->obj != 0) && ready) {
+                    got[n] = pass ? e->heap : e->obj; mem[n] = e->mem; unres[n++] = e->unres;
+                    *e = d->uret[--d->nuret];
+                } else i++;
+            }
+            LeaveCriticalSection(&d->heap_lock);
+            for (i = 0; i < n; i++) {
+                if (!pass) {
+                    if (unres[i]) mad_unresident(d, got[i]);
+                    NSObject_release(got[i]);
+                    continue;
+                }
+                if (got[i]) { if (unres[i]) mad_unresident(d, got[i]); NSObject_release(got[i]); }
+                if (mem[i]) VirtualFree(mem[i], 0, MEM_RELEASE);
+            }
+            if (n < 64) break;
+        }
+    }
+}
 static void mad_hp_reclaim_locked(struct mad_device *d) {
-    UINT64 done = mad_gpu_completed(d); unsigned i = 0;
+    UINT64 done = mad_gpu_completed(d), margin = g_cb_unretained > 0 ? 2 : 0; unsigned i = 0;
     while (i < d->nhret) {
-        if (d->hret[i].serial <= done) {
+        if (d->hret[i].serial + margin <= done) {
             mad_hp_free_locked(&d->theaps[d->hret[i].heap], d->hret[i].off, d->hret[i].size);
             InterlockedExchangeAdd64(&d->hp_live_bytes, -(LONG64)d->hret[i].size);
             d->hret[i] = d->hret[--d->nhret];
@@ -17502,7 +17862,11 @@ static void mad_vis_complete(struct mad_device *d, struct mad_vis_batch *v, int 
     for (k = 0; k < v->nchunks; k++) {
         if (mad_grow((void **)&d->ring_pool, &d->ring_pool_cap, d->nring_pool + 1, sizeof *d->ring_pool)) {
             v->chunks[k].serial = 0; d->ring_pool[d->nring_pool++] = v->chunks[k];
-        } else { NSObject_release(v->chunks[k].buf); InterlockedDecrement(&g_ring_chunks); }
+        } else {
+            if (g_cb_unretained > 0) mad_uret_push(d, v->chunks[k].buf, 0, NULL, 0);
+            else NSObject_release(v->chunks[k].buf);
+            InterlockedDecrement(&g_ring_chunks);
+        }
     }
     LeaveCriticalSection(&d->ring_lock);
     NSObject_release(v->cb);
@@ -17792,7 +18156,40 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
             for (k = 0; k < r->nxview; k++) mad_uavtex_forget(r, r->xview[k].id);
         }
         if (r->cpu) mad_tvs_forget(r);   /* madeira-bcd typed-view-shadow: before its memory goes */
-        /* build 666 (issue #36): the views, the texture and its resolve stand-in go to mad_release_after_gpu */
+        /* build 666 (issue #36): the views, the texture and its resolve stand-in go to mad_release_after_gpu;
+         * madeira-m5 0.1.730: when cb-unretained = 1, defer BOTH mad_unresident and release via mad_uret_push
+         * so no open or in-flight unretained command buffer ever hits a freed or non-resident resource. */
+        if (g_cb_unretained > 0 && r->owner) {
+            unsigned k;
+            for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { mad_uret_push(r->owner, r->tview[k].tex, 0, NULL, 0); InterlockedDecrement(&g_tview_live); }
+            for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_uret_push(r->owner, r->xview[k].tex, 0, NULL, 1); InterlockedDecrement(&g_xview_live); }
+            if (r->metal_bytes) {
+                InterlockedExchangeAdd64(&g_sa_tex_bytes, -(LONG64)r->metal_bytes);
+                InterlockedExchangeAdd64(&g_sa_tex_logical, -(LONG64)r->acct_bytes);
+                InterlockedDecrement(&g_sa_tex_n);
+            }
+            if (r->acct_bytes) mad_acct(r, r->acct_cat, r->acct_bytes, -1);
+            if (r->reserved_bytes) { InterlockedExchangeAdd64(&g_reserved_live_bytes, -(LONG64)r->reserved_bytes); InterlockedDecrement(&g_reserved_live_n); }
+            if (r->hp_used && r->owner) mad_hp_release(r->owner, r);
+            for (k = 0; k < r->nview_old; k++) free(r->view_old[k]); free(r->tview); free(r->tvh); free(r->xview);
+            if (r->buffer) mad_uret_push(r->owner, r->buffer, 0, NULL, (UINT8)(!r->placed_heap));
+            if (r->texture && !r->borrowed) mad_uret_push(r->owner, r->texture, 0, NULL, (UINT8)(!r->hp_used && !r->placed_heap));
+            if (r->resolve_tmp) mad_uret_push(r->owner, r->resolve_tmp, 0, NULL, 0);
+            if (r->placed_heap) { mad_pl_del(r->placed_heap, r); ID3D12Heap_Release((ID3D12Heap *)r->placed_heap); }
+            if (r->own_mem) {
+                InterlockedExchangeAdd64(&g_upload_swap_bytes, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_upload_swap_n);
+                if (r->heap == D3D12_HEAP_TYPE_DEFAULT) {
+                    InterlockedExchangeAdd64(&g_defswap_bytes, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_defswap_n);
+                    mad_dsw_track(r->own_mem, 0, 0);
+                    if (r->own_wired) {
+                        InterlockedExchangeAdd64(&g_defswap_wired, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_defswap_nwired);
+                    }
+                }
+                mad_uret_push(r->owner, 0, 0, r->own_mem, 0);
+            }
+            free(r);
+            return (ULONG)n;
+        }
         { unsigned k; for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { mad_release_after_gpu(r->owner, r->tview[k].tex); InterlockedDecrement(&g_tview_live); } }   /* ml905; ml1126: never set members */
         { unsigned k; for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_unresident(r->owner, r->xview[k].tex); mad_release_after_gpu(r->owner, r->xview[k].tex); InterlockedDecrement(&g_xview_live); } }   /* ml913 */
         if (r->metal_bytes) {   /* madeira-bcd metal-gap */
@@ -18567,13 +18964,18 @@ static ULONG STDMETHODCALLTYPE memheap_Release(ID3D12Heap *This) {
         if (h->mtl) {   /* ml1145: every placed resource held a reference, so none is left; ml1148: but the GPU may still hold them */
             struct mad_device *hd = h->device; int queued = 0;
             InterlockedExchangeAdd64(&g_mheap_bytes, -(LONG64)h->msize);   /* madeira-bcd metal-gap: queued frees are counted apart (msize: the Metal heap's size) */
-            EnterCriticalSection(&hd->heap_lock);
-            if (mad_grow((void **)&hd->mhret, &hd->mhret_cap, hd->nmhret + 1, sizeof *hd->mhret)) {
-                hd->mhret[hd->nmhret].heap = h->mtl; hd->mhret[hd->nmhret].serial = (UINT64)hd->gpu_serial; hd->mhret[hd->nmhret].mem = NULL; hd->mhret[hd->nmhret].obj = 0; hd->nmhret++; queued = 1;
+            if (g_cb_unretained > 0 && hd) {
+                mad_uret_push(hd, 0, h->mtl, NULL, 1);
+                mad_uret_reclaim(hd, 0);
+            } else {
+                EnterCriticalSection(&hd->heap_lock);
+                if (mad_grow((void **)&hd->mhret, &hd->mhret_cap, hd->nmhret + 1, sizeof *hd->mhret)) {
+                    hd->mhret[hd->nmhret].heap = h->mtl; hd->mhret[hd->nmhret].serial = (UINT64)hd->gpu_serial; hd->mhret[hd->nmhret].mem = NULL; hd->mhret[hd->nmhret].obj = 0; hd->nmhret++; queued = 1;
+                }
+                LeaveCriticalSection(&hd->heap_lock);
+                if (!queued) { mad_unresident(hd, h->mtl); NSObject_release(h->mtl); }
+                mad_mheap_reclaim(hd, 0);
             }
-            LeaveCriticalSection(&hd->heap_lock);
-            if (!queued) { mad_unresident(hd, h->mtl); NSObject_release(h->mtl); }
-            mad_mheap_reclaim(hd, 0);
         }
         free(h->pl);   /* madeira-bcd: placed registry (every placed resource is gone by now) */
         free(o);
@@ -18789,11 +19191,14 @@ heap_GetGPUDescriptorHandleForHeapStart(ID3D12DescriptorHeap *T, D3D12_GPU_DESCR
 
 static ULONG STDMETHODCALLTYPE pso_AddRef(ID3D12PipelineState *T) { return mad_addref((struct mad_obj *)T); }
 static HRESULT STDMETHODCALLTYPE pso_QI(ID3D12PipelineState *T, REFIID r, void **o) { return mad_qi((struct mad_obj *)T, r, o, 1); }
-static void mad_tess_free(struct mad_tess *t) {   /* ml1083; ml1147b: shared by the tessellation and geometry records */
+static void mad_tess_free(struct mad_device *d, struct mad_tess *t) {   /* ml1083; ml1147b: shared by the tessellation and geometry records */
     unsigned k;
     if (!t) return;
     for (k = 0; k < 3; k++) {
-        if (t->obj[k].rps) NSObject_release(t->obj[k].rps);
+        if (t->obj[k].rps) {
+            if (g_cb_unretained > 0 && d) mad_uret_push(d, t->obj[k].rps, 0, NULL, 0);
+            else NSObject_release(t->obj[k].rps);
+        }
         if (t->obj[k].fn) NSObject_release(t->obj[k].fn);
         if (t->obj[k].lib) NSObject_release(t->obj[k].lib);
         free(t->obj[k].vs.air); free(t->obj[k].hs.air);
@@ -18807,8 +19212,15 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
     struct mad_pso *p = (struct mad_pso *)T;
     LONG n = InterlockedDecrement(&p->refs);
     if (n == 0) { mad_pd_purge(T);   /* ml1143 */
-        if (p->rps) NSObject_release(p->rps);
-        { unsigned k; for (k = 0; k < p->nvar; k++) if (p->var[k].rps) NSObject_release(p->var[k].rps); }
+        struct mad_device *d = p->owner;
+        if (p->rps) {
+            if (g_cb_unretained > 0 && d) mad_uret_push(d, p->rps, 0, NULL, 0);
+            else NSObject_release(p->rps);
+        }
+        { unsigned k; for (k = 0; k < p->nvar; k++) if (p->var[k].rps) {
+            if (g_cb_unretained > 0 && d) mad_uret_push(d, p->var[k].rps, 0, NULL, 0);
+            else NSObject_release(p->var[k].rps);
+        } }
         free(p->var);   /* madeira-m5 0.1.718: the growable variant cache */
         if (p->has_vd) DeleteCriticalSection(&p->var_lock);
         if (p->vs_fn) NSObject_release(p->vs_fn);
@@ -18818,13 +19230,19 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
         if (p->si_lib) NSObject_release(p->si_lib);   /* ml927 */
         if (p->gs_lib) NSObject_release(p->gs_lib);
         if (p->hs_lib) NSObject_release(p->hs_lib);   /* DXIL tessellation */
-        if (p->dsso) NSObject_release(p->dsso);
-        if (p->cps) NSObject_release(p->cps);
+        if (p->dsso) {
+            if (g_cb_unretained > 0 && d) mad_uret_push(d, p->dsso, 0, NULL, 0);
+            else NSObject_release(p->dsso);
+        }
+        if (p->cps) {
+            if (g_cb_unretained > 0 && d) mad_uret_push(d, p->cps, 0, NULL, 0);
+            else NSObject_release(p->cps);
+        }
         free(p->air);   /* ml1010 */
         free(p->ps_air);   /* ml1011 */
         free(p->il_tag);   /* madeira-bcd skin-check-trace */
-        mad_tess_free(p->tess);         /* ml1083 */
-        mad_tess_free(p->tess_strip);   /* ml1147b */
+        mad_tess_free(d, p->tess);         /* ml1083 */
+        mad_tess_free(d, p->tess_strip);   /* ml1147b */
         free(p);
     }
     return (ULONG)n;
@@ -22783,7 +23201,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
 
     p = calloc(1, sizeof *p);
     if (!p) return E_OUTOFMEMORY;
-    p->vtbl = &g_pso_vtbl; p->refs = 1; p->iid = &IID_ID3D12PipelineState; p->name = "PipelineState";
+    p->vtbl = &g_pso_vtbl; p->refs = 1; p->iid = &IID_ID3D12PipelineState; p->name = "PipelineState"; p->owner = d;
     p->born_present = g_presents_now; p->born_tick = mad_tick_ms();   /* madeira-bcd: pso-first-use (build 657: mad_tick_ms, not GetTickCount) */
     if (mad_skin_on()) {   /* madeira-bcd skin-check: the vertex shader's bytecode, by hash */
         p->vs_hash = mad_fnv64(desc->VS.pShaderBytecode, desc->VS.BytecodeLength);
@@ -23333,7 +23751,7 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
     mad_resolve_target(d);
     p = calloc(1, sizeof *p);
     if (!p) return E_OUTOFMEMORY;
-    p->vtbl = &g_pso_vtbl; p->refs = 1; p->iid = &IID_ID3D12PipelineState; p->name = "ComputePipelineState";
+    p->vtbl = &g_pso_vtbl; p->refs = 1; p->iid = &IID_ID3D12PipelineState; p->name = "ComputePipelineState"; p->owner = d;
     p->born_present = g_presents_now; p->born_tick = mad_tick_ms();   /* madeira-bcd: pso-first-use (build 657: mad_tick_ms, not GetTickCount) */
     p->is_compute = 1;
     {   /* madeira-bcd: identify the bytecode for GPU fault reports */
@@ -24203,7 +24621,7 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
                 if (!as || (as & W) || !bs) {
                     cls = BC_ALL;
                     if (!bs || !as || (bs & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) || (as & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) uav_haz = 1;
-                    if (as & F5_VS) f5_vs = 1;
+                    if (!as || (as & F5_VS) || uav_haz) f5_vs = 1;
                 }
                 else if (!(bs & W)) {
                     cls = BC_RAR;
@@ -24216,13 +24634,13 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
                     if (as & ~(UINT)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_READ)) { vs = 1; f5_vs = 1; }
                 }
                 else if (bs == D3D12_RESOURCE_STATE_COPY_DEST) { cls = BC_RAW_COPY; if (as & F5_VS) f5_vs = 1; }
-                else if (bs == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) { cls = BC_RAW_UAV; uav_haz = 1; if (as & F5_VS) f5_vs = 1; }
-                else { uav_haz = 1; if (as & F5_VS) f5_vs = 1; }
+                else if (bs == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) { cls = BC_RAW_UAV; uav_haz = 1; f5_vs = 1; }
+                else { uav_haz = 1; f5_vs = 1; }
                 cls = (UINT8)(cls | bcf);
             }
         } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
             r = (struct mad_resource *)b[i].UAV.pResource;
-            cls = BC_RAW_UAV; uav_haz = 1;   /* UAV accesses happen only in compute and render encoders */
+            cls = BC_RAW_UAV; uav_haz = 1; f5_vs = 1;   /* UAV accesses happen in compute and render encoders; next pass vertex stage may read */
         } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
             /* madeira-m5 0.1.718 (Round 4 report 3.5): the two resources are recorded BY NAME as "wait for everything" entries
              * (the sync is unchanged: BC_ALL); only a NULL pair ("all aliases of this heap") still names every texture. Before,
@@ -24230,7 +24648,7 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
             r = (struct mad_resource *)b[i].Aliasing.pResourceBefore; r2 = (struct mad_resource *)b[i].Aliasing.pResourceAfter;
             if (!r) { r = r2; r2 = NULL; r_is_after = 1; }
             cls = (UINT8)(BC_ALL | BCF_ALIASING);
-            uav_haz = 1;
+            uav_haz = 1; f5_vs = 1;
             InterlockedIncrement(&g_bar_all[r ? MAD_BAR_ALIAS_NAMED : MAD_BAR_ALIAS_NULL]);
         }
         if (!r) {
@@ -26692,6 +27110,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     src = s->buffers[idx];
     g_perf_present_q = s->queue;   /* madeira-m5 0.1.716 P4a/P4e: for mad_perf_present below (same thread; the swapchain holds the queue) */
     mad_mheap_reclaim(s->dev, 0);   /* ml1148: once a frame, heaps whose GPU work is long done */
+    mad_uret_reclaim(s->dev, 0);    /* madeira-m5 0.1.730 cb-unretained: GPU-lifetime deferred objects */
     mad_swd_step(s->queue, 'F');    /* madeira-bcd: [swap-diag] steps, named by a drain that waits on this Present */
     { LONG64 tf = (LONG64)mad_tick();   /* ml1128; 0.1.718: mad_tick units */
     mad_device_flush_all(s->queue->device);          /* ml884: the frame's batch precedes the present */

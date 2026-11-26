@@ -1424,6 +1424,9 @@ jobs:
       - name: Patch winemetal late render-pass store actions
         run: python3 tools/patch-winemetal-rp-store.py
 
+      - name: Patch winemetal M5 fast path (unretained CB + compute memoryBarrier)
+        run: python3 tools/patch-winemetal-m5-fast.py
+
       - name: Patch winemetal untracked placement heaps
         run: python3 tools/patch-winemetal-heap-untracked.py
 
